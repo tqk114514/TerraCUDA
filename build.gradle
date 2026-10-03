@@ -196,7 +196,7 @@ def cudaArchs = (findProperty('terracuda.cuda.archs') ?: '75,80,86,89,90,100,120
         .toString().split(',').collect { it.trim() }.findAll { !it.isEmpty() }
 
 def cudaGeneratedDir = layout.buildDirectory.dir('generated/cuda')
-def cudaSourceFile = layout.projectDirectory.file('src/main/cuda/terracuda_noise.cu')
+def cudaSourceFile = layout.projectDirectory.file('src/main/cuda/terracuda.cu')
 
 def compileCuda = tasks.register('compileCuda') {
     group = 'build'
@@ -213,9 +213,9 @@ if (cudaNvcc == null || cudaHostCompiler == null) {
     cudaArchs.each { arch ->
         kernelTasks << tasks.register("compileCudaSm${arch}", NvccCompile) {
             group = 'build'
-            description = "Compiles terracuda_noise.cu to an sm_${arch} cubin"
+            description = "Compiles terracuda.cu to an sm_${arch} cubin"
             sourceFile.set(cudaSourceFile)
-            outputFile.set(cudaGeneratedDir.map { it.file("terracuda_noise_sm${arch}.cubin") })
+            outputFile.set(cudaGeneratedDir.map { it.file("terracuda_sm${arch}.cubin") })
             nvccPath.set(cudaNvcc)
             hostCompilerPath.set(cudaHostCompiler)
             // -Xcompiler=/utf-8: without it cl.exe warns C4819 on every CUDA header because the
@@ -230,9 +230,9 @@ if (cudaNvcc == null || cudaHostCompiler == null) {
     def ptxArch = cudaArchs.min { Integer.parseInt(it) }
     kernelTasks << tasks.register('compileCudaPtx', NvccCompile) {
         group = 'build'
-        description = "Compiles terracuda_noise.cu to compute_${ptxArch} PTX"
+        description = "Compiles terracuda.cu to compute_${ptxArch} PTX"
         sourceFile.set(cudaSourceFile)
-        outputFile.set(cudaGeneratedDir.map { it.file('terracuda_noise.ptx') })
+        outputFile.set(cudaGeneratedDir.map { it.file('terracuda.ptx') })
         nvccPath.set(cudaNvcc)
         hostCompilerPath.set(cudaHostCompiler)
         nvccFlags.set(['-ptx', "-arch=compute_${ptxArch}", '-fmad=false', '-O3', '-Xcompiler=/utf-8'])

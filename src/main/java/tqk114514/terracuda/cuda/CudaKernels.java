@@ -44,7 +44,9 @@ public final class CudaKernels {
     }
 
     private static final String RESOURCE_DIR = "/META-INF/terracuda/cuda/";
-    private static final String PROGRAM_NAME = "terracuda_noise.cu";
+    private static final String PROGRAM_NAME = "terracuda.cu";
+    private static final String CUBIN_PREFIX = "terracuda_sm";
+    private static final String PTX_NAME = "terracuda.ptx";
 
     /**
      * The options handed to NVRTC. {@code --fmad=false} is non-negotiable: with FMA contraction the
@@ -62,14 +64,14 @@ public final class CudaKernels {
      * @throws CudaException when no image can be produced at all
      */
     public static LoadedModule loadModule(CudaContext context, CudaDeviceInfo device) {
-        String cubinPath = RESOURCE_DIR + "terracuda_noise_sm" + device.computeCapability() + ".cubin";
+        String cubinPath = RESOURCE_DIR + CUBIN_PREFIX + device.computeCapability() + ".cubin";
         byte[] cubin = readResource(cubinPath);
         if (cubin != null) {
             context.loadModule(cubin);
             return new LoadedModule(Origin.CUBIN, cubinPath + " (" + cubin.length + " bytes)");
         }
 
-        String ptxPath = RESOURCE_DIR + "terracuda_noise.ptx";
+        String ptxPath = RESOURCE_DIR + PTX_NAME;
         byte[] ptx = readResource(ptxPath);
         if (ptx != null) {
             context.loadModule(nulTerminated(ptx));
@@ -84,9 +86,9 @@ public final class CudaKernels {
         String source = readResourceAsString(sourcePath);
         if (source == null) {
             throw new CudaException(CudaException.BINDING_FAILURE, "TERRACUDA_NO_KERNEL_IMAGE",
-                    "no kernel image on the classpath: neither " + RESOURCE_DIR
-                            + "terracuda_noise_sm" + device.computeCapability() + ".cubin, "
-                            + RESOURCE_DIR + "terracuda_noise.ptx, nor " + sourcePath + " is present");
+                    "no kernel image on the classpath: neither " + RESOURCE_DIR + CUBIN_PREFIX
+                            + device.computeCapability() + ".cubin, " + RESOURCE_DIR + PTX_NAME
+                            + ", nor " + sourcePath + " is present");
         }
 
         Optional<NvrtcCompiler> compiler = NvrtcCompiler.tryLoad();

@@ -157,7 +157,7 @@ class ImprovedNoiseGpuTest {
         assumeTrue(environment.available(), "no CUDA device on this machine");
         CudaDeviceInfo device = environment.firstDevice().orElseThrow();
 
-        String cubin = "/META-INF/terracuda/cuda/terracuda_noise_sm" + device.computeCapability() + ".cubin";
+        String cubin = "/META-INF/terracuda/cuda/terracuda_sm" + device.computeCapability() + ".cubin";
         assumeTrue(ImprovedNoiseGpuTest.class.getResource(cubin) != null,
                 "no prebuilt cubin for sm_" + device.computeCapability() + " on the classpath");
 

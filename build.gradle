@@ -20,6 +20,7 @@ sourceSets.main.resources {
 }
 
 repositories {
+    mavenCentral()
 }
 
 base {
@@ -56,6 +57,9 @@ neoForge {
         configureEach {
             systemProperty 'forge.logging.markers', 'REGISTRIES'
 
+            // Required for the java.lang.foreign CUDA binding to run inside a dev client/server.
+            jvmArguments.add('--enable-native-access=ALL-UNNAMED')
+
             logLevel = org.slf4j.event.Level.DEBUG
         }
     }
@@ -72,6 +76,26 @@ configurations {
 }
 
 dependencies {
+    testImplementation platform('org.junit:junit-bom:5.11.4')
+    testImplementation 'org.junit.jupiter:junit-jupiter'
+    testRuntimeOnly 'org.junit.platform:junit-platform-launcher'
+}
+
+// moddevgradle attaches the Minecraft / NeoForge classpath to the main source set directly, so the
+// test source set does not inherit it. Mirror it explicitly: parity tests must be able to call the
+// vanilla classes they are validating against.
+sourceSets.test.compileClasspath += sourceSets.main.compileClasspath
+sourceSets.test.runtimeClasspath += sourceSets.main.runtimeClasspath
+
+tasks.named('test', Test) {
+    useJUnitPlatform()
+    // The CUDA binding goes through java.lang.foreign, which is a restricted operation unless native
+    // access is granted explicitly. Without this the tests still run, but every run prints a warning.
+    jvmArgs '--enable-native-access=ALL-UNNAMED'
+    testLogging {
+        events 'passed', 'skipped', 'failed'
+        exceptionFormat = 'full'
+    }
 }
 
 var generateModMetadata = tasks.register("generateModMetadata", ProcessResources) {

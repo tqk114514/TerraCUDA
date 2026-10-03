@@ -47,15 +47,19 @@ waiting is deliberate, because the untested piece is exactly the write-back.
 
 ### Trying it in a game
 
-The device path is off by default. To exercise it inside a running world without changing what the
-game generates:
+The device path is off by default. To run the whole chain — lowering, upload, density, material
+rules, block ids — inside a real world without changing what the game generates:
 
 ```
--Dterracuda.gpu=true -Dterracuda.shadow=true
+./gradlew runClient -Pterracuda.shadow
 ```
 
-It computes each chunk's marker tables on the device and logs how long that took. A device that
-cannot be used degrades to a log line; nothing throws into the generation path.
+Add `-Pterracuda.verbose` to log every chunk rather than every 256th. The hook computes each chunk's
+blocks on the device path and logs how long that took; it never cancels the vanilla call and never
+touches the chunk. A device that cannot be used degrades to a log line.
+
+Expect this to slow world loading down noticeably: it is a diagnostic, it runs on the generation
+thread, and the material rules are the slow part.
 
 ## GPU kernels
 

@@ -105,6 +105,18 @@ neoForge {
             // Required for the java.lang.foreign CUDA binding to run inside a dev client/server.
             jvmArguments.add('--enable-native-access=ALL-UNNAMED')
 
+            // -Pterracuda.shadow turns the device path on in observation mode, so it can be tried
+            // without editing anything:
+            //     ./gradlew runClient -Pterracuda.shadow
+            // Add -Pterracuda.verbose to log every chunk instead of every 256th.
+            if (project.hasProperty('terracuda.shadow')) {
+                jvmArguments.add('-Dterracuda.gpu=true')
+                jvmArguments.add('-Dterracuda.shadow=true')
+            }
+            if (project.hasProperty('terracuda.verbose')) {
+                jvmArguments.add('-Dterracuda.verbose=true')
+            }
+
             logLevel = org.slf4j.event.Level.DEBUG
         }
     }

@@ -63,6 +63,7 @@ class ChunkPassProfileTest {
                 describeProgram("vein_ridged", randomState.router().veinRidged());
 
                 measurePasses(context, randomState, geometry);
+                measureCornerBatchScaling(context, randomState, geometry);
                 measureRouterEntries(randomState);
 
                 for (long bytes : new long[] {786432L, 3932160L}) {
@@ -111,6 +112,65 @@ class ChunkPassProfileTest {
                     name,
                     time(() -> evaluator.blocksForChunk(geometry, CHUNK_X, CHUNK_Z, order)),
                     time(() -> ChunkCornerTables.compute(evaluator, geometry, CHUNK_X, CHUNK_Z)));
+        }
+    }
+
+    /**
+     * Does folding several chunks into one marker-table launch actually pay?
+     *
+     * <p>A chunk's marker tables are 6450 points against a 450-step chain, which is 4% of what a 3080
+     * can hold in flight, so the kernel should be waiting on latency rather than on throughput — in
+     * which case eight chunks' points cost about what one chunk's do. This measures that directly
+     * instead of assuming it, because the answer decides whether batching is worth the scratch, which
+     * grows linearly with the batch.
+     */
+    private static void measureCornerBatchScaling(CudaContext context, RandomState randomState,
+            NoiseSettings geometry) {
+        DensityProgram program = DensityCompiler.lower(randomState.router().finalDensity());
+        DensityProgramImage image = DensityProgramImage.of(program);
+        int perChunk = ChunkCornerTables.pointBudget(image, geometry);
+        int countY = ChunkCornerTables.cornerCountY(geometry);
+        int[] kinds = image.markerKinds();
+        int[] roots = image.markerRoots();
+
+        int pointsPerChunk = 0;
+        for (int kind : kinds) {
+            if (kind == DensityProgram.MARKER_INTERPOLATED) {
+                pointsPerChunk += ChunkCornerTables.CORNERS_XZ * ChunkCornerTables.CORNERS_XZ * countY;
+            } else if (kind == DensityProgram.MARKER_FLAT_CACHE
+                    || kind == DensityProgram.MARKER_CACHE_2D) {
+                pointsPerChunk += ChunkCornerTables.CORNERS_XZ * ChunkCornerTables.CORNERS_XZ;
+            }
+        }
+
+        for (int chunks : new int[] {1, 2, 4, 8, 16}) {
+            try (DensityEvaluatorGpu evaluator =
+                         new DensityEvaluatorGpu(context, program, chunks * perChunk)) {
+                int[] points = new int[3 * pointsPerChunk * chunks];
+                int[] rootArray = new int[pointsPerChunk * chunks];
+                int at = 0;
+                for (int c = 0; c < chunks; c++) {
+                    int[] corners = ChunkCornerTables.cornerCoordinates(geometry, c, 0);
+                    int[] flats = ChunkCornerTables.flatCoordinates(geometry, c, 0);
+                    for (int i = 0; i < kinds.length; i++) {
+                        boolean isCorner = kinds[i] == DensityProgram.MARKER_INTERPOLATED;
+                        boolean isFlat = kinds[i] == DensityProgram.MARKER_FLAT_CACHE
+                                || kinds[i] == DensityProgram.MARKER_CACHE_2D;
+                        if (!isCorner && !isFlat) {
+                            continue;
+                        }
+                        int[] grid = isCorner ? corners : flats;
+                        int gridPoints = grid.length / 3;
+                        System.arraycopy(grid, 0, points, 3 * at, grid.length);
+                        java.util.Arrays.fill(rootArray, at, at + gridPoints, roots[i]);
+                        at += gridPoints;
+                    }
+                }
+
+                double ms = time(() -> evaluator.evaluate(points, rootArray));
+                System.out.printf("PROFILE corner batch %2d chunks: %7.3f ms total, %6.3f ms/chunk%n",
+                        chunks, ms, ms / chunks);
+            }
         }
     }
 

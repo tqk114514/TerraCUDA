@@ -4,16 +4,15 @@ import java.util.Optional;
 import java.util.concurrent.ArrayBlockingQueue;
 import java.util.concurrent.BlockingQueue;
 import java.util.concurrent.Callable;
+import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.ExecutionException;
-import java.util.concurrent.FutureTask;
 import java.util.concurrent.TimeUnit;
 
 import net.minecraft.world.level.chunk.ChunkAccess;
 import net.minecraft.world.level.levelgen.NoiseGeneratorSettings;
 import net.minecraft.world.level.levelgen.RandomState;
 
-import tqk114514.terracuda.chunk.ChunkReplay;
 import tqk114514.terracuda.chunk.EmittedChunk;
 import tqk114514.terracuda.cuda.CudaContext;
 import tqk114514.terracuda.cuda.CudaDeviceInfo;
@@ -27,9 +26,13 @@ import tqk114514.terracuda.cuda.CudaKernels;
  *
  * <p>The CUDA context is thread-affine and the device work is serialised anyway, so this runs a single
  * dedicated thread that creates the context, builds the density program and executes submitted jobs.
- * Chunk generation happens on several {@code wgen_fill_noise} worker threads, and none of them may
- * touch the context directly — they submit and wait. That is the seed of the batching dispatcher the
- * design doc calls for; the difference is that this version runs one job at a time.
+ * Chunk generation happens on several {@code wgen_fill_noise} dispatcher threads, and none of them may
+ * touch the context directly.
+ *
+ * <p>Two ways in, and the difference matters. {@link #fill} hands back a future and returns at once, so
+ * the dispatcher can carry on scheduling while the device works; that is the shape the design doc calls
+ * for, and it is what a batch has to be built on. {@link #blockIds} blocks its caller, because it is
+ * the diagnostic path and there is nothing to overlap with.
  *
  * <p>Failure is contained by construction: if CUDA is unavailable, the module will not load, or the
  * density function contains something the compiler does not understand, {@link #isReady()} stays
@@ -41,7 +44,12 @@ public final class GpuWorldgenService implements AutoCloseable {
     private static final int QUEUE_CAPACITY = 64;
     private static final int INIT_TIMEOUT_SECONDS = 30;
 
-    private final BlockingQueue<Runnable> jobs = new ArrayBlockingQueue<>(QUEUE_CAPACITY);
+    /** A unit of work for the GPU thread, which completes its own future. */
+    private interface Job {
+        void run(GpuChunkFiller filler);
+    }
+
+    private final BlockingQueue<Job> jobs = new ArrayBlockingQueue<>(QUEUE_CAPACITY);
     private final CountDownLatch initialised = new CountDownLatch(1);
     private final Thread thread;
 
@@ -88,9 +96,9 @@ public final class GpuWorldgenService implements AutoCloseable {
         }
         try {
             while (!this.closed) {
-                Runnable job = this.jobs.poll(200, TimeUnit.MILLISECONDS);
+                Job job = this.jobs.poll(200, TimeUnit.MILLISECONDS);
                 if (job != null) {
-                    job.run();
+                    job.run(this.filler);
                 }
             }
         } catch (InterruptedException e) {
@@ -134,7 +142,36 @@ public final class GpuWorldgenService implements AutoCloseable {
     }
 
     /**
-     * Emits one chunk's blocks.
+     * Emits one chunk's blocks and writes them into {@code chunk}, on the GPU thread.
+     *
+     * <p>Returns immediately. The future completes once the chunk has been written, or completes
+     * exceptionally if the device path could not do it — the caller is expected to fall back to
+     * vanilla in that case, which is why this reports failure rather than swallowing it.
+     */
+    public CompletableFuture<Void> fill(ChunkAccess chunk) {
+        CompletableFuture<Void> done = new CompletableFuture<>();
+        if (!isReady()) {
+            done.completeExceptionally(new IllegalStateException(unavailableReason));
+            return done;
+        }
+        Job job = filler -> {
+            try {
+                filler.fill(chunk);
+                done.complete(null);
+            } catch (Throwable t) {
+                done.completeExceptionally(t);
+            }
+        };
+        if (!this.jobs.offer(job)) {
+            // The device is behind. Blocking here would stall the dispatcher, and falling back to
+            // vanilla is both correct and parallel, so the caller gets to choose.
+            done.completeExceptionally(new IllegalStateException("the GPU queue is full"));
+        }
+        return done;
+    }
+
+    /**
+     * Emits one chunk's blocks, blocking until they are ready.
      *
      * @return the ids and the fluid-update bitmap, or empty when the device path is unavailable
      */
@@ -142,23 +179,22 @@ public final class GpuWorldgenService implements AutoCloseable {
         return submit(() -> this.filler.blockIds(chunkX, chunkZ));
     }
 
-    /** Emits one chunk's blocks and writes them into {@code chunk}. */
-    public Optional<EmittedChunk> fill(ChunkAccess chunk, int minY, int height) {
-        Optional<EmittedChunk> emitted = blockIds(chunk.getPos().x(), chunk.getPos().z());
-        emitted.ifPresent(blocks -> ChunkReplay.write(chunk, blocks, minY, height));
-        return emitted;
-    }
-
-    private <T> Optional<T> submit(Callable<T> job) {
+    private <T> Optional<T> submit(Callable<T> body) {
         if (!isReady()) {
             return Optional.empty();
         }
-        FutureTask<T> task = new FutureTask<>(job);
-        if (!this.jobs.offer(task)) {
+        CompletableFuture<T> result = new CompletableFuture<>();
+        if (!this.jobs.offer(filler -> {
+            try {
+                result.complete(body.call());
+            } catch (Throwable t) {
+                result.completeExceptionally(t);
+            }
+        })) {
             return Optional.empty();
         }
         try {
-            return Optional.ofNullable(task.get());
+            return Optional.ofNullable(result.get());
         } catch (InterruptedException e) {
             Thread.currentThread().interrupt();
             return Optional.empty();

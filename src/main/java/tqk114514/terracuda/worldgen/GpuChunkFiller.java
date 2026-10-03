@@ -3,6 +3,7 @@ package tqk114514.terracuda.worldgen;
 import net.minecraft.world.level.block.Block;
 import net.minecraft.world.level.block.state.BlockState;
 import net.minecraft.world.level.chunk.ChunkAccess;
+import net.minecraft.world.level.chunk.LevelChunkSection;
 import net.minecraft.world.level.levelgen.Aquifer;
 import net.minecraft.world.level.levelgen.DensityFunction;
 import net.minecraft.world.level.levelgen.NoiseGeneratorSettings;
@@ -51,6 +52,17 @@ public final class GpuChunkFiller implements AutoCloseable {
     private final DensityEvaluatorGpu veinToggleEvaluator;
     private final DensityEvaluatorGpu veinRidgedEvaluator;
 
+    /**
+     * The three per-block arrays, reused across chunks.
+     *
+     * <p>Each is 786 KB and there are three, so filling them fresh every chunk would hand the
+     * collector about two and a half megabytes a chunk for nothing. They belong to different
+     * evaluators, so all three are live at once and none can share.
+     */
+    private double[] densities;
+    private double[] veinToggleValues;
+    private double[] veinRidgedValues;
+
     private boolean closed;
 
     private GpuChunkFiller(CudaContext context, RandomState randomState, NoiseGeneratorSettings settings) {
@@ -85,16 +97,26 @@ public final class GpuChunkFiller implements AutoCloseable {
     public EmittedChunk blockIds(int chunkX, int chunkZ) {
         int minY = this.geometry.minY();
         int height = this.geometry.height();
+        int count = 16 * 16 * height;
+
+        if (this.densities == null) {
+            this.densities = new double[count];
+            this.veinToggleValues = new double[count];
+            this.veinRidgedValues = new double[count];
+        }
+        double[] densities = this.densities;
+        double[] veinToggleValues = this.veinToggleValues;
+        double[] veinRidgedValues = this.veinRidgedValues;
 
         // final_density is a cache_all_in_cell marker, so the rules see the lerp3 blend; the vein
         // functions are read straight, so they take the incremental one. The difference is in the last
         // bits and InterpolationOrderTest pins it down.
-        double[] densities = this.densityEvaluator.blocksForChunk(this.geometry, chunkX, chunkZ,
-                CornerInterpolation.LERP3);
-        double[] veinToggleValues = this.veinToggleEvaluator.blocksForChunk(this.geometry, chunkX,
-                chunkZ, CornerInterpolation.INCREMENTAL);
-        double[] veinRidgedValues = this.veinRidgedEvaluator.blocksForChunk(this.geometry, chunkX,
-                chunkZ, CornerInterpolation.INCREMENTAL);
+        this.densityEvaluator.blocksForChunk(this.geometry, chunkX, chunkZ,
+                CornerInterpolation.LERP3, densities);
+        this.veinToggleEvaluator.blocksForChunk(this.geometry, chunkX, chunkZ,
+                CornerInterpolation.INCREMENTAL, veinToggleValues);
+        this.veinRidgedEvaluator.blocksForChunk(this.geometry, chunkX, chunkZ,
+                CornerInterpolation.INCREMENTAL, veinRidgedValues);
 
         MaterialRules.RouterNoises noises = new MaterialRules.RouterNoises(
                 this.barrierNoise, this.floodedness, this.spread, this.lava, this.erosion,
@@ -109,7 +131,6 @@ public final class GpuChunkFiller implements AutoCloseable {
         BlockState defaultBlock = this.settings.defaultBlock();
         int chunkMinBlockX = chunkX * 16;
         int chunkMinBlockZ = chunkZ * 16;
-        int count = 16 * 16 * height;
         int[] ids = new int[count];
         long[] fluidUpdates = new long[(count + 63) >>> 6];
 
@@ -135,10 +156,33 @@ public final class GpuChunkFiller implements AutoCloseable {
         return new EmittedChunk(ids, fluidUpdates);
     }
 
-    /** Emits the chunk's blocks and writes them into {@code chunk}. */
+    /**
+     * Emits the chunk's blocks and writes them into {@code chunk}.
+     *
+     * <p>The sections are held for the duration, the way {@code fillFromNoise} holds them around
+     * {@code doFill}: the write is not atomic, and another thread may reach the chunk while it is
+     * being filled.
+     */
     public void fill(ChunkAccess chunk) {
-        EmittedChunk emitted = blockIds(chunk.getPos().x(), chunk.getPos().z());
-        ChunkReplay.write(chunk, emitted, this.geometry.minY(), this.geometry.height());
+        int minY = this.geometry.minY();
+        int height = this.geometry.height();
+        int top = chunk.getSectionIndex(minY + height - 1);
+        int bottom = chunk.getSectionIndex(minY);
+
+        java.util.List<LevelChunkSection> held = new java.util.ArrayList<>(top - bottom + 1);
+        for (int index = top; index >= bottom; index--) {
+            LevelChunkSection section = chunk.getSection(index);
+            section.acquire();
+            held.add(section);
+        }
+        try {
+            EmittedChunk emitted = blockIds(chunk.getPos().x(), chunk.getPos().z());
+            ChunkReplay.write(chunk, emitted, minY, height);
+        } finally {
+            for (LevelChunkSection section : held) {
+                section.release();
+            }
+        }
     }
 
     private MaterialRules.SurfaceLevels surfaceLevels() {

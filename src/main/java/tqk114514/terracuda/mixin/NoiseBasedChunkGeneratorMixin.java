@@ -1,9 +1,7 @@
 package tqk114514.terracuda.mixin;
 
-import java.util.HashSet;
 import java.util.Map;
 import java.util.Optional;
-import java.util.Set;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.atomic.AtomicBoolean;
@@ -12,7 +10,6 @@ import java.util.concurrent.atomic.AtomicLong;
 import net.minecraft.world.level.ChunkPos;
 import net.minecraft.world.level.StructureManager;
 import net.minecraft.world.level.chunk.ChunkAccess;
-import net.minecraft.world.level.chunk.LevelChunkSection;
 import net.minecraft.world.level.levelgen.NoiseBasedChunkGenerator;
 import net.minecraft.world.level.levelgen.NoiseGeneratorSettings;
 import net.minecraft.world.level.levelgen.NoiseSettings;
@@ -34,18 +31,19 @@ import tqk114514.terracuda.worldgen.GpuWorldgenService;
  *
  * <p>Two modes, both driven from here. In shadow mode the device path runs and the result is thrown
  * away, which is how the chain is checked against a live world without risking one. In takeover mode
- * the blocks are written into the chunk and vanilla's NOISE stage is cancelled.
+ * the chunk is handed to {@link GpuWorldgenService#fill} and vanilla's NOISE stage is cancelled.
  *
- * <p><b>Why the fallback is shaped the way it is.</b> The obvious order is to cancel first and do the
- * work in the returned future, but that gives up the ability to fall back: once the future is handed
- * back, there is no way to un-cancel. So the work happens first, on this thread, and the cancellation
- * only follows a successful write. Anything that goes wrong — no device, a device that stopped
- * answering, a noise configuration the service was not built for — simply falls through to vanilla,
- * which then writes every block itself and overwrites whatever was there.
+ * <p><b>Why the future is returned uncompleted.</b> The device work is serialised on one thread, so
+ * blocking the caller here would stall a chunk-task dispatcher thread for the whole time a chunk takes
+ * — and those threads are also driving biomes, surface and lighting. Handing back a future lets the
+ * dispatcher schedule ahead, and it is the hook batching needs: a batch can only form if the requests
+ * pile up somewhere.
  *
- * <p>What that costs is parallelism: the device work is serialised anyway, but blocking here also
- * holds one of the four chunk-task dispatcher threads. Returning an incomplete future is the shape
- * that fixes it, and it is the same shape batching needs, so the two are one change.
+ * <p><b>Why the fallback re-enters.</b> Once a future is handed back there is no way to un-cancel, so a
+ * device failure cannot be reported by simply returning. Instead the fallback calls
+ * {@code fillFromNoise} again, on the completing thread, with a thread-local guard that stops this
+ * injection from firing a second time. Nothing has been written to the chunk by then — the service
+ * only writes once the whole job has succeeded — so vanilla's own fill is a clean overwrite.
  *
  * <p>Failure containment: everything is inside a try/catch, the switch is off by default, the
  * injection is marked non-required and the mixin config is marked non-required, so a future Minecraft
@@ -59,11 +57,14 @@ public abstract class NoiseBasedChunkGeneratorMixin {
     private static final AtomicBoolean REPORTED_FAILURE = new AtomicBoolean();
     private static final AtomicBoolean REPORTED_HEIGHT_MISMATCH = new AtomicBoolean();
 
+    /** Set while the fallback is running, so this injection does not fire on it again. */
+    private static final ThreadLocal<Boolean> IN_VANILLA = new ThreadLocal<>();
+
     @Inject(method = "fillFromNoise", at = @At("HEAD"), cancellable = true, require = 0)
     private void terracuda$fillFromNoise(Blender blender, RandomState randomState,
             StructureManager structureManager, ChunkAccess centerChunk,
             CallbackInfoReturnable<CompletableFuture<ChunkAccess>> cir) {
-        if (!TerracudaConfig.gpuEnabled()) {
+        if (!TerracudaConfig.gpuEnabled() || Boolean.TRUE.equals(IN_VANILLA.get())) {
             return;
         }
         try {
@@ -103,27 +104,32 @@ public abstract class NoiseBasedChunkGeneratorMixin {
             }
 
             ChunkPos pos = centerChunk.getPos();
-            boolean takeover = TerracudaConfig.takeover();
             long start = System.nanoTime();
-            Optional<EmittedChunk> emitted = takeover
-                    ? fillWithSectionsHeld(service, centerChunk, clamped.minY(), clamped.height())
-                    : service.blockIds(pos.x(), pos.z());
-            long micros = (System.nanoTime() - start) / 1000;
 
-            if (!emitted.isPresent()) {
-                // The service reported ready but the job did not come back. Vanilla still has the chunk.
+            if (TerracudaConfig.takeover()) {
+                CompletableFuture<ChunkAccess> result = service.fill(centerChunk)
+                        .handle((ignored, error) -> error)
+                        .thenCompose(error -> {
+                            long micros = (System.nanoTime() - start) / 1000;
+                            if (error == null) {
+                                logChunk(pos, micros, true);
+                                return CompletableFuture.completedFuture(centerChunk);
+                            }
+                            if (REPORTED_FAILURE.compareAndSet(false, true)) {
+                                TerraCUDA.LOGGER.warn("TerraCUDA: the device path failed on chunk "
+                                        + pos + "; falling back to vanilla for it and continuing",
+                                        error);
+                            }
+                            return vanillaFill(self, blender, randomState, structureManager,
+                                    centerChunk);
+                        });
+                cir.setReturnValue(result);
                 return;
             }
-            if (takeover) {
-                // The chunk now holds the device's blocks. Vanilla's NOISE stage would overwrite them
-                // with its own, so it does not run.
-                cir.setReturnValue(CompletableFuture.completedFuture(centerChunk));
-            }
 
-            long count = CHUNKS.incrementAndGet();
-            if (TerracudaConfig.verbose() || count % 256 == 1) {
-                TerraCUDA.LOGGER.info("TerraCUDA{}: chunk {} -> {} blocks in {} us ({} chunks seen)",
-                        takeover ? "" : " shadow", pos, emitted.get().size(), micros, count);
+            Optional<EmittedChunk> emitted = service.blockIds(pos.x(), pos.z());
+            if (emitted.isPresent()) {
+                logChunk(pos, (System.nanoTime() - start) / 1000, false);
             }
         } catch (Throwable t) {
             // Never break world generation. Falling through means vanilla writes the chunk, which is
@@ -134,29 +140,23 @@ public abstract class NoiseBasedChunkGeneratorMixin {
         }
     }
 
-    /**
-     * Emits the chunk and writes it, holding the sections the way vanilla's own {@code doFill} does.
-     *
-     * <p>{@code fillFromNoise} acquires every section it is about to write before running the fill, so
-     * that a concurrent reader cannot observe a half-written one. The write happens here rather than
-     * on a worker, but the sections are still reachable by other threads, so the same guard applies.
-     */
-    private static Optional<EmittedChunk> fillWithSectionsHeld(GpuWorldgenService service,
-            ChunkAccess chunk, int minY, int height) {
-        int top = chunk.getSectionIndex(minY + height - 1);
-        int bottom = chunk.getSectionIndex(minY);
-        Set<LevelChunkSection> held = new HashSet<>();
-        for (int index = top; index >= bottom; index--) {
-            LevelChunkSection section = chunk.getSection(index);
-            section.acquire();
-            held.add(section);
-        }
+    /** Runs vanilla's own NOISE stage, with this injection suppressed for the duration. */
+    private static CompletableFuture<ChunkAccess> vanillaFill(NoiseBasedChunkGenerator self,
+            Blender blender, RandomState randomState, StructureManager structureManager,
+            ChunkAccess chunk) {
+        IN_VANILLA.set(Boolean.TRUE);
         try {
-            return service.fill(chunk, minY, height);
+            return self.fillFromNoise(blender, randomState, structureManager, chunk);
         } finally {
-            for (LevelChunkSection section : held) {
-                section.release();
-            }
+            IN_VANILLA.remove();
+        }
+    }
+
+    private static void logChunk(ChunkPos pos, long micros, boolean takeover) {
+        long count = CHUNKS.incrementAndGet();
+        if (TerracudaConfig.verbose() || count % 256 == 1) {
+            TerraCUDA.LOGGER.info("TerraCUDA{}: chunk {} in {} us ({} chunks seen)",
+                    takeover ? "" : " shadow", pos, micros, count);
         }
     }
 }

@@ -27,6 +27,8 @@ bin/
 
 .DS_Store
 
+.workbuddy-ai/
+
 run/
 !**/src/**/run/
 **/src/generated/**/.cache/

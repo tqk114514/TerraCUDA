@@ -1,2 +1,15 @@
-src/generated/**/.cache/* text eol=lf
+# Normalize all text files to LF in the repository
+* text=auto eol=lf
+
+# Windows batch scripts must keep CRLF
+*.bat text eol=crlf
+
+# Binary assets
+*.jar binary
+*.png binary
+*.bbmodel binary
+*.ogg binary
+
+# Generated resources
 src/generated/**/*.json text eol=lf
+src/generated/**/.cache/* text eol=lf

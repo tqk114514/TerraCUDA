@@ -125,6 +125,7 @@ public final class VanillaChunkReference {
                                 int index = (x * 16 + z) * height + (posY - minY);
                                 stateIds[index] = Block.getId(state);
                                 densities[index] = fullNoise.compute(chunk);
+
                             }
                         }
                     }

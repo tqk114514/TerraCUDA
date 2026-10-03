@@ -1,6 +1,5 @@
 package tqk114514.terracuda.worldgen;
 
-import java.util.List;
 import java.util.Optional;
 import java.util.concurrent.ArrayBlockingQueue;
 import java.util.concurrent.BlockingQueue;
@@ -10,7 +9,7 @@ import java.util.concurrent.ExecutionException;
 import java.util.concurrent.FutureTask;
 import java.util.concurrent.TimeUnit;
 
-import net.minecraft.world.level.levelgen.NoiseSettings;
+import net.minecraft.world.level.levelgen.NoiseGeneratorSettings;
 import net.minecraft.world.level.levelgen.RandomState;
 
 import tqk114514.terracuda.cuda.CudaContext;
@@ -19,10 +18,6 @@ import tqk114514.terracuda.cuda.CudaDriver;
 import tqk114514.terracuda.cuda.CudaEnvironment;
 import tqk114514.terracuda.cuda.CudaException;
 import tqk114514.terracuda.cuda.CudaKernels;
-import tqk114514.terracuda.density.DensityCompiler;
-import tqk114514.terracuda.density.DensityProgram;
-import tqk114514.terracuda.gpu.ChunkCornerTables;
-import tqk114514.terracuda.gpu.DensityEvaluatorGpu;
 
 /**
  * Owns the GPU side of world generation for one {@link RandomState}.
@@ -52,10 +47,10 @@ public final class GpuWorldgenService implements AutoCloseable {
     private volatile boolean closed;
 
     private CudaContext context;
-    private DensityEvaluatorGpu evaluator;
+    private GpuChunkFiller filler;
 
-    private GpuWorldgenService(RandomState randomState) {
-        this.thread = new Thread(() -> run(randomState), "TerraCUDA-GPU");
+    private GpuWorldgenService(RandomState randomState, NoiseGeneratorSettings settings) {
+        this.thread = new Thread(() -> run(randomState, settings), "TerraCUDA-GPU");
         this.thread.setDaemon(true);
         this.thread.start();
     }
@@ -66,8 +61,8 @@ public final class GpuWorldgenService implements AutoCloseable {
      * <p>A service that cannot use the GPU is still returned, so the reason is available for the log;
      * check {@link #isReady()} before using it.
      */
-    public static GpuWorldgenService of(RandomState randomState) {
-        GpuWorldgenService service = new GpuWorldgenService(randomState);
+    public static GpuWorldgenService of(RandomState randomState, NoiseGeneratorSettings settings) {
+        GpuWorldgenService service = new GpuWorldgenService(randomState, settings);
         try {
             if (!service.initialised.await(INIT_TIMEOUT_SECONDS, TimeUnit.SECONDS)) {
                 service.unavailableReason = "initialisation timed out";
@@ -79,9 +74,9 @@ public final class GpuWorldgenService implements AutoCloseable {
         return service;
     }
 
-    private void run(RandomState randomState) {
+    private void run(RandomState randomState, NoiseGeneratorSettings settings) {
         try {
-            initialise(randomState);
+            initialise(randomState, settings);
         } catch (Throwable t) {
             this.unavailableReason = "initialisation failed: " + t;
             this.ready = false;
@@ -102,7 +97,7 @@ public final class GpuWorldgenService implements AutoCloseable {
         }
     }
 
-    private void initialise(RandomState randomState) {
+    private void initialise(RandomState randomState, NoiseGeneratorSettings settings) {
         CudaEnvironment environment = CudaEnvironment.detect();
         if (!environment.available()) {
             this.unavailableReason = environment.reason();
@@ -120,9 +115,7 @@ public final class GpuWorldgenService implements AutoCloseable {
         this.context = CudaContext.create(driver, device.index());
         CudaKernels.loadModule(this.context, device);
 
-        DensityProgram program =
-                DensityCompiler.lower(randomState.router().finalDensity());
-        this.evaluator = new DensityEvaluatorGpu(this.context, program, 2048);
+        this.filler = GpuChunkFiller.create(this.context, randomState, settings);
         this.ready = true;
         this.unavailableReason = "";
     }
@@ -138,13 +131,12 @@ public final class GpuWorldgenService implements AutoCloseable {
     }
 
     /**
-     * Computes the marker tables for one chunk.
+     * Emits one chunk's block state ids.
      *
-     * @return the tables, or empty when the device path is unavailable
+     * @return the ids, or empty when the device path is unavailable
      */
-    public Optional<List<ChunkCornerTables.MarkerGrid>> markerTables(NoiseSettings settings, int chunkX,
-            int chunkZ) {
-        return submit(() -> ChunkCornerTables.compute(this.evaluator, settings, chunkX, chunkZ));
+    public Optional<int[]> blockIds(int chunkX, int chunkZ) {
+        return submit(() -> this.filler.blockIds(chunkX, chunkZ));
     }
 
     private <T> Optional<T> submit(Callable<T> job) {
@@ -167,8 +159,8 @@ public final class GpuWorldgenService implements AutoCloseable {
 
     private void closeQuietly() {
         try {
-            if (this.evaluator != null) {
-                this.evaluator.close();
+            if (this.filler != null) {
+                this.filler.close();
             }
         } catch (CudaException ignored) {
             // Shutting down; a failure here has nowhere useful to go.
@@ -193,6 +185,6 @@ public final class GpuWorldgenService implements AutoCloseable {
         if (!isReady()) {
             return "unavailable (" + this.unavailableReason + ")";
         }
-        return "ready, " + this.evaluator.instructionCount() + " instructions";
+        return "ready";
     }
 }

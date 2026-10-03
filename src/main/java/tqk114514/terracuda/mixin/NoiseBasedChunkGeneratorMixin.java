@@ -1,6 +1,5 @@
 package tqk114514.terracuda.mixin;
 
-import java.util.List;
 import java.util.Map;
 import java.util.Optional;
 import java.util.concurrent.CompletableFuture;
@@ -12,7 +11,7 @@ import net.minecraft.world.level.ChunkPos;
 import net.minecraft.world.level.StructureManager;
 import net.minecraft.world.level.chunk.ChunkAccess;
 import net.minecraft.world.level.levelgen.NoiseBasedChunkGenerator;
-import net.minecraft.world.level.levelgen.NoiseSettings;
+import net.minecraft.world.level.levelgen.NoiseGeneratorSettings;
 import net.minecraft.world.level.levelgen.RandomState;
 import net.minecraft.world.level.levelgen.blending.Blender;
 
@@ -23,18 +22,19 @@ import org.spongepowered.asm.mixin.injection.callback.CallbackInfoReturnable;
 
 import tqk114514.terracuda.TerraCUDA;
 import tqk114514.terracuda.config.TerracudaConfig;
-import tqk114514.terracuda.gpu.ChunkCornerTables;
 import tqk114514.terracuda.worldgen.GpuWorldgenService;
 
 /**
  * Hooks {@code NoiseBasedChunkGenerator.fillFromNoise}, the entry point to the NOISE stage.
  *
- * <p>At this milestone the hook is deliberately <em>observational</em>: it runs the device path for the
- * chunk and logs what it produced, but never cancels the vanilla call and never touches the chunk. The
- * reason is that producing a correct chunk also needs the material rules, the aquifer and the paletted
- * container replay — M3's K3 and K4 — and returning a half-filled chunk would be worse than not
- * running at all. What this does buy is proof that lowering, module loading, upload and launch all
- * work against a live {@link RandomState} inside a real world.
+ * <p>At this milestone the hook is deliberately <em>observational</em>: it runs the whole device path
+ * for the chunk — lowering, upload, the density, the material rules, the block ids — and logs what came
+ * out, but never cancels the vanilla call and never touches the chunk. Switching it to cancel is a
+ * one-line change, and it is worth waiting for: the replay that writes those ids into the chunk is the
+ * one piece with no unit test behind it, because building a chunk in a test needs registry plumbing
+ * that has nothing to do with this code. Running it in a real world first is the cheaper way to find
+ * out. What it does buy today is proof that the whole chain works against a live {@link RandomState}
+ * inside a real game.
  *
  * <p>Failure containment is the point of the shape here: everything is inside a try/catch, the switch
  * is off by default, the injection is marked non-required, and the mixin config is marked non-required,
@@ -56,9 +56,10 @@ public abstract class NoiseBasedChunkGeneratorMixin {
         }
         try {
             NoiseBasedChunkGenerator self = (NoiseBasedChunkGenerator) (Object) this;
-            NoiseSettings settings = self.generatorSettings().value().noiseSettings();
+            NoiseGeneratorSettings settings = self.generatorSettings().value();
 
-            GpuWorldgenService service = SERVICES.computeIfAbsent(randomState, GpuWorldgenService::of);
+            GpuWorldgenService service = SERVICES.computeIfAbsent(randomState,
+                    key -> GpuWorldgenService.of(key, settings));
             if (!service.isReady()) {
                 if (REPORTED_FAILURE.compareAndSet(false, true)) {
                     TerraCUDA.LOGGER.info("TerraCUDA: shadow mode disabled, device unavailable: {}",
@@ -69,14 +70,13 @@ public abstract class NoiseBasedChunkGeneratorMixin {
 
             ChunkPos pos = centerChunk.getPos();
             long start = System.nanoTime();
-            Optional<List<ChunkCornerTables.MarkerGrid>> tables =
-                    service.markerTables(settings, pos.x(), pos.z());
+            Optional<int[]> ids = service.blockIds(pos.x(), pos.z());
             long micros = (System.nanoTime() - start) / 1000;
 
             long count = CHUNKS.incrementAndGet();
             if (TerracudaConfig.verbose() || count % 256 == 1) {
-                TerraCUDA.LOGGER.info("TerraCUDA shadow: chunk {} -> {} marker tables in {} us ({} chunks seen)",
-                        pos, tables.map(List::size).orElse(0), micros, count);
+                TerraCUDA.LOGGER.info("TerraCUDA shadow: chunk {} -> {} block ids in {} us ({} chunks seen)",
+                        pos, ids.map(blocks -> blocks.length).orElse(0), micros, count);
             }
         } catch (Throwable t) {
             // A diagnostic hook must never break world generation.

@@ -51,10 +51,11 @@ The device path is off by default. To run the whole chain — lowering, upload, 
 rules, block ids — inside a real world without changing what the game generates:
 
 ```
-./gradlew runClient -Pterracuda.shadow
+./gradlew runClient -Pshadow
 ```
 
-Add `-Pterracuda.verbose` to log every chunk rather than every 256th. The hook computes each chunk's
+Add `-Pverbose` to log every chunk rather than every 256th. (`-Pterracuda.shadow` works too, but the
+Windows shell splits it at the dot, so the dotless form is the one to use there.) The hook computes each chunk's
 blocks on the device path and logs how long that took; it never cancels the vanilla call and never
 touches the chunk. A device that cannot be used degrades to a log line.
 

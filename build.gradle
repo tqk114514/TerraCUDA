@@ -74,6 +74,12 @@ base {
 
 java.toolchain.languageVersion = JavaLanguageVersion.of(25)
 
+// Shadow mode is switched on from the command line. Both spellings are accepted because PowerShell
+// splits `-Pterracuda.shadow` at the dot into `-Pterracuda` and `.shadow`, so the dotless one is the
+// form that survives there.
+def terracudaShadow = project.hasProperty('terracuda.shadow') || project.hasProperty('shadow')
+def terracudaVerbose = project.hasProperty('terracuda.verbose') || project.hasProperty('verbose')
+
 neoForge {
     version = project.neo_version
 
@@ -105,15 +111,15 @@ neoForge {
             // Required for the java.lang.foreign CUDA binding to run inside a dev client/server.
             jvmArguments.add('--enable-native-access=ALL-UNNAMED')
 
-            // -Pterracuda.shadow turns the device path on in observation mode, so it can be tried
-            // without editing anything:
-            //     ./gradlew runClient -Pterracuda.shadow
-            // Add -Pterracuda.verbose to log every chunk instead of every 256th.
-            if (project.hasProperty('terracuda.shadow')) {
+            // -Pshadow turns the device path on in observation mode, so it can be tried without
+            // editing anything:
+            //     ./gradlew runClient -Pshadow
+            // Add -Pverbose to log every chunk instead of every 256th.
+            if (terracudaShadow) {
                 jvmArguments.add('-Dterracuda.gpu=true')
                 jvmArguments.add('-Dterracuda.shadow=true')
             }
-            if (project.hasProperty('terracuda.verbose')) {
+            if (terracudaVerbose) {
                 jvmArguments.add('-Dterracuda.verbose=true')
             }
 

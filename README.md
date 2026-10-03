@@ -38,11 +38,12 @@ match the Java reference bit for bit.
 | M0 — CPU reference + parity | **done.** The overworld density function is lowered to an instruction program and evaluated bit-identically to vanilla, and every noise it uses round-trips through the export path. |
 | M1 — FFM + a kernel | **done.** A million points through the CUDA `ImprovedNoise` match the Java reference bit for bit. |
 | M2 — K0/K1/K2 | **done.** `preliminary_surface_level` and every per-chunk marker table (column caches and the 5×5×49 interpolator corner grids) are computed on the device, bit-identically to the CPU reference. |
-| M3 — K3/K4 + chunk replay | not started. Material rules, aquifer, ore veins, and writing the chunk back. |
+| M3 — K3/K4 + chunk replay | **K3 done, K4 not started.** The material rules (aquifer and ore veinifier) are ported and reproduce vanilla's block for every one of 294912 blocks across three chunks. They run on the CPU: the plan puts them in the K3 kernel, and that port is still open. K4 — emitting block ids from the device and writing them back — is not started. |
 | M4 — batching, pinned buffers | not started. |
 
-The GPU path does not yet produce chunks: it computes the density tables, and vanilla's own
-interpolation and block writing still do the rest. That is deliberate — a half-filled chunk would be
+The GPU path does not yet produce chunks. The density tables are computed on the device and the
+material rules run on the CPU, but nothing writes a chunk back yet, and the rules would have to move
+to the device before that would be worth doing. That is deliberate — a half-filled chunk would be
 worse than not running at all.
 
 ### Trying it in a game

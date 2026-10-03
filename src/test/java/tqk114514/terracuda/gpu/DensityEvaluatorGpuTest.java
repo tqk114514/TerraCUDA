@@ -105,15 +105,42 @@ class DensityEvaluatorGpuTest {
         }
     }
 
+    /**
+     * K0: {@code preliminary_surface_level} is a {@code find_top_surface}, which re-enters the density
+     * subtree at a different y for every probe step. It is the root of that program, which is the one
+     * shape the kernel can evaluate soundly.
+     */
     @Test
-    void aProgramUsingFindTopSurfaceIsDeclinedRatherThanMisevaluated() {
-        // preliminary_surface_level is a find_top_surface; final_density is not. The kernel cannot
-        // re-enter the DAG at a different y, so it declines instead of returning a wrong number.
-        DensityProgram preliminary = DensityCompiler.lower(
-                OverworldFixture.randomState().router().preliminarySurfaceLevel());
+    void thePreliminarySurfaceLevelMatchesTheCpuReferenceBitForBit() {
+        DensityProgram program =
+                DensityCompiler.lower(OverworldFixture.randomState().router().preliminarySurfaceLevel());
+        DensityInterpreter reference = new DensityInterpreter(program);
 
-        assertThrows(DensityCompiler.UnsupportedDensityFunctionException.class,
-                () -> DensityProgramImage.of(preliminary));
+        CudaEnvironment environment = CudaEnvironment.detect();
+        assumeTrue(environment.available(), "no CUDA device on this machine");
+        Optional<CudaDriver> loaded = CudaDriver.tryLoad();
+        assumeTrue(loaded.isPresent(), "no CUDA driver library on this machine");
+
+        try (CudaDriver driver = loaded.get()) {
+            driver.init();
+            CudaDeviceInfo device = environment.firstDevice().orElseThrow();
+            try (CudaContext context = CudaContext.create(driver, device.index())) {
+                CudaKernels.loadModule(context, device);
+
+                int count = 1024;
+                int[] coordinates = blockCoordinates(count);
+                try (DensityEvaluatorGpu gpu = new DensityEvaluatorGpu(context, program, count)) {
+                    double[] actual = gpu.evaluate(coordinates);
+                    for (int i = 0; i < count; i++) {
+                        double expected = reference.evaluate(coordinates[3 * i],
+                                coordinates[3 * i + 1], coordinates[3 * i + 2]);
+                        TestParity.assertDoubleIdentical(expected, actual[i],
+                                "(" + coordinates[3 * i] + ", " + coordinates[3 * i + 1] + ", "
+                                        + coordinates[3 * i + 2] + ")");
+                    }
+                }
+            }
+        }
     }
 
     @Test

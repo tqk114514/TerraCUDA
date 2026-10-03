@@ -73,10 +73,10 @@ public final class DensityProgramImage {
     /**
      * Flattens {@code program}.
      *
-     * @throws DensityCompiler.UnsupportedDensityFunctionException when the program contains a node the
-     *         kernel cannot evaluate — {@code find_top_surface} re-enters the DAG at a different y,
-     *         which the flat single-pass evaluation cannot express. That node only appears in
-     *         {@code preliminary_surface_level}, never in {@code final_density}.
+     * @throws DensityCompiler.UnsupportedDensityFunctionException when the program uses
+     *         {@code find_top_surface} somewhere other than the root. That node re-enters the DAG at a
+     *         different y, which rewrites the scratch beneath it; as a root instruction that is sound,
+     *         and {@code preliminary_surface_level} has exactly that shape.
      */
     public static DensityProgramImage of(DensityProgram program) {
         int size = program.size();
@@ -89,9 +89,13 @@ public final class DensityProgramImage {
         double[] rawDb = new double[size];
         for (int pc = 0; pc < size; pc++) {
             rawOp[pc] = program.op(pc);
-            if (rawOp[pc] == DensityProgram.FIND_TOP_SURFACE) {
+            if (rawOp[pc] == DensityProgram.FIND_TOP_SURFACE && pc != program.root()) {
+                // The kernel re-evaluates the density subtree at each probe y, which rewrites the
+                // scratch below this instruction. That is only sound when nothing after it depends on
+                // that scratch — i.e. when it is the root. preliminary_surface_level has this shape.
                 throw new DensityCompiler.UnsupportedDensityFunctionException(
-                        "the GPU interpreter cannot evaluate find_top_surface at instruction " + pc);
+                        "the GPU interpreter can only evaluate find_top_surface as the root, but "
+                                + "instruction " + pc + " is one and the root is " + program.root());
             }
             rawIa[pc] = program.ia(pc);
             rawIb[pc] = program.ib(pc);

@@ -70,6 +70,24 @@ class DensityInterpreterTest {
     }
 
     @Test
+    void theInterpreterMatchesVanillaForThePreliminarySurfaceLevel() {
+        // find_top_surface re-enters the density subtree at a different y for every probe step. That
+        // exercises the interpreter's evaluation-context handling rather than its arithmetic, and it
+        // is where a memo that survives a context change would show up as a wrong surface height.
+        DensityFunction vanilla = OverworldFixture.randomState().router().preliminarySurfaceLevel();
+        DensityInterpreter interpreter = new DensityInterpreter(DensityCompiler.lower(vanilla));
+
+        for (int i = 0; i < 2000; i++) {
+            int x = (int) Math.round(OverworldFixture.coordinate(i, 0) * 64.0);
+            int y = (int) Math.round(OverworldFixture.coordinate(i, 1) * 40.0);
+            int z = (int) Math.round(OverworldFixture.coordinate(i, 2) * 64.0);
+            double expected = vanilla.compute(new DensityFunction.SinglePointContext(x, y, z));
+            double actual = interpreter.evaluate(x, y, z);
+            TestParity.assertDoubleIdentical(expected, actual, "(" + x + ", " + y + ", " + z + ")");
+        }
+    }
+
+    @Test
     void repeatedEvaluationsAreStable() {
         RandomState randomState = OverworldFixture.randomState();
         DensityInterpreter interpreter =

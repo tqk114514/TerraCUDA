@@ -467,7 +467,7 @@ __device__ double tcBlendedNoise(const TcProgram& p, int index, int blockX, int 
     return tcClampedLerp(factor, blendMin / 512.0, blendMax / 512.0) / 128.0;
 }
 
-__device__ double tcCompute(const TcProgram& p, const double* values, int pc) {
+__device__ double tcCompute(TcProgram& p, double* values, int pc) {
     const int* ops = tcInts(p, TC_OFF_OPS);
     const int* ia = tcInts(p, TC_OFF_IA);
     const int* ib = tcInts(p, TC_OFF_IB);
@@ -564,8 +564,35 @@ __device__ double tcCompute(const TcProgram& p, const double* values, int pc) {
             double v = values[ia[pc]];
             return v < da[pc] ? da[pc] : fmin(v, db[pc]);
         }
+        case TC_FIND_TOP_SURFACE: {
+            // Probes downwards in cellHeight steps until the density turns positive. Each probe is a
+            // different y, so the density subtree is re-evaluated from scratch — which is only sound
+            // when this instruction is the root, and the image is built to guarantee that.
+            int densityPc = ia[pc];
+            int lowerBound = ic[pc];
+            int cellHeight = id[pc];
+            int topY = (int) floor(values[ib[pc]] / (double) cellHeight) * cellHeight;
+            if (topY <= lowerBound) {
+                return (double) lowerBound;
+            }
+
+            int savedY = p.blockY;
+            double result = (double) lowerBound;
+            for (int probeY = topY; probeY >= lowerBound; probeY -= cellHeight) {
+                p.blockY = probeY;
+                for (int i = 0; i <= densityPc; i++) {
+                    values[i] = tcCompute(p, values, i);
+                }
+                if (values[densityPc] > 0.0) {
+                    result = (double) probeY;
+                    break;
+                }
+            }
+            p.blockY = savedY;
+            return result;
+        }
         default:
-            // TC_FIND_TOP_SURFACE and anything newer. NaN rather than a guess: the caller compares
+            // Anything newer than this interpreter. NaN rather than a guess: the caller compares
             // against the CPU reference and a mismatch is a loud failure, not silent wrong terrain.
             return __longlong_as_double(0x7FF8000000000000LL);
     }

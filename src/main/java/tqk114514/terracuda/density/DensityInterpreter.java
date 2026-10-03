@@ -203,11 +203,12 @@ public final class DensityInterpreter {
             }
             return lowerBound;
         } finally {
-            // Dropping the version discards every probe result and revalidates the outer context.
-            this.version = savedVersion;
-            this.blockX = savedX;
-            this.blockY = savedY;
-            this.blockZ = savedZ;
+            // Bumping the version rather than restoring it is the whole point: restoring would leave
+            // the probe results stamped with versions the *next* evaluation will hand out, so they
+            // would be mistaken for the outer context's values. Bumping invalidates every probe
+            // result and re-establishes the outer position; the enclosing evaluation recomputes
+            // whatever it had, which is merely slower, never wrong.
+            setContext(savedX, savedY, savedZ);
         }
     }
 

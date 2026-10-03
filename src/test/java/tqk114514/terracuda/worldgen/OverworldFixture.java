@@ -35,12 +35,16 @@ public final class OverworldFixture {
 
     /** The overworld cell geometry: min y, height, and the noise cell sizes. */
     public static NoiseSettings noiseSettings() {
+        return generatorSettings().noiseSettings();
+    }
+
+    /** The overworld generator settings themselves. */
+    public static NoiseGeneratorSettings generatorSettings() {
         Bootstrap.bootStrap();
         HolderLookup.Provider registries = VanillaRegistries.createLookup();
         return registries.lookupOrThrow(Registries.NOISE_SETTINGS)
                 .getOrThrow(NoiseGeneratorSettings.OVERWORLD)
-                .value()
-                .noiseSettings();
+                .value();
     }
 
     /** Deterministic, well-spread sample coordinates in {@code [-1000, 1000)}. */

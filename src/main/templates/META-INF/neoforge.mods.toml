@@ -1,0 +1,47 @@
+
+license="${mod_license}"
+
+issueTrackerURL="https://github.com/tqk114514/TerraCUDA/issues"
+
+[[mods]] #mandatory
+
+modId="${mod_id}" #mandatory
+
+version="${mod_version}" #mandatory
+
+displayName="${mod_name}" #mandatory
+
+displayURL="https://github.com/tqk114514/TerraCUDA"
+
+#logoFile="terracuda.png" #optional
+
+#credits="" #optional
+
+authors="tqk114514"
+
+description='''
+Offloads Minecraft's terrain noise generation from your CPU to your NVIDIA GPU.
+'''
+
+[[mixins]]
+config="${mod_id}.mixins.json"
+
+#[[accessTransformers]]
+#file="META-INF/accesstransformer.cfg"
+
+[[dependencies.${mod_id}]] #optional
+    modId="neoforge" #mandatory
+    type="required" #mandatory
+    versionRange="[${neo_version},)" #mandatory
+    ordering="NONE"
+    side="BOTH"
+
+[[dependencies.${mod_id}]]
+    modId="minecraft"
+    type="required"
+    versionRange="${minecraft_version_range}"
+    ordering="NONE"
+    side="BOTH"
+
+#[features.${mod_id}]
+#openGLVersion="[3.2,)"

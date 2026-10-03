@@ -31,6 +31,32 @@ without an NVIDIA driver.
 `ImprovedNoiseGpuTest` is the GPU acceptance test: a million points through the CUDA kernel must
 match the Java reference bit for bit.
 
+## Status
+
+| Milestone | State |
+|---|---|
+| M0 — CPU reference + parity | **done.** The overworld density function is lowered to an instruction program and evaluated bit-identically to vanilla, and every noise it uses round-trips through the export path. |
+| M1 — FFM + a kernel | **done.** A million points through the CUDA `ImprovedNoise` match the Java reference bit for bit. |
+| M2 — K0/K1/K2 | **done.** `preliminary_surface_level` and every per-chunk marker table (column caches and the 5×5×49 interpolator corner grids) are computed on the device, bit-identically to the CPU reference. |
+| M3 — K3/K4 + chunk replay | not started. Material rules, aquifer, ore veins, and writing the chunk back. |
+| M4 — batching, pinned buffers | not started. |
+
+The GPU path does not yet produce chunks: it computes the density tables, and vanilla's own
+interpolation and block writing still do the rest. That is deliberate — a half-filled chunk would be
+worse than not running at all.
+
+### Trying it in a game
+
+The device path is off by default. To exercise it inside a running world without changing what the
+game generates:
+
+```
+-Dterracuda.gpu=true -Dterracuda.shadow=true
+```
+
+It computes each chunk's marker tables on the device and logs how long that took. A device that
+cannot be used degrades to a log line; nothing throws into the generation path.
+
 ## GPU kernels
 
 The CUDA source lives in `src/main/cuda/` and is shipped inside the jar. At runtime the mod picks the

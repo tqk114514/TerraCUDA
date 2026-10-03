@@ -24,7 +24,6 @@ import tqk114514.terracuda.density.CornerInterpolation;
 import tqk114514.terracuda.density.DensityCompiler;
 import tqk114514.terracuda.density.DensityInterpreter;
 import tqk114514.terracuda.gpu.DensityEvaluatorGpu;
-import tqk114514.terracuda.gpu.InterpolatedDensity;
 import tqk114514.terracuda.math.VanillaMath;
 
 /**
@@ -83,8 +82,10 @@ class MaterialRulesTest {
         int height = settings.height();
 
         DensityInterpreter density = lower(router.finalDensity());
-        try (DensityEvaluatorGpu evaluator = new DensityEvaluatorGpu(context, density.program(), 2048)) {
-            double[] densities = InterpolatedDensity.forChunk(evaluator, density, settings, chunkX, chunkZ);
+        try (DensityEvaluatorGpu evaluator =
+                DensityEvaluatorGpu.forProgram(context, density.program(), settings)) {
+            double[] densities = evaluator.blocksForChunk(settings, chunkX, chunkZ,
+                    CornerInterpolation.DEFAULT);
             double[] veinToggle = perBlock(context, router.veinToggle(), settings, chunkX, chunkZ);
             double[] veinRidged = perBlock(context, router.veinRidged(), settings, chunkX, chunkZ);
 
@@ -186,8 +187,8 @@ class MaterialRulesTest {
             NoiseSettings settings, int chunkX, int chunkZ) {
         DensityInterpreter interpreter = lower(function);
         try (DensityEvaluatorGpu evaluator =
-                new DensityEvaluatorGpu(context, interpreter.program(), 2048)) {
-            return InterpolatedDensity.forChunk(evaluator, interpreter, settings, chunkX, chunkZ,
+                DensityEvaluatorGpu.forProgram(context, interpreter.program(), settings)) {
+            return evaluator.blocksForChunk(settings, chunkX, chunkZ,
                     CornerInterpolation.INCREMENTAL);
         }
     }

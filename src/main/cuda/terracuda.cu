@@ -208,9 +208,14 @@ __device__ __forceinline__ double improvedNoise(const unsigned char* p, double x
 #define TC_SQUEEZE 28
 #define TC_CLAMP 29
 #define TC_FIND_TOP_SURFACE 30
+#define TC_OVERRIDE 31
 
 #define TC_SPLINE_CONSTANT 0
 #define TC_SPLINE_MULTIPOINT 1
+
+// Blend orders, mirroring CornerInterpolation.
+#define TC_ORDER_INCREMENTAL 0
+#define TC_ORDER_LERP3 1
 
 namespace {
 
@@ -591,11 +596,55 @@ __device__ double tcCompute(TcProgram& p, double* values, int pc) {
             p.blockY = savedY;
             return result;
         }
+        case TC_OVERRIDE:
+            // A leaf the caller filled in before the sweep — an interpolated marker blended down from
+            // its corner grid. Returning the slot is what keeps the forward pass from clobbering it.
+            return values[pc];
         default:
             // Anything newer than this interpreter. NaN rather than a guess: the caller compares
             // against the CPU reference and a mismatch is a loud failure, not silent wrong terrain.
             return __longlong_as_double(0x7FF8000000000000LL);
     }
+}
+
+// One block's trilinear blend out of a marker's corner grid. Both orders live here so the two
+// kernels that need a blend cannot drift apart.
+__device__ __forceinline__ double tcBlendMarker(const double* __restrict__ corners, int base,
+                                                int cell, int cornerCountY, int order,
+                                                double factorX, double factorY, double factorZ) {
+    const double* v = corners + base;
+    int stepX = 5 * cornerCountY;
+    double n000 = v[cell];
+    double n001 = v[cell + cornerCountY];
+    double n100 = v[cell + stepX];
+    double n101 = v[cell + stepX + cornerCountY];
+    double n010 = v[cell + 1];
+    double n011 = v[cell + cornerCountY + 1];
+    double n110 = v[cell + stepX + 1];
+    double n111 = v[cell + stepX + cornerCountY + 1];
+
+    if (order == TC_ORDER_LERP3) {
+        return lerp3(factorX, factorY, factorZ, n000, n100, n010, n110, n001, n101, n011, n111);
+    }
+    // NoiseInterpolator.updateForY/X/Z: Y, then X, then Z.
+    double xz00 = lerp(factorY, n000, n010);
+    double xz10 = lerp(factorY, n100, n110);
+    double xz01 = lerp(factorY, n001, n011);
+    double xz11 = lerp(factorY, n101, n111);
+    double z0 = lerp(factorX, xz00, xz10);
+    double z1 = lerp(factorX, xz01, xz11);
+    return lerp(factorZ, z0, z1);
+}
+
+// Splits a linear block index into chunk-local coordinates, in the layout the caller uses for its
+// per-block arrays: (x * sizeXZ + z) * height + y. Returned once so the block position and the cell
+// coordinates cannot be derived two different ways and drift.
+__device__ __forceinline__ void tcBlockLocal(int index, int sizeXZ, int height,
+                                             int* xLocal, int* zLocal, int* yLocal) {
+    *yLocal = index % height;
+    int rest = index / height;
+    *zLocal = rest % sizeXZ;
+    *xLocal = rest / sizeXZ;
 }
 
 }  // namespace
@@ -653,6 +702,72 @@ extern "C" __global__ void terracuda_density_evaluate(
 
     // The image is emitted in post-order, so every instruction sits after the ones it reads and a
     // single forward pass is a valid evaluation.
+    for (int pc = 0; pc < instructionCount; pc++) {
+        values[pc] = tcCompute(program, values, pc);
+    }
+    results[index] = values[program.root];
+}
+
+// The chunk-level pass: blend each interpolated marker down to block resolution, then evaluate the
+// DAG above it, all in one launch. One double comes back per block.
+//
+// Both halves used to run on the CPU and measured at about eleven milliseconds per chunk — seven and
+// a half of it the interpreter walking the few dozen instructions above the markers, and three and a
+// half the blend. Neither is large in absolute terms, and both are embarrassingly parallel, which is
+// exactly the shape that does not belong on one core. The `blob` here is the reduced image built by
+// `DensityProgramImage.ofBlocks`: the marker subgraphs are gone, replaced by TC_OVERRIDE leaves that
+// the blend fills in below.
+//
+// `bases` and `slots` are parallel per-marker arrays: where the marker's corner grid starts in
+// `corners`, and which instruction to write its blended value to.
+extern "C" __global__ void terracuda_density_blocks(
+        const char* __restrict__ blob,
+        const long long* __restrict__ offsets,
+        int instructionCount,
+        int root,
+        const double* __restrict__ corners,
+        const int* __restrict__ bases,
+        const int* __restrict__ slots,
+        int markerCount,
+        int cellWidth, int cellHeight, int cornerCountY, int sizeXZ, int height, int order,
+        int chunkMinBlockX, int minY, int chunkMinBlockZ,
+        double* __restrict__ scratch,     // count * instructionCount
+        double* __restrict__ results,     // count
+        int count) {
+    int index = blockIdx.x * blockDim.x + threadIdx.x;
+    if (index >= count) {
+        return;
+    }
+
+    TcProgram program;
+    program.blob = blob;
+    program.offsets = offsets;
+    program.root = root;
+    program.instructionCount = instructionCount;
+
+    int xLocal, zLocal, yLocal;
+    tcBlockLocal(index, sizeXZ, height, &xLocal, &zLocal, &yLocal);
+    program.blockX = chunkMinBlockX + xLocal;
+    program.blockY = minY + yLocal;
+    program.blockZ = chunkMinBlockZ + zLocal;
+
+    int cellX = xLocal / cellWidth;
+    int cellY = yLocal / cellHeight;
+    int cellZ = zLocal / cellWidth;
+    double factorX = (double) (xLocal % cellWidth) / (double) cellWidth;
+    double factorY = (double) (yLocal % cellHeight) / (double) cellHeight;
+    double factorZ = (double) (zLocal % cellWidth) / (double) cellWidth;
+
+    double* values = scratch + (long long) index * instructionCount;
+
+    int cell = (cellX * 5 + cellZ) * cornerCountY + cellY;
+    for (int m = 0; m < markerCount; m++) {
+        values[slots[m]] = tcBlendMarker(corners, bases[m], cell, cornerCountY, order,
+                factorX, factorY, factorZ);
+    }
+
+    // The image is in post-order, so every instruction sits after the ones it reads. TC_OVERRIDE
+    // returns its own slot, so the sweep leaves the blends above untouched.
     for (int pc = 0; pc < instructionCount; pc++) {
         values[pc] = tcCompute(program, values, pc);
     }

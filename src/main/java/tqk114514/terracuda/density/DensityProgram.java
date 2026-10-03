@@ -57,6 +57,17 @@ public final class DensityProgram {
     public static final int CLAMP = 29;
     public static final int FIND_TOP_SURFACE = 30;
 
+    /**
+     * A value supplied from outside the program.
+     *
+     * <p>Only produced by {@code DensityProgramImage.ofBlocks}, which lowers a program with its
+     * interpolated markers cut out: those markers become leaves of this kind, and the caller fills
+     * them in — with the trilinear blend of the marker's corner grid — before evaluating. The rest of
+     * the DAG above them is unchanged, so the chunk-level pass can run on the device without the
+     * marker subgraphs, which is the whole point.
+     */
+    public static final int OVERRIDE = 31;
+
     public static final int MARKER_INTERPOLATED = 1;
     public static final int MARKER_FLAT_CACHE = 2;
     public static final int MARKER_CACHE_2D = 3;

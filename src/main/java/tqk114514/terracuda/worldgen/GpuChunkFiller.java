@@ -14,8 +14,8 @@ import tqk114514.terracuda.cuda.CudaContext;
 import tqk114514.terracuda.density.CornerInterpolation;
 import tqk114514.terracuda.density.DensityCompiler;
 import tqk114514.terracuda.density.DensityInterpreter;
+import tqk114514.terracuda.density.DensityProgram;
 import tqk114514.terracuda.gpu.DensityEvaluatorGpu;
-import tqk114514.terracuda.gpu.InterpolatedDensity;
 
 /**
  * Produces a chunk's blocks: the density comes from the device, the material rules run here, and the
@@ -23,10 +23,9 @@ import tqk114514.terracuda.gpu.InterpolatedDensity;
  *
  * <p>This is M3's K3 and K4 joined up, and it is a hybrid on purpose. The design doc puts the material
  * rules in the K3 kernel too, but they are branch- and table-driven rather than floating-point heavy —
- * the FLOP density is in the interpolator corners, and that part is on the device. Moving the aquifer
- * across would mean a per-thread copy of its grid and caches for very little gain, so it stays here
- * until something measures otherwise. The split is exactly the one the plan describes for the CPU
- * reference: corners from the device, arithmetic above them wherever it is cheapest.
+ * the FLOP density is in the interpolator corners and the arithmetic above them, and both of those are
+ * on the device. Moving the aquifer across would mean a per-thread copy of its grid and caches for
+ * very little gain, so it stays here until something measures otherwise.
  *
  * <p>Everything is per world: the lowered programs and the device buffers are built once and reused for
  * every chunk. Not thread-safe — one instance belongs to one thread, which is why
@@ -36,12 +35,8 @@ public final class GpuChunkFiller implements AutoCloseable {
 
     private final NoiseGeneratorSettings settings;
     private final NoiseSettings geometry;
-    private final NoiseRouter router;
     private final RandomState randomState;
 
-    private final DensityInterpreter density;
-    private final DensityInterpreter veinToggle;
-    private final DensityInterpreter veinRidged;
     private final DensityInterpreter barrierNoise;
     private final DensityInterpreter floodedness;
     private final DensityInterpreter spread;
@@ -60,24 +55,24 @@ public final class GpuChunkFiller implements AutoCloseable {
     private GpuChunkFiller(CudaContext context, RandomState randomState, NoiseGeneratorSettings settings) {
         this.settings = settings;
         this.geometry = settings.noiseSettings();
-        this.router = randomState.router();
         this.randomState = randomState;
 
-        this.density = lower(this.router.finalDensity());
-        this.veinToggle = lower(this.router.veinToggle());
-        this.veinRidged = lower(this.router.veinRidged());
-        this.barrierNoise = lower(this.router.barrierNoise());
-        this.floodedness = lower(this.router.fluidLevelFloodednessNoise());
-        this.spread = lower(this.router.fluidLevelSpreadNoise());
-        this.lava = lower(this.router.lavaNoise());
-        this.erosion = lower(this.router.erosion());
-        this.depth = lower(this.router.depth());
-        this.veinGap = lower(this.router.veinGap());
-        this.preliminarySurface = lower(this.router.preliminarySurfaceLevel());
+        NoiseRouter router = randomState.router();
+        DensityProgram density = DensityCompiler.lower(router.finalDensity());
+        DensityProgram veinToggle = DensityCompiler.lower(router.veinToggle());
+        DensityProgram veinRidged = DensityCompiler.lower(router.veinRidged());
+        this.barrierNoise = lower(router.barrierNoise());
+        this.floodedness = lower(router.fluidLevelFloodednessNoise());
+        this.spread = lower(router.fluidLevelSpreadNoise());
+        this.lava = lower(router.lavaNoise());
+        this.erosion = lower(router.erosion());
+        this.depth = lower(router.depth());
+        this.veinGap = lower(router.veinGap());
+        this.preliminarySurface = lower(router.preliminarySurfaceLevel());
 
-        this.densityEvaluator = DensityEvaluatorGpu.forProgram(context, this.density.program(), this.geometry);
-        this.veinToggleEvaluator = DensityEvaluatorGpu.forProgram(context, this.veinToggle.program(), this.geometry);
-        this.veinRidgedEvaluator = DensityEvaluatorGpu.forProgram(context, this.veinRidged.program(), this.geometry);
+        this.densityEvaluator = DensityEvaluatorGpu.forProgram(context, density, this.geometry);
+        this.veinToggleEvaluator = DensityEvaluatorGpu.forProgram(context, veinToggle, this.geometry);
+        this.veinRidgedEvaluator = DensityEvaluatorGpu.forProgram(context, veinRidged, this.geometry);
     }
 
     public static GpuChunkFiller create(CudaContext context, RandomState randomState,
@@ -90,12 +85,15 @@ public final class GpuChunkFiller implements AutoCloseable {
         int minY = this.geometry.minY();
         int height = this.geometry.height();
 
-        double[] densities = InterpolatedDensity.forChunk(this.densityEvaluator, this.density,
-                this.geometry, chunkX, chunkZ);
-        double[] veinToggleValues = InterpolatedDensity.forChunk(this.veinToggleEvaluator,
-                this.veinToggle, this.geometry, chunkX, chunkZ, CornerInterpolation.INCREMENTAL);
-        double[] veinRidgedValues = InterpolatedDensity.forChunk(this.veinRidgedEvaluator,
-                this.veinRidged, this.geometry, chunkX, chunkZ, CornerInterpolation.INCREMENTAL);
+        // final_density is a cache_all_in_cell marker, so the rules see the lerp3 blend; the vein
+        // functions are read straight, so they take the incremental one. The difference is in the last
+        // bits and InterpolationOrderTest pins it down.
+        double[] densities = this.densityEvaluator.blocksForChunk(this.geometry, chunkX, chunkZ,
+                CornerInterpolation.LERP3);
+        double[] veinToggleValues = this.veinToggleEvaluator.blocksForChunk(this.geometry, chunkX,
+                chunkZ, CornerInterpolation.INCREMENTAL);
+        double[] veinRidgedValues = this.veinRidgedEvaluator.blocksForChunk(this.geometry, chunkX,
+                chunkZ, CornerInterpolation.INCREMENTAL);
 
         MaterialRules.RouterNoises noises = new MaterialRules.RouterNoises(
                 this.barrierNoise, this.floodedness, this.spread, this.lava, this.erosion,

@@ -12,39 +12,62 @@ import tqk114514.terracuda.density.DensityProgramImage;
 import net.minecraft.world.level.levelgen.NoiseSettings;
 
 /**
- * GPU-backed evaluation of a lowered density program: the K2 kernel of the design doc.
+ * GPU-backed evaluation of a lowered density program: the K2 and K3 kernels of the design doc.
  *
- * <p>One thread per block position, each running the whole instruction stream. The program is
- * uploaded once as a single read-only blob, so the per-batch cost is the point transfer plus the
- * launch.
+ * <p>Two images of the same program live here, and the split between them is the point:
  *
- * <p>The per-thread scratch is a global buffer of {@code capacity * instructionCount} doubles rather
- * than local memory: at a few hundred instructions per thread, local memory would be several kilobytes
- * each, and a device-side allocation per thread would be worse still.
+ * <ul>
+ *   <li>the full image, evaluated one thread per point against a root, produces the marker tables —
+ *       the {@code 5 × 5 × 49} corner grid of every interpolated marker;</li>
+ *   <li>the reduced image, from {@link DensityProgramImage#ofBlocks}, keeps only the DAG above those
+ *       markers and leaves them as {@code OVERRIDE} leaves. One thread per block blends the corners
+ *       down, drops the results into the leaves, and evaluates what is left.</li>
+ * </ul>
+ *
+ * <p>The second image is why the chunk pass is cheap. Running the whole program per block would be
+ * ten times the instructions for the same answer, and uploading the marker tables to blend them on
+ * the host — which is what this did first — spends more on turning them back into a Java array than
+ * the blend itself costs.
+ *
+ * <p>One thread per point, so the per-thread scratch is a global buffer rather than local memory: at
+ * a few hundred instructions per thread, local memory would be several kilobytes each.
  */
 public final class DensityEvaluatorGpu implements AutoCloseable {
 
-    /** The exported kernel symbol, matching {@code terracuda.cu}. */
+    /** The exported kernel symbol for the marker-table pass, matching {@code terracuda.cu}. */
     public static final String KERNEL_NAME = "terracuda_density_evaluate";
+
+    /** The exported kernel symbol for the per-block pass. */
+    public static final String BLOCKS_KERNEL_NAME = "terracuda_density_blocks";
 
     private static final int BLOCK_SIZE = 128;
     private static final int MIN_CAPACITY = 2048;
 
+    /** The chunk is 16 blocks across, which the block kernel needs to recover x and z. */
+    private static final int CHUNK_SIZE_XZ = 16;
+
     private final CudaContext context;
     private final DensityProgramImage image;
+    private final DensityProgramImage blockImage;
     private final CudaContext.DeviceBuffer blob;
     private final CudaContext.DeviceBuffer offsets;
+    private final CudaContext.DeviceBuffer blockBlob;
+    private final CudaContext.DeviceBuffer blockOffsets;
     private final CudaContext.DeviceBuffer points;
     private final CudaContext.DeviceBuffer scratch;
     private final CudaContext.DeviceBuffer results;
     private CudaContext.DeviceBuffer roots;
+    private CudaContext.DeviceBuffer markerBases;
+    private CudaContext.DeviceBuffer markerSlots;
+    private CudaContext.DeviceBuffer blockScratch;
+    private CudaContext.DeviceBuffer blockResults;
     private final int instructionCount;
     private final int root;
     private final int capacity;
     private boolean closed;
 
     public DensityEvaluatorGpu(CudaContext context, DensityProgram program, int capacity) {
-        this(context, DensityProgramImage.of(program), capacity);
+        this(context, DensityProgramImage.of(program), DensityProgramImage.ofBlocks(program), capacity);
     }
 
     /**
@@ -57,35 +80,51 @@ public final class DensityEvaluatorGpu implements AutoCloseable {
             NoiseSettings settings) {
         DensityProgramImage image = DensityProgramImage.of(program);
         int budget = Math.max(MIN_CAPACITY, ChunkCornerTables.pointBudget(image, settings));
-        return new DensityEvaluatorGpu(context, image, budget);
+        return new DensityEvaluatorGpu(context, image, DensityProgramImage.ofBlocks(program), budget);
     }
 
-    public DensityEvaluatorGpu(CudaContext context, DensityProgramImage image, int capacity) {
+    private DensityEvaluatorGpu(CudaContext context, DensityProgramImage image,
+            DensityProgramImage blockImage, int capacity) {
         if (capacity <= 0) {
             throw new IllegalArgumentException("capacity must be positive, got " + capacity);
         }
         this.context = context;
         this.image = image;
+        this.blockImage = blockImage;
         this.instructionCount = image.instructionCount();
         this.root = image.root();
         this.capacity = capacity;
 
-        try (Arena arena = Arena.ofConfined()) {
-            byte[] blobBytes = image.blob();
-            MemorySegment hostBlob = arena.allocate(blobBytes.length);
-            MemorySegment.copy(blobBytes, 0, hostBlob, ValueLayout.JAVA_BYTE, 0, blobBytes.length);
-            this.blob = context.allocate(blobBytes.length);
-            context.copyToDevice(hostBlob, this.blob);
-
-            long[] offsetValues = image.offsets();
-            MemorySegment hostOffsets = arena.allocateFrom(ValueLayout.JAVA_LONG, offsetValues);
-            this.offsets = context.allocate(hostOffsets.byteSize());
-            context.copyToDevice(hostOffsets, this.offsets);
-        }
+        this.blob = uploadBlob(image);
+        this.offsets = uploadOffsets(image);
+        this.blockBlob = uploadBlob(blockImage);
+        this.blockOffsets = uploadOffsets(blockImage);
 
         this.points = context.allocate(3L * capacity * Integer.BYTES);
         this.scratch = context.allocate((long) capacity * this.instructionCount * Double.BYTES);
         this.results = context.allocate((long) capacity * Double.BYTES);
+    }
+
+    /** Uploads one image's blob. */
+    private CudaContext.DeviceBuffer uploadBlob(DensityProgramImage source) {
+        try (Arena arena = Arena.ofConfined()) {
+            byte[] blobBytes = source.blob();
+            MemorySegment hostBlob = arena.allocate(blobBytes.length);
+            MemorySegment.copy(blobBytes, 0, hostBlob, ValueLayout.JAVA_BYTE, 0, blobBytes.length);
+            CudaContext.DeviceBuffer buffer = this.context.allocate(blobBytes.length);
+            this.context.copyToDevice(hostBlob, buffer);
+            return buffer;
+        }
+    }
+
+    /** Uploads one image's offset table. */
+    private CudaContext.DeviceBuffer uploadOffsets(DensityProgramImage source) {
+        try (Arena arena = Arena.ofConfined()) {
+            MemorySegment hostOffsets = arena.allocateFrom(ValueLayout.JAVA_LONG, source.offsets());
+            CudaContext.DeviceBuffer buffer = this.context.allocate(hostOffsets.byteSize());
+            this.context.copyToDevice(hostOffsets, buffer);
+            return buffer;
+        }
     }
 
     public int capacity() {
@@ -99,6 +138,11 @@ public final class DensityEvaluatorGpu implements AutoCloseable {
     /** The uploaded program, including the marker roots used to build the chunk-level tables. */
     public DensityProgramImage image() {
         return this.image;
+    }
+
+    /** The reduced image the per-block pass runs: the DAG above the interpolated markers. */
+    public DensityProgramImage blockImage() {
+        return this.blockImage;
     }
 
     /**
@@ -140,6 +184,23 @@ public final class DensityEvaluatorGpu implements AutoCloseable {
     }
 
     private double[] evaluate(int[] blockCoordinates, int rootInstruction, int[] roots) {
+        launch(blockCoordinates, rootInstruction, roots);
+        int count = blockCoordinates.length / 3;
+        try (Arena arena = Arena.ofConfined()) {
+            MemorySegment hostResults = arena.allocate(ValueLayout.JAVA_DOUBLE, count);
+            this.context.copyFromDevice(this.results, hostResults);
+            return hostResults.toArray(ValueLayout.JAVA_DOUBLE);
+        }
+    }
+
+    /**
+     * Runs the marker-table evaluation and leaves the result in device memory.
+     *
+     * <p>Used by {@link #blocksForChunk}, where the corner tables are an input to the next kernel
+     * rather than something the host wants: reading them back only to upload them again would be a
+     * round trip through the slowest link in the system for no reason.
+     */
+    private void launch(int[] blockCoordinates, int rootInstruction, int[] roots) {
         if (blockCoordinates.length % 3 != 0) {
             throw new IllegalArgumentException("expected interleaved xyz triples, got "
                     + blockCoordinates.length + " ints");
@@ -157,7 +218,7 @@ public final class DensityEvaluatorGpu implements AutoCloseable {
                     + " is outside [0, " + this.instructionCount + ")");
         }
         if (count == 0) {
-            return new double[0];
+            return;
         }
 
         try (Arena arena = Arena.ofConfined()) {
@@ -188,11 +249,114 @@ public final class DensityEvaluatorGpu implements AutoCloseable {
                 this.context.launch(KERNEL_NAME, grid, 1, 1, BLOCK_SIZE, 1, 1, arguments);
             }
             this.context.synchronize();
-
-            MemorySegment hostResults = arena.allocate(ValueLayout.JAVA_DOUBLE, count);
-            this.context.copyFromDevice(this.results, hostResults);
-            return hostResults.toArray(ValueLayout.JAVA_DOUBLE);
         }
+    }
+
+    /**
+     * The value of the program at every block of one chunk — marker tables, blend and the DAG above
+     * them, all on the device.
+     *
+     * <p>This is K3's density half. Both stages it replaces were measured on the host and neither was
+     * small: about seven and a half milliseconds of interpreting the DAG above the markers, and three
+     * and a half of trilinear blend, against roughly a fifth of a millisecond to read the answer back.
+     *
+     * @param order {@link tqk114514.terracuda.density.CornerInterpolation#LERP3} or {@code INCREMENTAL}
+     * @return {@code 16 * 16 * height} values, indexed {@code (x * 16 + z) * height + (y - minY)}
+     */
+    public double[] blocksForChunk(NoiseSettings settings, int chunkX, int chunkZ, int order) {
+        int[] cornerRoots = interpolatedRoots(this.image);
+        int[] slots = interpolatedRoots(this.blockImage);
+        if (cornerRoots.length != slots.length) {
+            throw new IllegalStateException("the reduced image has " + slots.length
+                    + " interpolated markers, the full one has " + cornerRoots.length);
+        }
+
+        int markerCount = cornerRoots.length;
+        int countY = ChunkCornerTables.cornerCountY(settings);
+        int perMarker = ChunkCornerTables.CORNERS_XZ * ChunkCornerTables.CORNERS_XZ * countY;
+        int count = CHUNK_SIZE_XZ * CHUNK_SIZE_XZ * settings.height();
+
+        if (markerCount > 0) {
+            int[] single = ChunkCornerTables.cornerCoordinates(settings, chunkX, chunkZ);
+            int[] combinedPoints = new int[markerCount * single.length];
+            int[] combinedRoots = new int[markerCount * perMarker];
+            for (int m = 0; m < markerCount; m++) {
+                System.arraycopy(single, 0, combinedPoints, m * single.length, single.length);
+                java.util.Arrays.fill(combinedRoots, m * perMarker, (m + 1) * perMarker,
+                        cornerRoots[m]);
+            }
+            launch(combinedPoints, this.root, combinedRoots);
+        }
+
+        int blockInstructions = this.blockImage.instructionCount();
+        if (this.blockScratch == null) {
+            this.markerBases = this.context.allocate((long) Math.max(1, markerCount) * Integer.BYTES);
+            this.markerSlots = this.context.allocate((long) Math.max(1, markerCount) * Integer.BYTES);
+            this.blockResults = this.context.allocate((long) count * Double.BYTES);
+            this.blockScratch = this.context.allocate((long) count * blockInstructions * Double.BYTES);
+        }
+
+        int[] bases = new int[markerCount];
+        for (int m = 0; m < markerCount; m++) {
+            bases[m] = m * perMarker;
+        }
+
+        try (Arena arena = Arena.ofConfined()) {
+            MemorySegment hostBases = arena.allocateFrom(ValueLayout.JAVA_INT, bases);
+            this.context.copyToDevice(hostBases, this.markerBases);
+            MemorySegment hostSlots = arena.allocateFrom(ValueLayout.JAVA_INT, slots);
+            this.context.copyToDevice(hostSlots, this.markerSlots);
+
+            try (KernelArguments arguments = new KernelArguments(20)) {
+                arguments.addDevicePointer(this.blockBlob.address())
+                        .addDevicePointer(this.blockOffsets.address())
+                        .addInt(blockInstructions)
+                        .addInt(this.blockImage.root())
+                        .addDevicePointer(this.results.address())
+                        .addDevicePointer(this.markerBases.address())
+                        .addDevicePointer(this.markerSlots.address())
+                        .addInt(markerCount)
+                        .addInt(settings.getCellWidth())
+                        .addInt(settings.getCellHeight())
+                        .addInt(countY)
+                        .addInt(CHUNK_SIZE_XZ)
+                        .addInt(settings.height())
+                        .addInt(order)
+                        .addInt(chunkX * CHUNK_SIZE_XZ)
+                        .addInt(settings.minY())
+                        .addInt(chunkZ * CHUNK_SIZE_XZ)
+                        .addDevicePointer(this.blockScratch.address())
+                        .addDevicePointer(this.blockResults.address())
+                        .addInt(count);
+                int grid = (count + BLOCK_SIZE - 1) / BLOCK_SIZE;
+                this.context.launch(BLOCKS_KERNEL_NAME, grid, 1, 1, BLOCK_SIZE, 1, 1, arguments);
+            }
+            this.context.synchronize();
+
+            MemorySegment host = arena.allocate(ValueLayout.JAVA_DOUBLE, count);
+            this.context.copyFromDevice(this.blockResults, host);
+            return host.toArray(ValueLayout.JAVA_DOUBLE);
+        }
+    }
+
+    /** The image instruction each interpolated marker wraps, in the image's own marker order. */
+    private static int[] interpolatedRoots(DensityProgramImage source) {
+        int[] kinds = source.markerKinds();
+        int[] roots = source.markerRoots();
+        int markers = 0;
+        for (int kind : kinds) {
+            if (kind == DensityProgram.MARKER_INTERPOLATED) {
+                markers++;
+            }
+        }
+        int[] out = new int[markers];
+        int at = 0;
+        for (int i = 0; i < kinds.length; i++) {
+            if (kinds[i] == DensityProgram.MARKER_INTERPOLATED) {
+                out[at++] = roots[i];
+            }
+        }
+        return out;
     }
 
     @Override
@@ -204,12 +368,26 @@ public final class DensityEvaluatorGpu implements AutoCloseable {
         if (this.context.isClosed()) {
             return;
         }
+        if (this.blockScratch != null) {
+            this.context.free(this.blockScratch);
+        }
+        if (this.blockResults != null) {
+            this.context.free(this.blockResults);
+        }
+        if (this.markerSlots != null) {
+            this.context.free(this.markerSlots);
+        }
+        if (this.markerBases != null) {
+            this.context.free(this.markerBases);
+        }
         this.context.free(this.results);
         if (this.roots != null) {
             this.context.free(this.roots);
         }
         this.context.free(this.scratch);
         this.context.free(this.points);
+        this.context.free(this.blockOffsets);
+        this.context.free(this.blockBlob);
         this.context.free(this.offsets);
         this.context.free(this.blob);
     }

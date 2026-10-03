@@ -94,7 +94,38 @@ public final class DensityProgramImage {
      *         and {@code preliminary_surface_level} has exactly that shape.
      */
     public static DensityProgramImage of(DensityProgram program) {
+        return of(program, false);
+    }
+
+    /**
+     * Flattens only the part of {@code program} that sits <em>above</em> its interpolated markers.
+     *
+     * <p>Each interpolated marker becomes an {@link DensityProgram#OVERRIDE} leaf instead of being
+     * expanded. The caller fills those leaves in with the marker's trilinear blend and evaluates the
+     * result, which is what makes the chunk-level pass small enough to run on the device: the marker
+     * subgraphs are thousands of instructions, and this image is the few dozen around them.
+     *
+     * <p>Markers that are not interpolated are expanded as usual. In the overworld they all sit inside
+     * an interpolated marker, so they drop out entirely; a data pack that put one above them would
+     * keep its subtree, which is correct if not free.
+     */
+    public static DensityProgramImage ofBlocks(DensityProgram program) {
+        return of(program, true);
+    }
+
+    private static DensityProgramImage of(DensityProgram program, boolean stopAtInterpolated) {
         int size = program.size();
+        boolean[] stop = new boolean[size];
+        if (stopAtInterpolated) {
+            int[] kinds = program.markerKinds();
+            int[] roots = program.markerRoots();
+            for (int i = 0; i < kinds.length; i++) {
+                if (kinds[i] == DensityProgram.MARKER_INTERPOLATED) {
+                    stop[roots[i]] = true;
+                }
+            }
+        }
+
         int[] rawOp = new int[size];
         int[] rawIa = new int[size];
         int[] rawIb = new int[size];
@@ -124,7 +155,7 @@ public final class DensityProgramImage {
         // subgraph shared by two parents keeps the index it got the first time. Re-emit the reachable
         // graph in post-order so that every child precedes its parent, which is what lets the kernel
         // evaluate the whole stream in one forward pass.
-        int[] order = postOrder(program, rawOp, rawIa, rawIb, rawIc);
+        int[] order = postOrder(program, rawOp, rawIa, rawIb, rawIc, stop);
         int[] newIndex = new int[size];
         java.util.Arrays.fill(newIndex, -1);
         for (int i = 0; i < order.length; i++) {
@@ -141,7 +172,9 @@ public final class DensityProgramImage {
         double[] db = new double[count];
         for (int i = 0; i < count; i++) {
             int pc = order[i];
-            ops[i] = rawOp[pc];
+            // A cut marker keeps its index so its parents still resolve, but its opcode becomes a leaf
+            // the caller fills in; its own operands are never read again.
+            ops[i] = stop[pc] ? DensityProgram.OVERRIDE : rawOp[pc];
             ia[i] = remap(rawIa[pc], ops[i], 0, newIndex);
             ib[i] = remap(rawIb[pc], ops[i], 1, newIndex);
             ic[i] = remap(rawIc[pc], ops[i], 2, newIndex);
@@ -295,41 +328,51 @@ public final class DensityProgramImage {
     /**
      * Emits the reachable graph in post-order, so that every instruction appears after all of the
      * instructions it reads. Shared subgraphs are emitted once.
+     *
+     * <p>{@code stop} marks instructions to emit as leaves rather than expand — the interpolated
+     * markers, when the caller wants only the DAG above them.
      */
-    private static int[] postOrder(DensityProgram program, int[] ops, int[] ia, int[] ib, int[] ic) {
+    private static int[] postOrder(DensityProgram program, int[] ops, int[] ia, int[] ib, int[] ic,
+            boolean[] stop) {
         boolean[] visited = new boolean[ops.length];
         boolean[] splineVisited = new boolean[program.splineCount()];
         IntList order = new IntList();
-        visit(program, ops, ia, ib, ic, program.root(), visited, splineVisited, order);
+        visit(program, ops, ia, ib, ic, program.root(), visited, splineVisited, stop, order);
         return order.toArray();
     }
 
     private static void visit(DensityProgram program, int[] ops, int[] ia, int[] ib, int[] ic, int pc,
-            boolean[] visited, boolean[] splineVisited, IntList order) {
+            boolean[] visited, boolean[] splineVisited, boolean[] stop, IntList order) {
         if (visited[pc]) {
             return;
         }
         visited[pc] = true;
+        if (stop[pc]) {
+            order.add(pc);
+            return;
+        }
         if (isChild(ops[pc], 0)) {
-            visit(program, ops, ia, ib, ic, ia[pc], visited, splineVisited, order);
+            visit(program, ops, ia, ib, ic, ia[pc], visited, splineVisited, stop, order);
         }
         if (isChild(ops[pc], 1)) {
-            visit(program, ops, ia, ib, ic, ib[pc], visited, splineVisited, order);
+            visit(program, ops, ia, ib, ic, ib[pc], visited, splineVisited, stop, order);
         }
         if (isChild(ops[pc], 2)) {
-            visit(program, ops, ia, ib, ic, ic[pc], visited, splineVisited, order);
+            visit(program, ops, ia, ib, ic, ic[pc], visited, splineVisited, stop, order);
         }
         if (ops[pc] == DensityProgram.SPLINE) {
             // A spline reads the instructions computing its coordinates, and those dependencies live
             // in the spline table rather than in the instruction's operands. Nested spline values have
             // coordinates of their own, so the whole spline tree has to be walked.
-            visitSplineCoordinates(program, ops, ia, ib, ic, ia[pc], visited, splineVisited, order);
+            visitSplineCoordinates(program, ops, ia, ib, ic, ia[pc], visited, splineVisited, stop,
+                    order);
         }
         order.add(pc);
     }
 
     private static void visitSplineCoordinates(DensityProgram program, int[] ops, int[] ia, int[] ib,
-            int[] ic, int splineIndex, boolean[] visited, boolean[] splineVisited, IntList order) {
+            int[] ic, int splineIndex, boolean[] visited, boolean[] splineVisited, boolean[] stop,
+            IntList order) {
         if (splineVisited[splineIndex]) {
             return;
         }
@@ -340,10 +383,11 @@ public final class DensityProgramImage {
         }
         int coordinate = node.coordinate();
         if (coordinate >= 0) {
-            visit(program, ops, ia, ib, ic, coordinate, visited, splineVisited, order);
+            visit(program, ops, ia, ib, ic, coordinate, visited, splineVisited, stop, order);
         }
         for (int child : node.children()) {
-            visitSplineCoordinates(program, ops, ia, ib, ic, child, visited, splineVisited, order);
+            visitSplineCoordinates(program, ops, ia, ib, ic, child, visited, splineVisited, stop,
+                    order);
         }
     }
 

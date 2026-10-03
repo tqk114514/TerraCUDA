@@ -133,13 +133,25 @@ public final class GpuChunkFiller implements AutoCloseable {
 
     private MaterialRules.SurfaceLevels surfaceLevels() {
         DensityInterpreter interpreter = this.preliminarySurface;
+        // Vanilla caches the preliminary surface level per column, and it matters: the aquifer asks
+        // for the same columns over and over — thirteen sampling offsets times every grid cell — and
+        // each miss is a find_top_surface, which walks the density downwards in steps of eight.
+        java.util.Map<Long, Integer> cache = new java.util.HashMap<>();
         return new MaterialRules.SurfaceLevels() {
             @Override
             public int preliminarySurfaceLevel(int blockX, int blockZ) {
                 // Vanilla quantises to quart positions before looking the column up.
                 int quartX = (blockX >> 2) << 2;
                 int quartZ = (blockZ >> 2) << 2;
-                return tqk114514.terracuda.math.VanillaMath.floor(interpreter.evaluate(quartX, 0, quartZ));
+                long key = (long) quartX << 32 | quartZ & 0xFFFFFFFFL;
+                Integer cached = cache.get(key);
+                if (cached != null) {
+                    return cached;
+                }
+                int level = tqk114514.terracuda.math.VanillaMath.floor(
+                        interpreter.evaluate(quartX, 0, quartZ));
+                cache.put(key, level);
+                return level;
             }
 
             @Override

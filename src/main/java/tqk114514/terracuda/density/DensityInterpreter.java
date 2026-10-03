@@ -30,7 +30,10 @@ public final class DensityInterpreter {
     private final int[] stamp;
     private int version;
 
-    private java.util.Map<Integer, Double> overrides = java.util.Map.of();
+
+    private double[] overrideValues;
+    private boolean[] overrideSet;
+    private int[] lastOverrideIndices;
 
     private int blockX;
     private int blockY;
@@ -48,7 +51,7 @@ public final class DensityInterpreter {
 
     /** Evaluates the program's root at one block position. */
     public double evaluate(int x, int y, int z) {
-        this.overrides = java.util.Map.of();
+        clearOverrides();
         setContext(x, y, z);
         return eval(this.program.root());
     }
@@ -65,9 +68,59 @@ public final class DensityInterpreter {
      * @param overrides instruction index to value; the program's own computation is skipped for those
      */
     public double evaluate(int x, int y, int z, java.util.Map<Integer, Double> overrides) {
-        this.overrides = overrides;
+        if (this.overrideValues == null) {
+            this.overrideValues = new double[this.program.size()];
+            this.overrideSet = new boolean[this.program.size()];
+        }
+        clearOverrides();
+        int i = 0;
+        int[] indices = new int[overrides.size()];
+        for (java.util.Map.Entry<Integer, Double> entry : overrides.entrySet()) {
+            this.overrideValues[entry.getKey()] = entry.getValue();
+            this.overrideSet[entry.getKey()] = true;
+            indices[i++] = entry.getKey();
+        }
+        this.lastOverrideIndices = indices;
         setContext(x, y, z);
         return eval(this.program.root());
+    }
+
+    /**
+     * The same, but with the indices and values as parallel arrays.
+     *
+     * <p>This is the form the chunk filler uses. The indices are the same for every block in a chunk
+     * and only the values change, so passing arrays avoids allocating a map per block — which at 98304
+     * blocks per chunk is most of the cost of the override machinery.
+     *
+     * @param indices instruction indices, reused across calls
+     * @param values  one value per index, in the same order
+     */
+    public double evaluate(int x, int y, int z, int[] indices, double[] values) {
+        if (this.overrideValues == null) {
+            this.overrideValues = new double[this.program.size()];
+            this.overrideSet = new boolean[this.program.size()];
+        }
+        if (this.lastOverrideIndices != null && this.lastOverrideIndices != indices) {
+            for (int index : this.lastOverrideIndices) {
+                this.overrideSet[index] = false;
+            }
+        }
+        for (int i = 0; i < indices.length; i++) {
+            this.overrideValues[indices[i]] = values[i];
+            this.overrideSet[indices[i]] = true;
+        }
+        this.lastOverrideIndices = indices;
+        setContext(x, y, z);
+        return eval(this.program.root());
+    }
+
+    private void clearOverrides() {
+        if (this.lastOverrideIndices != null) {
+            for (int index : this.lastOverrideIndices) {
+                this.overrideSet[index] = false;
+            }
+            this.lastOverrideIndices = null;
+        }
     }
 
     /**
@@ -92,8 +145,7 @@ public final class DensityInterpreter {
         if (this.stamp[pc] == this.version) {
             return this.memo[pc];
         }
-        Double override = this.overrides.get(pc);
-        double value = override != null ? override : compute(pc);
+        double value = this.overrideSet != null && this.overrideSet[pc] ? this.overrideValues[pc] : compute(pc);
         this.memo[pc] = value;
         this.stamp[pc] = this.version;
         return value;

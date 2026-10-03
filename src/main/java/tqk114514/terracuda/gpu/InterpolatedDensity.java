@@ -1,8 +1,6 @@
 package tqk114514.terracuda.gpu;
 
-import java.util.HashMap;
 import java.util.List;
-import java.util.Map;
 import net.minecraft.world.level.levelgen.NoiseSettings;
 import tqk114514.terracuda.density.CornerInterpolation;
 import tqk114514.terracuda.density.DensityInterpreter;
@@ -50,7 +48,17 @@ public final class InterpolatedDensity {
         int chunkMinBlockZ = chunkZ * 16;
 
         double[] densities = new double[16 * 16 * height];
-        Map<Integer, Double> overrides = new HashMap<>();
+
+        // The overridden instructions are the same for every block in the chunk, so the indices are
+        // computed once and only the values change per block. Passing arrays rather than a map is what
+        // keeps this from allocating 98304 maps.
+        int[] overrideIndices = new int[interpolators.size()];
+        for (int i = 0; i < interpolators.size(); i++) {
+            // The corner tables are indexed in image numbering; the interpreter works in program
+            // numbering.
+            overrideIndices[i] = imageToOriginal[interpolators.get(i).root()];
+        }
+        double[] overrideValues = new double[interpolators.size()];
 
         for (int yLocal = 0; yLocal < height; yLocal++) {
             int y = minY + yLocal;
@@ -63,17 +71,15 @@ public final class InterpolatedDensity {
                     int cellZ = zLocal / cellWidth;
                     int zInCell = zLocal % cellWidth;
 
-                    overrides.clear();
-                    for (ChunkCornerTables.MarkerGrid grid : interpolators) {
-                        // The corner tables are indexed in image numbering; the interpreter works in
-                        // program numbering.
-                        overrides.put(imageToOriginal[grid.root()], CornerInterpolation.interpolate(
-                                grid.values(), cornerCountY, order, cellX, cellZ, cellY,
-                                xInCell, yInCell, zInCell, cellWidth, cellHeight));
+                    for (int i = 0; i < interpolators.size(); i++) {
+                        ChunkCornerTables.MarkerGrid grid = interpolators.get(i);
+                        overrideValues[i] = CornerInterpolation.interpolate(grid.values(), cornerCountY,
+                                order, cellX, cellZ, cellY, xInCell, yInCell, zInCell, cellWidth, cellHeight);
                     }
 
                     densities[(xLocal * 16 + zLocal) * height + yLocal] = interpreter.evaluate(
-                            chunkMinBlockX + xLocal, y, chunkMinBlockZ + zLocal, overrides);
+                            chunkMinBlockX + xLocal, y, chunkMinBlockZ + zLocal, overrideIndices,
+                            overrideValues);
                 }
             }
         }

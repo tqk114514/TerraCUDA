@@ -40,9 +40,17 @@ best available image, in this order:
 2. a prebuilt PTX image, JIT-compiled by the driver;
 3. the embedded CUDA source, compiled at runtime with NVRTC.
 
-Rungs 1 and 2 are produced by `nvcc` at build time. On Windows `nvcc` additionally requires the MSVC
-host compiler (`cl.exe`); without it, rung 3 still works, so the CUDA Toolkit alone is enough to run
-the GPU path — it just costs a one-off JIT at startup instead of none.
+Rungs 1 and 2 are produced by `nvcc` at build time, for the architectures in
+`terracuda.cuda.archs` (default `75,80,86,89,90,100,120`). While iterating on a kernel, build only
+your own architecture:
+
+```bash
+./gradlew build -Pterracuda.cuda.archs=86
+```
+
+On Windows `nvcc` additionally requires the MSVC host compiler (`cl.exe`). Without either, the build
+still succeeds — the task is skipped and rung 3 takes over, so the CUDA Toolkit alone is enough to
+run the GPU path; it just costs a one-off JIT at startup instead of none.
 
 Whichever rung is used, the kernels are compiled with `--fmad=false` and never with
 `--use_fast_math`. FMA contraction would make the GPU compute a differently-rounded answer than Java

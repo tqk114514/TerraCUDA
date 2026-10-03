@@ -1,8 +1,53 @@
+import org.gradle.process.ExecOperations
+
+import javax.inject.Inject
+
 plugins {
     id 'java-library'
     id 'maven-publish'
     id 'net.neoforged.moddev' version '2.0.148'
     id 'idea'
+}
+
+/**
+ * Compiles one CUDA translation unit with nvcc.
+ *
+ * A dedicated task type rather than a plain {@code Exec} so the toolchain can be absent: nvcc on
+ * Windows additionally requires the MSVC host compiler, and a build must still succeed without it.
+ * The runtime falls back to compiling the kernel through NVRTC in that case, so the prebuilt images
+ * are a startup-latency optimisation, not a requirement.
+ */
+abstract class NvccCompile extends DefaultTask {
+
+    @Inject
+    abstract ExecOperations getExecOperations()
+
+    @InputFile
+    abstract RegularFileProperty getSourceFile()
+
+    @OutputFile
+    abstract RegularFileProperty getOutputFile()
+
+    @Input
+    abstract Property<String> getNvccPath()
+
+    @Input
+    abstract Property<String> getHostCompilerPath()
+
+    @Input
+    abstract ListProperty<String> getNvccFlags()
+
+    @TaskAction
+    void compile() {
+        File output = getOutputFile().get().asFile
+        output.parentFile.mkdirs()
+        List<String> command = [getNvccPath().get()]
+        command.addAll(getNvccFlags().get())
+        command.addAll(['-ccbin', getHostCompilerPath().get(),
+                        '-o', output.absolutePath,
+                        getSourceFile().get().asFile.absolutePath])
+        getExecOperations().exec { commandLine command }.assertNormalExitValue()
+    }
 }
 
 tasks.named('wrapper', Wrapper).configure {
@@ -87,12 +132,116 @@ dependencies {
 sourceSets.test.compileClasspath += sourceSets.main.compileClasspath
 sourceSets.test.runtimeClasspath += sourceSets.main.runtimeClasspath
 
-// Ship the CUDA source inside the jar. Machines without a host compiler cannot run nvcc, so the
-// runtime compiles this through NVRTC instead; see tqk114514.terracuda.cuda.CudaKernels.
+// ---------------------------------------------------------------------------------------------
+// CUDA kernels
+//
+// The .cu source is always shipped inside the jar so NVRTC can compile it at runtime. When nvcc and
+// a host compiler are both present we additionally build prebuilt cubin/PTX images, which the loader
+// prefers over NVRTC (no JIT at startup). See tqk114514.terracuda.cuda.CudaKernels.
+// ---------------------------------------------------------------------------------------------
+
+def resolveNvcc() {
+    List<File> candidates = []
+    String cudaPath = System.getenv('CUDA_PATH')
+    if (cudaPath) {
+        candidates << new File(cudaPath, 'bin/nvcc.exe')
+    }
+    File root = new File('C:/Program Files/NVIDIA GPU Computing Toolkit/CUDA')
+    if (root.isDirectory()) {
+        root.listFiles().findAll { it.isDirectory() }.sort { it.name }.reverse().each {
+            candidates << new File(it, 'bin/nvcc.exe')
+        }
+    }
+    File found = candidates.find { it.isFile() }
+    return found == null ? null : found.absolutePath.replace('\\', '/')
+}
+
+def resolveHostCompiler() {
+    // nvcc needs cl.exe; probe the usual Visual Studio layouts rather than shelling out to vswhere,
+    // which keeps configuration free of process spawns.
+    List<File> roots = [new File('C:/Program Files/Microsoft Visual Studio'),
+                        new File('C:/Program Files (x86)/Microsoft Visual Studio')]
+    List<String> candidates = []
+    roots.each { root ->
+        if (!root.isDirectory()) return
+        root.listFiles().findAll { it.isDirectory() }.each { edition ->
+            edition.listFiles().findAll { it.isDirectory() }.each { year ->
+                File msvc = new File(year, 'VC/Tools/MSVC')
+                if (!msvc.isDirectory()) return
+                msvc.listFiles().findAll { it.isDirectory() }.each { version ->
+                    File cl = new File(version, 'bin/Hostx64/x64/cl.exe')
+                    if (cl.isFile()) {
+                        candidates << cl.parentFile.absolutePath.replace('\\', '/')
+                    }
+                }
+            }
+        }
+    }
+    return candidates.isEmpty() ? null : candidates.sort().last()
+}
+
+def cudaNvcc = resolveNvcc()
+def cudaHostCompiler = resolveHostCompiler()
+
+// Override for a faster edit/compile loop on the kernels: -Pterracuda.cuda.archs=86
+def cudaArchs = (findProperty('terracuda.cuda.archs') ?: '75,80,86,89,90,100,120')
+        .toString().split(',').collect { it.trim() }.findAll { !it.isEmpty() }
+
+def cudaGeneratedDir = layout.buildDirectory.dir('generated/cuda')
+def cudaSourceFile = layout.projectDirectory.file('src/main/cuda/terracuda_noise.cu')
+
+def compileCuda = tasks.register('compileCuda') {
+    group = 'build'
+    description = 'Compiles the CUDA kernels into cubin/PTX images; skipped when nvcc is unavailable'
+}
+
+if (cudaNvcc == null || cudaHostCompiler == null) {
+    logger.lifecycle('TerraCUDA: nvcc or the MSVC host compiler is missing, so no prebuilt CUDA '
+            + 'images will be produced. The mod still uses the GPU by compiling the kernel through '
+            + 'NVRTC at runtime.')
+} else {
+    def kernelTasks = []
+
+    cudaArchs.each { arch ->
+        kernelTasks << tasks.register("compileCudaSm${arch}", NvccCompile) {
+            group = 'build'
+            description = "Compiles terracuda_noise.cu to an sm_${arch} cubin"
+            sourceFile.set(cudaSourceFile)
+            outputFile.set(cudaGeneratedDir.map { it.file("terracuda_noise_sm${arch}.cubin") })
+            nvccPath.set(cudaNvcc)
+            hostCompilerPath.set(cudaHostCompiler)
+            // -Xcompiler=/utf-8: without it cl.exe warns C4819 on every CUDA header because the
+            // console code page is not UTF-8. -fmad=false is what keeps the results bit-identical
+            // to Java; --use_fast_math must never appear here.
+            nvccFlags.set(['-cubin', "-arch=sm_${arch}", '-fmad=false', '-O3', '-Xcompiler=/utf-8'])
+        }
+    }
+
+    // A single PTX image for the oldest supported architecture: the driver JITs it for anything newer,
+    // which is what covers a GPU whose exact cubin we did not build.
+    def ptxArch = cudaArchs.min { Integer.parseInt(it) }
+    kernelTasks << tasks.register('compileCudaPtx', NvccCompile) {
+        group = 'build'
+        description = "Compiles terracuda_noise.cu to compute_${ptxArch} PTX"
+        sourceFile.set(cudaSourceFile)
+        outputFile.set(cudaGeneratedDir.map { it.file('terracuda_noise.ptx') })
+        nvccPath.set(cudaNvcc)
+        hostCompilerPath.set(cudaHostCompiler)
+        nvccFlags.set(['-ptx', "-arch=compute_${ptxArch}", '-fmad=false', '-O3', '-Xcompiler=/utf-8'])
+    }
+
+    compileCuda.configure { dependsOn kernelTasks }
+}
+
+// The CUDA source always ships (for NVRTC); the prebuilt images ship when they were built.
 processResources {
     from('src/main/cuda') {
         into 'META-INF/terracuda/cuda'
     }
+    from(cudaGeneratedDir) {
+        into 'META-INF/terracuda/cuda'
+    }
+    dependsOn compileCuda
 }
 
 tasks.named('test', Test) {

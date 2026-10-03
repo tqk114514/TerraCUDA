@@ -147,6 +147,30 @@ class ImprovedNoiseGpuTest {
         }
     }
 
+    /**
+     * The loader must prefer a cubin built for this exact compute capability over the PTX and NVRTC
+     * rungs. Without this, a build that quietly stopped producing cubins would go unnoticed.
+     */
+    @Test
+    void aCubinForThisDeviceIsPreferredOverTheLowerRungs() {
+        CudaEnvironment environment = CudaEnvironment.detect();
+        assumeTrue(environment.available(), "no CUDA device on this machine");
+        CudaDeviceInfo device = environment.firstDevice().orElseThrow();
+
+        String cubin = "/META-INF/terracuda/cuda/terracuda_noise_sm" + device.computeCapability() + ".cubin";
+        assumeTrue(ImprovedNoiseGpuTest.class.getResource(cubin) != null,
+                "no prebuilt cubin for sm_" + device.computeCapability() + " on the classpath");
+
+        Optional<CudaDriver> loaded = CudaDriver.tryLoad();
+        assumeTrue(loaded.isPresent(), "no CUDA driver library on this machine");
+        try (CudaDriver driver = loaded.get()) {
+            driver.init();
+            try (CudaContext context = CudaContext.create(driver, device.index())) {
+                assertEquals(CudaKernels.Origin.CUBIN, CudaKernels.loadModule(context, device).origin());
+            }
+        }
+    }
+
     /** Deterministic points spread over [-2000, 2000) in all three axes, both signs. */
     private static double[] points(int count) {
         double[] xyz = new double[3 * count];

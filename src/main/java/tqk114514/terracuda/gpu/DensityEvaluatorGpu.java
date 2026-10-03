@@ -28,6 +28,7 @@ public final class DensityEvaluatorGpu implements AutoCloseable {
     private static final int BLOCK_SIZE = 128;
 
     private final CudaContext context;
+    private final DensityProgramImage image;
     private final CudaContext.DeviceBuffer blob;
     private final CudaContext.DeviceBuffer offsets;
     private final CudaContext.DeviceBuffer points;
@@ -47,6 +48,7 @@ public final class DensityEvaluatorGpu implements AutoCloseable {
             throw new IllegalArgumentException("capacity must be positive, got " + capacity);
         }
         this.context = context;
+        this.image = image;
         this.instructionCount = image.instructionCount();
         this.root = image.root();
         this.capacity = capacity;
@@ -77,6 +79,11 @@ public final class DensityEvaluatorGpu implements AutoCloseable {
         return this.instructionCount;
     }
 
+    /** The uploaded program, including the marker roots used to build the chunk-level tables. */
+    public DensityProgramImage image() {
+        return this.image;
+    }
+
     /**
      * Evaluates the program for {@code count} block positions.
      *
@@ -84,6 +91,19 @@ public final class DensityEvaluatorGpu implements AutoCloseable {
      * @return one density value per position
      */
     public double[] evaluate(int[] blockCoordinates) {
+        return evaluate(blockCoordinates, this.root);
+    }
+
+    /**
+     * Evaluates a sub-graph of the program, identified by the instruction it is rooted at.
+     *
+     * <p>Valid for any instruction index, because the image is emitted in post-order: everything an
+     * instruction reads sits below it. This is how the {@code flat_cache} and {@code interpolated}
+     * markers are evaluated on their own grids — each marker records the instruction it wraps.
+     *
+     * @param rootInstruction the instruction to take the value of, instead of the program root
+     */
+    public double[] evaluate(int[] blockCoordinates, int rootInstruction) {
         if (blockCoordinates.length % 3 != 0) {
             throw new IllegalArgumentException("expected interleaved xyz triples, got "
                     + blockCoordinates.length + " ints");
@@ -92,6 +112,10 @@ public final class DensityEvaluatorGpu implements AutoCloseable {
         if (count > this.capacity) {
             throw new IllegalArgumentException("batch of " + count + " points exceeds the "
                     + this.capacity + "-point capacity");
+        }
+        if (rootInstruction < 0 || rootInstruction >= this.instructionCount) {
+            throw new IllegalArgumentException("root instruction " + rootInstruction
+                    + " is outside [0, " + this.instructionCount + ")");
         }
         if (count == 0) {
             return new double[0];
@@ -105,7 +129,7 @@ public final class DensityEvaluatorGpu implements AutoCloseable {
                 arguments.addDevicePointer(this.blob.address())
                         .addDevicePointer(this.offsets.address())
                         .addInt(this.instructionCount)
-                        .addInt(this.root)
+                        .addInt(rootInstruction)
                         .addDevicePointer(this.points.address())
                         .addDevicePointer(this.scratch.address())
                         .addDevicePointer(this.results.address())

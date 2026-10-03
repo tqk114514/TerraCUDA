@@ -1,9 +1,11 @@
 package tqk114514.terracuda.worldgen;
 
 import net.minecraft.core.HolderLookup;
+import net.minecraft.core.registries.Registries;
 import net.minecraft.data.registries.VanillaRegistries;
 import net.minecraft.server.Bootstrap;
 import net.minecraft.world.level.levelgen.NoiseGeneratorSettings;
+import net.minecraft.world.level.levelgen.NoiseSettings;
 import net.minecraft.world.level.levelgen.RandomState;
 
 /**
@@ -29,6 +31,16 @@ public final class OverworldFixture {
             randomState = RandomState.create(registries, NoiseGeneratorSettings.OVERWORLD, SEED);
         }
         return randomState;
+    }
+
+    /** The overworld cell geometry: min y, height, and the noise cell sizes. */
+    public static NoiseSettings noiseSettings() {
+        Bootstrap.bootStrap();
+        HolderLookup.Provider registries = VanillaRegistries.createLookup();
+        return registries.lookupOrThrow(Registries.NOISE_SETTINGS)
+                .getOrThrow(NoiseGeneratorSettings.OVERWORLD)
+                .value()
+                .noiseSettings();
     }
 
     /** Deterministic, well-spread sample coordinates in {@code [-1000, 1000)}. */

@@ -60,14 +60,29 @@ public final class DensityProgramImage {
     private final int instructionCount;
     private final int root;
     private final int octaveCount;
+    private final int[] markerKinds;
+    private final int[] markerRoots;
+    private final int[] imageToOriginal;
 
     private DensityProgramImage(byte[] blob, long[] offsets, int instructionCount, int root,
-            int octaveCount) {
+            int octaveCount, int[] markerKinds, int[] markerRoots, int[] imageToOriginal) {
         this.blob = blob;
         this.offsets = offsets;
         this.instructionCount = instructionCount;
         this.root = root;
         this.octaveCount = octaveCount;
+        this.markerKinds = markerKinds;
+        this.markerRoots = markerRoots;
+        this.imageToOriginal = imageToOriginal;
+    }
+
+    /**
+     * Maps an image instruction index back to the {@link DensityProgram} index it came from.
+     *
+     * <p>Used to line the device tables up with the CPU reference, which works in program numbering.
+     */
+    public int[] imageToOriginal() {
+        return this.imageToOriginal.clone();
     }
 
     /**
@@ -245,7 +260,36 @@ public final class DensityProgramImage {
         offsets[OFF_BLENDED_MIN_COUNT] = writer.putInts(blendedMinCount);
         offsets[OFF_BLENDED_MAIN_COUNT] = writer.putInts(blendedMainCount);
 
-        return new DensityProgramImage(writer.toArray(), offsets, count, root, octaves.count());
+        // Markers are kernel boundaries: the chunk-level tables are evaluated at each marker's root,
+        // so their instruction indices have to be carried over into the image's numbering.
+        int[] sourceKinds = program.markerKinds();
+        int[] sourceRoots = program.markerRoots();
+        IntList markerKindList = new IntList();
+        IntList markerRootList = new IntList();
+        for (int i = 0; i < sourceKinds.length; i++) {
+            int remapped = newIndex[sourceRoots[i]];
+            if (remapped >= 0) {
+                markerKindList.add(sourceKinds[i]);
+                markerRootList.add(remapped);
+            }
+        }
+
+        return new DensityProgramImage(writer.toArray(), offsets, count, root, octaves.count(),
+                markerKindList.toArray(), markerRootList.toArray(), order);
+    }
+
+    /** Marker kinds, parallel with {@link #markerRoots()}, in image instruction numbering. */
+    public int[] markerKinds() {
+        return this.markerKinds.clone();
+    }
+
+    /** The image instruction each marker wraps, parallel with {@link #markerKinds()}. */
+    public int[] markerRoots() {
+        return this.markerRoots.clone();
+    }
+
+    public int markerCount() {
+        return this.markerKinds.length;
     }
 
     /**

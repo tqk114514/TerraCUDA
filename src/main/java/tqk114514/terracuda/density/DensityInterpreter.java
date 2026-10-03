@@ -50,6 +50,17 @@ public final class DensityInterpreter {
         return eval(this.program.root());
     }
 
+    /**
+     * Evaluates an arbitrary instruction at one block position.
+     *
+     * <p>Used to check the device-side marker tables, which are evaluated at each marker's wrapped
+     * instruction rather than at the program root.
+     */
+    public double evaluateAt(int instruction, int x, int y, int z) {
+        setContext(x, y, z);
+        return eval(instruction);
+    }
+
     private void setContext(int x, int y, int z) {
         this.blockX = x;
         this.blockY = y;

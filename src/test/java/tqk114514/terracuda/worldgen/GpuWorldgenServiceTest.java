@@ -9,6 +9,7 @@ import net.minecraft.world.level.block.Block;
 import net.minecraft.world.level.levelgen.NoiseGeneratorSettings;
 import net.minecraft.world.level.levelgen.RandomState;
 import org.junit.jupiter.api.Test;
+import tqk114514.terracuda.chunk.EmittedChunk;
 
 /**
  * The dispatch side of M3: chunk generation runs on several worker threads, none of which may touch the
@@ -27,14 +28,15 @@ class GpuWorldgenServiceTest {
         try (GpuWorldgenService service = GpuWorldgenService.of(randomState, settings)) {
             assumeTrue(service.isReady(), service.unavailableReason());
 
-            Optional<int[]> ids = service.blockIds(3, -7);
-            assertTrue(ids.isPresent(), "the service reported ready but produced no ids");
-            assertTrue(ids.get().length > 0);
+            Optional<EmittedChunk> emitted = service.blockIds(3, -7);
+            assertTrue(emitted.isPresent(), "the service reported ready but produced no ids");
+            int[] ids = emitted.get().stateIds();
+            assertTrue(ids.length > 0);
 
             // The ids must be ones vanilla would have chosen, which at minimum means real blocks.
             int air = Block.getId(net.minecraft.world.level.block.Blocks.AIR.defaultBlockState());
             int nonAir = 0;
-            for (int id : ids.get()) {
+            for (int id : ids) {
                 if (id != air) {
                     nonAir++;
                 }

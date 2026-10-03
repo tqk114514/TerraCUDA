@@ -10,6 +10,7 @@ import net.minecraft.world.level.levelgen.NoiseRouter;
 import net.minecraft.world.level.levelgen.NoiseSettings;
 import net.minecraft.world.level.levelgen.RandomState;
 import tqk114514.terracuda.chunk.ChunkReplay;
+import tqk114514.terracuda.chunk.EmittedChunk;
 import tqk114514.terracuda.cuda.CudaContext;
 import tqk114514.terracuda.density.CornerInterpolation;
 import tqk114514.terracuda.density.DensityCompiler;
@@ -80,8 +81,8 @@ public final class GpuChunkFiller implements AutoCloseable {
         return new GpuChunkFiller(context, randomState, settings);
     }
 
-    /** The block state ids of one chunk, indexed {@code (x * 16 + z) * height + (y - minY)}. */
-    public int[] blockIds(int chunkX, int chunkZ) {
+    /** One chunk's blocks, indexed {@code (x * 16 + z) * height + (y - minY)}. */
+    public EmittedChunk blockIds(int chunkX, int chunkZ) {
         int minY = this.geometry.minY();
         int height = this.geometry.height();
 
@@ -105,28 +106,39 @@ public final class GpuChunkFiller implements AutoCloseable {
                 VanillaRandomExport.export(this.randomState.aquiferRandom()),
                 VanillaRandomExport.export(this.randomState.oreRandom()), chunkX, chunkZ, this.geometry);
 
-        int defaultBlock = Block.getId(this.settings.defaultBlock());
+        BlockState defaultBlock = this.settings.defaultBlock();
         int chunkMinBlockX = chunkX * 16;
         int chunkMinBlockZ = chunkZ * 16;
-        int[] ids = new int[16 * 16 * height];
+        int count = 16 * 16 * height;
+        int[] ids = new int[count];
+        long[] fluidUpdates = new long[(count + 63) >>> 6];
 
         for (int yLocal = 0; yLocal < height; yLocal++) {
             int y = minY + yLocal;
             for (int x = 0; x < 16; x++) {
                 for (int z = 0; z < 16; z++) {
-                    double value = densities[(x * 16 + z) * height + yLocal];
+                    int blockIndex = (x * 16 + z) * height + yLocal;
+                    double value = densities[blockIndex];
                     BlockState state = rules.compute(chunkMinBlockX + x, y, chunkMinBlockZ + z, value);
-                    ids[(x * 16 + z) * height + yLocal] = state == null ? defaultBlock : Block.getId(state);
+                    if (state == null) {
+                        state = defaultBlock;
+                    }
+                    ids[blockIndex] = Block.getId(state);
+                    // doFill's condition, in the same place it evaluates it: inside the branch that
+                    // actually writes a block.
+                    if (rules.shouldScheduleFluidUpdate() && !state.getFluidState().isEmpty()) {
+                        fluidUpdates[blockIndex >>> 6] |= 1L << (blockIndex & 63);
+                    }
                 }
             }
         }
-        return ids;
+        return new EmittedChunk(ids, fluidUpdates);
     }
 
     /** Emits the chunk's blocks and writes them into {@code chunk}. */
     public void fill(ChunkAccess chunk) {
-        int[] ids = blockIds(chunk.getPos().x(), chunk.getPos().z());
-        ChunkReplay.write(chunk, ids, this.geometry.minY(), this.geometry.height());
+        EmittedChunk emitted = blockIds(chunk.getPos().x(), chunk.getPos().z());
+        ChunkReplay.write(chunk, emitted, this.geometry.minY(), this.geometry.height());
     }
 
     private MaterialRules.SurfaceLevels surfaceLevels() {

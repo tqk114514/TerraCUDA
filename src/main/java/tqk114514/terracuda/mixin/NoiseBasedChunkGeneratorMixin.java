@@ -1,7 +1,9 @@
 package tqk114514.terracuda.mixin;
 
+import java.util.HashSet;
 import java.util.Map;
 import java.util.Optional;
+import java.util.Set;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.atomic.AtomicBoolean;
@@ -10,8 +12,10 @@ import java.util.concurrent.atomic.AtomicLong;
 import net.minecraft.world.level.ChunkPos;
 import net.minecraft.world.level.StructureManager;
 import net.minecraft.world.level.chunk.ChunkAccess;
+import net.minecraft.world.level.chunk.LevelChunkSection;
 import net.minecraft.world.level.levelgen.NoiseBasedChunkGenerator;
 import net.minecraft.world.level.levelgen.NoiseGeneratorSettings;
+import net.minecraft.world.level.levelgen.NoiseSettings;
 import net.minecraft.world.level.levelgen.RandomState;
 import net.minecraft.world.level.levelgen.blending.Blender;
 
@@ -21,24 +25,31 @@ import org.spongepowered.asm.mixin.injection.Inject;
 import org.spongepowered.asm.mixin.injection.callback.CallbackInfoReturnable;
 
 import tqk114514.terracuda.TerraCUDA;
+import tqk114514.terracuda.chunk.EmittedChunk;
 import tqk114514.terracuda.config.TerracudaConfig;
 import tqk114514.terracuda.worldgen.GpuWorldgenService;
 
 /**
  * Hooks {@code NoiseBasedChunkGenerator.fillFromNoise}, the entry point to the NOISE stage.
  *
- * <p>At this milestone the hook is deliberately <em>observational</em>: it runs the whole device path
- * for the chunk — lowering, upload, the density, the material rules, the block ids — and logs what came
- * out, but never cancels the vanilla call and never touches the chunk. Switching it to cancel is a
- * one-line change, and it is worth waiting for: the replay that writes those ids into the chunk is the
- * one piece with no unit test behind it, because building a chunk in a test needs registry plumbing
- * that has nothing to do with this code. Running it in a real world first is the cheaper way to find
- * out. What it does buy today is proof that the whole chain works against a live {@link RandomState}
- * inside a real game.
+ * <p>Two modes, both driven from here. In shadow mode the device path runs and the result is thrown
+ * away, which is how the chain is checked against a live world without risking one. In takeover mode
+ * the blocks are written into the chunk and vanilla's NOISE stage is cancelled.
  *
- * <p>Failure containment is the point of the shape here: everything is inside a try/catch, the switch
- * is off by default, the injection is marked non-required, and the mixin config is marked non-required,
- * so a future Minecraft changing the signature degrades to a warning rather than a crash.
+ * <p><b>Why the fallback is shaped the way it is.</b> The obvious order is to cancel first and do the
+ * work in the returned future, but that gives up the ability to fall back: once the future is handed
+ * back, there is no way to un-cancel. So the work happens first, on this thread, and the cancellation
+ * only follows a successful write. Anything that goes wrong — no device, a device that stopped
+ * answering, a noise configuration the service was not built for — simply falls through to vanilla,
+ * which then writes every block itself and overwrites whatever was there.
+ *
+ * <p>What that costs is parallelism: the device work is serialised anyway, but blocking here also
+ * holds one of the four chunk-task dispatcher threads. Returning an incomplete future is the shape
+ * that fixes it, and it is the same shape batching needs, so the two are one change.
+ *
+ * <p>Failure containment: everything is inside a try/catch, the switch is off by default, the
+ * injection is marked non-required and the mixin config is marked non-required, so a future Minecraft
+ * changing the signature degrades to a warning rather than a crash.
  */
 @Mixin(NoiseBasedChunkGenerator.class)
 public abstract class NoiseBasedChunkGeneratorMixin {
@@ -46,42 +57,105 @@ public abstract class NoiseBasedChunkGeneratorMixin {
     private static final Map<RandomState, GpuWorldgenService> SERVICES = new ConcurrentHashMap<>();
     private static final AtomicLong CHUNKS = new AtomicLong();
     private static final AtomicBoolean REPORTED_FAILURE = new AtomicBoolean();
+    private static final AtomicBoolean REPORTED_HEIGHT_MISMATCH = new AtomicBoolean();
 
-    @Inject(method = "fillFromNoise", at = @At("HEAD"), require = 0)
-    private void terracuda$shadowFillFromNoise(Blender blender, RandomState randomState,
+    @Inject(method = "fillFromNoise", at = @At("HEAD"), cancellable = true, require = 0)
+    private void terracuda$fillFromNoise(Blender blender, RandomState randomState,
             StructureManager structureManager, ChunkAccess centerChunk,
             CallbackInfoReturnable<CompletableFuture<ChunkAccess>> cir) {
-        if (!TerracudaConfig.gpuEnabled() || !TerracudaConfig.shadowMode()) {
+        if (!TerracudaConfig.gpuEnabled()) {
             return;
         }
         try {
             NoiseBasedChunkGenerator self = (NoiseBasedChunkGenerator) (Object) this;
             NoiseGeneratorSettings settings = self.generatorSettings().value();
 
+            // The design doc routes a non-empty blender to vanilla: it is the legacy-world transition,
+            // and blend_alpha/blend_offset/blend_density are not on the device.
+            if (!blender.isEmpty()) {
+                return;
+            }
+
+            // Vanilla clamps the noise settings to the chunk's own height accessor, and the service is
+            // built once per world from the unclamped ones. They agree for a normal dimension; when
+            // they do not, this chunk is not the shape the service was sized for.
+            NoiseSettings clamped = settings.noiseSettings()
+                    .clampToHeightAccessor(centerChunk.getHeightAccessorForGeneration());
+            if (!clamped.equals(settings.noiseSettings())) {
+                if (REPORTED_HEIGHT_MISMATCH.compareAndSet(false, true)) {
+                    TerraCUDA.LOGGER.info("TerraCUDA: this dimension's chunks are {} high from y {}, "
+                                    + "but the generator is configured for {} from y {}; those chunks "
+                                    + "will be generated by vanilla",
+                            clamped.height(), clamped.minY(), settings.noiseSettings().height(),
+                            settings.noiseSettings().minY());
+                }
+                return;
+            }
+
             GpuWorldgenService service = SERVICES.computeIfAbsent(randomState,
                     key -> GpuWorldgenService.of(key, settings));
             if (!service.isReady()) {
                 if (REPORTED_FAILURE.compareAndSet(false, true)) {
-                    TerraCUDA.LOGGER.info("TerraCUDA: shadow mode disabled, device unavailable: {}",
+                    TerraCUDA.LOGGER.info("TerraCUDA: device unavailable, using vanilla: {}",
                             service.unavailableReason());
                 }
                 return;
             }
 
             ChunkPos pos = centerChunk.getPos();
+            boolean takeover = TerracudaConfig.takeover();
             long start = System.nanoTime();
-            Optional<int[]> ids = service.blockIds(pos.x(), pos.z());
+            Optional<EmittedChunk> emitted = takeover
+                    ? fillWithSectionsHeld(service, centerChunk, clamped.minY(), clamped.height())
+                    : service.blockIds(pos.x(), pos.z());
             long micros = (System.nanoTime() - start) / 1000;
+
+            if (!emitted.isPresent()) {
+                // The service reported ready but the job did not come back. Vanilla still has the chunk.
+                return;
+            }
+            if (takeover) {
+                // The chunk now holds the device's blocks. Vanilla's NOISE stage would overwrite them
+                // with its own, so it does not run.
+                cir.setReturnValue(CompletableFuture.completedFuture(centerChunk));
+            }
 
             long count = CHUNKS.incrementAndGet();
             if (TerracudaConfig.verbose() || count % 256 == 1) {
-                TerraCUDA.LOGGER.info("TerraCUDA shadow: chunk {} -> {} block ids in {} us ({} chunks seen)",
-                        pos, ids.map(blocks -> blocks.length).orElse(0), micros, count);
+                TerraCUDA.LOGGER.info("TerraCUDA{}: chunk {} -> {} blocks in {} us ({} chunks seen)",
+                        takeover ? "" : " shadow", pos, emitted.get().size(), micros, count);
             }
         } catch (Throwable t) {
-            // A diagnostic hook must never break world generation.
+            // Never break world generation. Falling through means vanilla writes the chunk, which is
+            // correct even if this path had already written part of it.
             if (REPORTED_FAILURE.compareAndSet(false, true)) {
-                TerraCUDA.LOGGER.warn("TerraCUDA: shadow mode failed and will stay off", t);
+                TerraCUDA.LOGGER.warn("TerraCUDA: the device path failed and is now off", t);
+            }
+        }
+    }
+
+    /**
+     * Emits the chunk and writes it, holding the sections the way vanilla's own {@code doFill} does.
+     *
+     * <p>{@code fillFromNoise} acquires every section it is about to write before running the fill, so
+     * that a concurrent reader cannot observe a half-written one. The write happens here rather than
+     * on a worker, but the sections are still reachable by other threads, so the same guard applies.
+     */
+    private static Optional<EmittedChunk> fillWithSectionsHeld(GpuWorldgenService service,
+            ChunkAccess chunk, int minY, int height) {
+        int top = chunk.getSectionIndex(minY + height - 1);
+        int bottom = chunk.getSectionIndex(minY);
+        Set<LevelChunkSection> held = new HashSet<>();
+        for (int index = top; index >= bottom; index--) {
+            LevelChunkSection section = chunk.getSection(index);
+            section.acquire();
+            held.add(section);
+        }
+        try {
+            return service.fill(chunk, minY, height);
+        } finally {
+            for (LevelChunkSection section : held) {
+                section.release();
             }
         }
     }

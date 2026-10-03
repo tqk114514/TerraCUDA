@@ -42,12 +42,12 @@ to be the bottleneck, and the only thing that settled any of them was a number.
 | M0 — CPU reference + parity | **done.** The overworld density function is lowered to an instruction program and evaluated bit-identically to vanilla, and every noise it uses round-trips through the export path. |
 | M1 — FFM + a kernel | **done.** A million points through the CUDA `ImprovedNoise` match the Java reference bit for bit. |
 | M2 — K0/K1/K2 | **done.** `preliminary_surface_level` and every per-chunk marker table (column caches and the 5×5×49 interpolator corner grids) are computed on the device, bit-identically to the CPU reference. |
-| M3 — K3/K4 + chunk replay | **K3 done, K4's emit done, replay untested.** The material rules (aquifer and ore veinifier) are ported and reproduce vanilla's block for every one of 294912 blocks across three chunks, and `GpuChunkFiller` now turns that into a whole chunk's block state ids. The write-back into sections is implemented but has no unit test: building a chunk in a test needs the datapack biome registry. |
-| M4 — batching, pinned buffers | **in progress.** One launch per chunk per program instead of one per marker, and the per-block pass — the trilinear blend and the DAG above it — runs on the device rather than on one core. 16.2 ms per chunk became 7.8 ms. Batching across chunks and pinned staging are still open. |
+| M3 — K3/K4 + chunk replay | **done.** The material rules (aquifer and ore veinifier) are ported and reproduce vanilla's block for every one of 294912 blocks across three chunks; `GpuChunkFiller` turns that into a whole chunk's blocks; and `ChunkReplay` writes them into a chunk, with the heightmaps and the fluid-update flags `doFill` also maintains. |
+| M4 — batching, pinned buffers | **in progress.** One launch per chunk per program instead of one per marker, and the per-block pass — the trilinear blend and the DAG above it — runs on the device rather than on one core. 16.2 ms per chunk became 7.8 ms, and the mixin takes over generation. Batching across chunks and pinned staging are still open. |
 
-The GPU path does not yet take over generation. It can produce a correct chunk's worth of blocks —
-verified block for block — but the mixin still only observes; switching it to cancel is one line, and
-waiting is deliberate, because the untested piece is exactly the write-back.
+The device path now generates terrain. It is off by default; with it on, the NOISE stage runs on the
+GPU and vanilla's own is cancelled. Anything that goes wrong falls through to vanilla, which writes
+every block itself.
 
 ### Where the work sits
 
@@ -64,6 +64,12 @@ That last choice is the design doc's, and it is measured rather than assumed: mo
 the DAG above the markers to the device was worth about eleven milliseconds a chunk, and moving the
 aquifer would mean a per-thread copy of its grid and caches for very little.
 
+Three things happen when a chunk is written, and all three are in vanilla's `doFill`: the block
+states, the two worldgen heightmaps, and `markPosForPostprocessing` for the positions the aquifer
+flagged as able to flow. The last is easy to leave out and is the difference between water that flows
+into a cave and water that sits there. The flags are compared against vanilla's own aquifer, not
+smoke-tested: most chunks flag nothing at all, so the test uses three that flag 155, 67 and 145.
+
 ### Trying it in a game
 
 The device path is off by default. To run the whole chain — lowering, upload, density, material
@@ -78,9 +84,16 @@ Windows shell splits it at the dot, so the dotless form is the one to use there.
 blocks on the device path and logs how long that took; it never cancels the vanilla call and never
 touches the chunk. A device that cannot be used degrades to a log line.
 
-Expect this to slow world loading down: it is a diagnostic and it runs on the generation thread. The
-chunk pass itself is about 8 ms on an RTX 3080, most of the remainder being the material rules and
-the corner-table launch, which is what batching is meant to amortise.
+To let it build the chunks instead:
+
+```
+./gradlew runClient -Ptakeover
+```
+
+Vanilla's NOISE stage is cancelled and the device's blocks are written into the chunk. On an RTX 3080
+a chunk takes about 9 ms at the median, 11 ms at the ninetieth percentile, over 2661 chunks of a real
+world with no exceptions. A dimension whose chunks are not the height the generator is configured for,
+a legacy-world blend, and anything that fails mid-flight all fall through to vanilla.
 
 ## GPU kernels
 

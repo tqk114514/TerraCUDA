@@ -74,10 +74,11 @@ base {
 
 java.toolchain.languageVersion = JavaLanguageVersion.of(25)
 
-// Shadow mode is switched on from the command line. Both spellings are accepted because PowerShell
-// splits `-Pterracuda.shadow` at the dot into `-Pterracuda` and `.shadow`, so the dotless one is the
-// form that survives there.
+// The GPU path is switched on from the command line. Both spellings of each are accepted because
+// PowerShell splits `-Pterracuda.shadow` at the dot into `-Pterracuda` and `.shadow`, so the dotless
+// form is the one that survives there.
 def terracudaShadow = project.hasProperty('terracuda.shadow') || project.hasProperty('shadow')
+def terracudaTakeover = project.hasProperty('terracuda.takeover') || project.hasProperty('takeover')
 def terracudaVerbose = project.hasProperty('terracuda.verbose') || project.hasProperty('verbose')
 
 neoForge {
@@ -111,13 +112,18 @@ neoForge {
             // Required for the java.lang.foreign CUDA binding to run inside a dev client/server.
             jvmArguments.add('--enable-native-access=ALL-UNNAMED')
 
-            // -Pshadow turns the device path on in observation mode, so it can be tried without
-            // editing anything:
+            // -Pshadow runs the device path in observation mode, so it can be tried without changing
+            // what the game generates:
             //     ./gradlew runClient -Pshadow
+            // -Ptakeover lets it build the chunk, which is the real thing:
+            //     ./gradlew runClient -Ptakeover
             // Add -Pverbose to log every chunk instead of every 256th.
             if (terracudaShadow) {
                 jvmArguments.add('-Dterracuda.gpu=true')
                 jvmArguments.add('-Dterracuda.shadow=true')
+            }
+            if (terracudaTakeover) {
+                jvmArguments.add('-Dterracuda.gpu=true')
             }
             if (terracudaVerbose) {
                 jvmArguments.add('-Dterracuda.verbose=true')

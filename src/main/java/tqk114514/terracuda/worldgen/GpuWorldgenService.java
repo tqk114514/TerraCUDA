@@ -9,9 +9,12 @@ import java.util.concurrent.ExecutionException;
 import java.util.concurrent.FutureTask;
 import java.util.concurrent.TimeUnit;
 
+import net.minecraft.world.level.chunk.ChunkAccess;
 import net.minecraft.world.level.levelgen.NoiseGeneratorSettings;
 import net.minecraft.world.level.levelgen.RandomState;
 
+import tqk114514.terracuda.chunk.ChunkReplay;
+import tqk114514.terracuda.chunk.EmittedChunk;
 import tqk114514.terracuda.cuda.CudaContext;
 import tqk114514.terracuda.cuda.CudaDeviceInfo;
 import tqk114514.terracuda.cuda.CudaDriver;
@@ -131,12 +134,19 @@ public final class GpuWorldgenService implements AutoCloseable {
     }
 
     /**
-     * Emits one chunk's block state ids.
+     * Emits one chunk's blocks.
      *
-     * @return the ids, or empty when the device path is unavailable
+     * @return the ids and the fluid-update bitmap, or empty when the device path is unavailable
      */
-    public Optional<int[]> blockIds(int chunkX, int chunkZ) {
+    public Optional<EmittedChunk> blockIds(int chunkX, int chunkZ) {
         return submit(() -> this.filler.blockIds(chunkX, chunkZ));
+    }
+
+    /** Emits one chunk's blocks and writes them into {@code chunk}. */
+    public Optional<EmittedChunk> fill(ChunkAccess chunk, int minY, int height) {
+        Optional<EmittedChunk> emitted = blockIds(chunk.getPos().x(), chunk.getPos().z());
+        emitted.ifPresent(blocks -> ChunkReplay.write(chunk, blocks, minY, height));
+        return emitted;
     }
 
     private <T> Optional<T> submit(Callable<T> job) {

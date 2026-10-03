@@ -31,16 +31,22 @@ public final class VanillaChunkReference {
 
     private static final Method GET_INTERPOLATED_STATE = interpolatedStateAccessor();
 
+    /** {@code doFill} compares against this exact state, not {@code isAir}. */
+    private static final BlockState AIR = Blocks.AIR.defaultBlockState();
+
     /**
      * One chunk's output, indexed {@code (x * 16 + z) * height + (y - minY)}.
      *
      * @param stateIds  {@link Block#getId(BlockState)} per block
      * @param densities the value the material rules saw, i.e. the interpolated {@code final_density}
      *                  plus the beardifier — the number that decides solid from sky
+     * @param fluidUpdates one bit per block, set where {@code doFill} would call
+     *                  {@code markPosForPostprocessing}
      * @param minY      the chunk's lowest y
      * @param height    the chunk's height
      */
-    public record ChunkBlocks(int[] stateIds, double[] densities, int minY, int height) {
+    public record ChunkBlocks(int[] stateIds, double[] densities, long[] fluidUpdates, int minY,
+            int height) {
 
         public int at(int x, int y, int z) {
             return this.stateIds[index(x, y, z)];
@@ -48,6 +54,10 @@ public final class VanillaChunkReference {
 
         public double densityAt(int x, int y, int z) {
             return this.densities[index(x, y, z)];
+        }
+
+        public boolean fluidUpdateAt(int index) {
+            return (this.fluidUpdates[index >>> 6] & (1L << (index & 63))) != 0L;
         }
 
         private int index(int x, int y, int z) {
@@ -94,11 +104,13 @@ public final class VanillaChunkReference {
 
         int[] stateIds = new int[16 * 16 * noiseSettings.height()];
         double[] densities = new double[stateIds.length];
+        long[] fluidUpdates = new long[(stateIds.length + 63) >>> 6];
         int minY = noiseSettings.minY();
         int height = noiseSettings.height();
         int chunkMinBlockX = chunkX * 16;
         int chunkMinBlockZ = chunkZ * 16;
         DensityFunction fullNoise = fullNoiseDensity(chunk);
+        Aquifer aquifer = chunk.aquifer();
 
         chunk.initializeForFirstCellX();
         for (int cellX = 0; cellX < cellCountXZ; cellX++) {
@@ -125,7 +137,12 @@ public final class VanillaChunkReference {
                                 int index = (x * 16 + z) * height + (posY - minY);
                                 stateIds[index] = Block.getId(state);
                                 densities[index] = fullNoise.compute(chunk);
-
+                                // doFill's post-processing condition, evaluated where doFill evaluates
+                                // it: only for the blocks it actually writes.
+                                if (state != AIR && aquifer.shouldScheduleFluidUpdate()
+                                        && !state.getFluidState().isEmpty()) {
+                                    fluidUpdates[index >>> 6] |= 1L << (index & 63);
+                                }
                             }
                         }
                     }
@@ -135,7 +152,7 @@ public final class VanillaChunkReference {
         }
         chunk.stopInterpolation();
 
-        return new ChunkBlocks(stateIds, densities, minY, height);
+        return new ChunkBlocks(stateIds, densities, fluidUpdates, minY, height);
     }
 
     /**

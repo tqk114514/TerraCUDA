@@ -43,11 +43,35 @@ to be the bottleneck, and the only thing that settled any of them was a number.
 | M1 — FFM + a kernel | **done.** A million points through the CUDA `ImprovedNoise` match the Java reference bit for bit. |
 | M2 — K0/K1/K2 | **done.** `preliminary_surface_level` and every per-chunk marker table (column caches and the 5×5×49 interpolator corner grids) are computed on the device, bit-identically to the CPU reference. |
 | M3 — K3/K4 + chunk replay | **done.** The material rules (aquifer and ore veinifier) are ported and reproduce vanilla's block for every one of 294912 blocks across three chunks; `GpuChunkFiller` turns that into a whole chunk's blocks; and `ChunkReplay` writes them into a chunk, with the heightmaps and the fluid-update flags `doFill` also maintains. |
-| M4 — batching, pinned buffers | **in progress.** One launch per chunk per program instead of one per marker, and the per-block pass — the trilinear blend and the DAG above it — runs on the device rather than on one core. 16.2 ms per chunk became 7.8 ms, and the mixin takes over generation. Batching across chunks and pinned staging are still open. |
+| M4 — batching, pinned buffers | **in progress, and the batching premise did not hold.** One launch per chunk per program instead of one per marker, the per-block pass moved onto the device, the dispatcher no longer blocks, and the host staging is reused: 16.2 ms per chunk became 6.7 ms, and 40 chunks a second became 64. Folding several chunks into one marker-table launch was measured at 0.7 ms a chunk for a scratch that grows from 25 MB to 200 MB — and the GPU is not the bottleneck anyway, so it is recorded rather than built. |
 
 The device path now generates terrain. It is off by default; with it on, the NOISE stage runs on the
 GPU and vanilla's own is cancelled. Anything that goes wrong falls through to vanilla, which writes
 every block itself.
+
+### Where the time goes, and where it does not
+
+On an RTX 3080, a chunk is about 6.7 ms on the device path: 2.1 ms of marker tables, 0.9 ms of
+per-block passes, 2.2 ms of material rules, and the rest host-side. Measured over a real world, the
+path sustains about **64 chunks a second** — against a GPU whose share of that work would allow
+**149**. The device is not the bottleneck; the rest of the chunk pipeline is, and it shares the same
+four dispatcher threads.
+
+That is why the design doc's batching is not built. Its premise is that a chunk's marker tables are
+latency-bound — 6450 points against a 450-step chain is about 5% occupancy — so folding several
+chunks into one launch should be nearly free. Measuring it says otherwise:
+
+| chunks per launch | total | per chunk |
+|---|---|---|
+| 1 | 1.55 ms | 1.55 ms |
+| 4 | 4.00 ms | 1.00 ms |
+| 8 | 7.77 ms | 0.97 ms |
+| 16 | 13.71 ms | 0.86 ms |
+
+Sixteen times the threads buys 1.8x, so the kernel is not simply waiting on occupancy. The scratch
+grows linearly with the batch, so eight chunks costs 200 MB to save 0.7 ms a chunk — and against a
+GPU with 2x headroom, it would not show up at all. `ChunkPassProfileTest` prints these numbers and
+anyone can re-run them.
 
 ### Where the work sits
 
@@ -91,9 +115,10 @@ To let it build the chunks instead:
 ```
 
 Vanilla's NOISE stage is cancelled and the device's blocks are written into the chunk. On an RTX 3080
-a chunk takes about 9 ms at the median, 11 ms at the ninetieth percentile, over 2661 chunks of a real
-world with no exceptions. A dimension whose chunks are not the height the generator is configured for,
-a legacy-world blend, and anything that fails mid-flight all fall through to vanilla.
+a chunk takes about 6.7 ms and the path sustains roughly 64 chunks a second — over 2886 chunks of a
+real world, with no exceptions and no fallbacks to vanilla. A dimension whose chunks are not the
+height the generator is configured for, a legacy-world blend, and anything that fails mid-flight all
+fall through to vanilla.
 
 ## GPU kernels
 

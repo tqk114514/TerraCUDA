@@ -87,6 +87,14 @@ dependencies {
 sourceSets.test.compileClasspath += sourceSets.main.compileClasspath
 sourceSets.test.runtimeClasspath += sourceSets.main.runtimeClasspath
 
+// Ship the CUDA source inside the jar. Machines without a host compiler cannot run nvcc, so the
+// runtime compiles this through NVRTC instead; see tqk114514.terracuda.cuda.CudaKernels.
+processResources {
+    from('src/main/cuda') {
+        into 'META-INF/terracuda/cuda'
+    }
+}
+
 tasks.named('test', Test) {
     useJUnitPlatform()
     // The CUDA binding goes through java.lang.foreign, which is a restricted operation unless native

@@ -62,6 +62,7 @@ public final class CudaDriver implements AutoCloseable {
     private static final int ERROR_STRING_BYTES = 256;
 
     private final Arena arena;
+    private final SymbolLookup lookup;
     private final MethodHandle cuInit;
     private final MethodHandle cuDriverGetVersion;
     private final MethodHandle cuDeviceGetCount;
@@ -76,25 +77,20 @@ public final class CudaDriver implements AutoCloseable {
 
     private CudaDriver(Arena arena, SymbolLookup lookup) {
         this.arena = arena;
-        Linker linker = Linker.nativeLinker();
-        this.cuInit = bind(linker, lookup, "cuInit", FunctionDescriptor.of(CU_INT, CU_INT));
-        this.cuDriverGetVersion = bind(linker, lookup, "cuDriverGetVersion",
-                FunctionDescriptor.of(CU_INT, ValueLayout.ADDRESS));
-        this.cuDeviceGetCount = bind(linker, lookup, "cuDeviceGetCount",
-                FunctionDescriptor.of(CU_INT, ValueLayout.ADDRESS));
-        this.cuDeviceGet = bind(linker, lookup, "cuDeviceGet",
-                FunctionDescriptor.of(CU_INT, ValueLayout.ADDRESS, CU_INT));
-        this.cuDeviceGetName = bind(linker, lookup, "cuDeviceGetName",
+        this.lookup = lookup;
+        this.cuInit = bind("cuInit", FunctionDescriptor.of(CU_INT, CU_INT));
+        this.cuDriverGetVersion = bind("cuDriverGetVersion", FunctionDescriptor.of(CU_INT, ValueLayout.ADDRESS));
+        this.cuDeviceGetCount = bind("cuDeviceGetCount", FunctionDescriptor.of(CU_INT, ValueLayout.ADDRESS));
+        this.cuDeviceGet = bind("cuDeviceGet", FunctionDescriptor.of(CU_INT, ValueLayout.ADDRESS, CU_INT));
+        this.cuDeviceGetName = bind("cuDeviceGetName",
                 FunctionDescriptor.of(CU_INT, ValueLayout.ADDRESS, CU_INT, CU_INT));
-        this.cuDeviceGetAttribute = bind(linker, lookup, "cuDeviceGetAttribute",
+        this.cuDeviceGetAttribute = bind("cuDeviceGetAttribute",
                 FunctionDescriptor.of(CU_INT, ValueLayout.ADDRESS, CU_INT, CU_INT));
         // cuDeviceTotalMem was versioned to _v2; some old drivers only export the unsuffixed name.
-        this.cuDeviceTotalMem = bindAny(linker, lookup, FunctionDescriptor.of(CU_INT, ValueLayout.ADDRESS, CU_INT),
+        this.cuDeviceTotalMem = bindAny(FunctionDescriptor.of(CU_INT, ValueLayout.ADDRESS, CU_INT),
                 "cuDeviceTotalMem_v2", "cuDeviceTotalMem");
-        this.cuGetErrorName = bind(linker, lookup, "cuGetErrorName",
-                FunctionDescriptor.of(CU_INT, CU_INT, ValueLayout.ADDRESS));
-        this.cuGetErrorString = bind(linker, lookup, "cuGetErrorString",
-                FunctionDescriptor.of(CU_INT, CU_INT, ValueLayout.ADDRESS));
+        this.cuGetErrorName = bind("cuGetErrorName", FunctionDescriptor.of(CU_INT, CU_INT, ValueLayout.ADDRESS));
+        this.cuGetErrorString = bind("cuGetErrorString", FunctionDescriptor.of(CU_INT, CU_INT, ValueLayout.ADDRESS));
     }
 
     /**
@@ -116,18 +112,27 @@ public final class CudaDriver implements AutoCloseable {
         }
     }
 
-    private static MethodHandle bind(Linker linker, SymbolLookup lookup, String name, FunctionDescriptor descriptor) {
+    /**
+     * Binds a further entry point from the loaded driver library.
+     *
+     * <p>Exposed so that the compute layer can keep each {@link FunctionDescriptor} next to the call
+     * it describes, instead of every driver entry point living in this class. Callers are responsible
+     * for getting the C type widths right: {@code size_t} and {@code CUdeviceptr} are 64-bit here.
+     *
+     * @throws IllegalStateException when the symbol is missing from the driver
+     */
+    public MethodHandle bind(String name, FunctionDescriptor descriptor) {
         MemorySegment symbol = lookup.find(name)
                 .orElseThrow(() -> new IllegalStateException("CUDA symbol not found: " + name));
-        return linker.downcallHandle(symbol, descriptor);
+        return Linker.nativeLinker().downcallHandle(symbol, descriptor);
     }
 
-    private static MethodHandle bindAny(Linker linker, SymbolLookup lookup, FunctionDescriptor descriptor,
-            String... names) {
+    /** Like {@link #bind(String, FunctionDescriptor)} but tries each name in turn. */
+    public MethodHandle bindAny(FunctionDescriptor descriptor, String... names) {
         for (String name : names) {
             Optional<MemorySegment> symbol = lookup.find(name);
             if (symbol.isPresent()) {
-                return linker.downcallHandle(symbol.get(), descriptor);
+                return Linker.nativeLinker().downcallHandle(symbol.get(), descriptor);
             }
         }
         throw new IllegalStateException("none of the CUDA symbols were found: " + String.join(", ", names));

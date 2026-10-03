@@ -35,6 +35,7 @@ class ImprovedNoiseTest {
     }
 
     @Test
+    @SuppressWarnings("deprecation") // the vanilla y-scaled overload is deprecated but still the contract
     void yScaledNoiseMatchesVanilla() {
         // BlendedNoise uses the yScale / yFudge variant; exercise both the fudge and the short-circuit.
         double[][] scales = {{0.0, 0.0}, {1.0, 0.0}, {0.5, 0.25}, {2.0, 1.5}, {8.0, 3.0}};

@@ -38,17 +38,13 @@ import tqk114514.terracuda.math.VanillaMath;
  *
  * <p>The reference is {@link VanillaChunkReference}, which runs vanilla's own NOISE stage.
  *
- * <p>Three chunks, not one: a rule set that happens to be right on a chunk that is mostly stone is
- * worth very little, and the first chunk tried here is exactly that kind of lucky case.
+ * <p>Three chunks, chosen to cover different terrain: land with water, a chunk near spawn, and one
+ * dense with ore veins. A rule set that happens to be right on a chunk that is mostly stone is worth
+ * very little, and the first chunk tried was exactly that kind of lucky case.
  */
 class MaterialRulesTest {
 
-    /** Chunks whose blocks are reproduced exactly. */
-    private static final int[][] EXACT_CHUNKS = {{3, -7}, {0, 0}};
-
-    /** A chunk with dense ore veins, where a known gap remains. */
-    private static final int VEIN_CHUNK_X = -40;
-    private static final int VEIN_CHUNK_Z = 17;
+    private static final int[][] CHUNKS = {{3, -7}, {0, 0}, {-40, 17}};
 
     @Test
     void everyBlockOfEveryChunkMatchesVanilla() {
@@ -72,69 +68,25 @@ class MaterialRulesTest {
             CudaDeviceInfo device = environment.firstDevice().orElseThrow();
             try (CudaContext context = CudaContext.create(driver, device.index())) {
                 CudaKernels.loadModule(context, device);
-                for (int[] chunk : EXACT_CHUNKS) {
+                for (int[] chunk : CHUNKS) {
                     checkChunk(chunk[0], chunk[1], randomState, router, settings, generatorSettings,
-                            fluidPicker, context, 0);
+                            fluidPicker, context);
                 }
-            }
-        }
-    }
-
-    /**
-     * The known gap: a chunk with dense ore veins.
-     *
-     * <p>The density is exact everywhere, and the aquifer agrees everywhere. What differs is the ore
-     * veinifier, on a small fraction of blocks — it declines where vanilla places tuff, which means the
-     * veininess it reads is too small. Both blend orders for the vein interpolators give the same
-     * count, so the discrepancy is not about the blend; something in how {@code veinToggle} is
-     * sampled or lowered is still off.
-     *
-     * <p>This test asserts the gap is bounded and shrinking rather than pretending it is closed: a
-     * change that made it worse fails here.
-     */
-    @Test
-    void theVeinGapIsBounded() {
-        RandomState randomState = OverworldFixture.randomState();
-        NoiseRouter router = randomState.router();
-        NoiseSettings settings = OverworldFixture.noiseSettings();
-        NoiseGeneratorSettings generatorSettings = OverworldFixture.generatorSettings();
-
-        int seaLevel = generatorSettings.seaLevel();
-        Aquifer.FluidPicker fluidPicker = (x, y, z) -> y < Math.min(-54, seaLevel)
-                ? new Aquifer.FluidStatus(-54, Blocks.LAVA.defaultBlockState())
-                : new Aquifer.FluidStatus(seaLevel, Blocks.WATER.defaultBlockState());
-
-        CudaEnvironment environment = CudaEnvironment.detect();
-        assumeTrue(environment.available(), "no CUDA device on this machine");
-        Optional<CudaDriver> loaded = CudaDriver.tryLoad();
-        assumeTrue(loaded.isPresent(), "no CUDA driver library on this machine");
-
-        try (CudaDriver driver = loaded.get()) {
-            driver.init();
-            CudaDeviceInfo device = environment.firstDevice().orElseThrow();
-            try (CudaContext context = CudaContext.create(driver, device.index())) {
-                CudaKernels.loadModule(context, device);
-                // Density must still be exact here; only the veinifier is allowed to differ.
-                checkChunk(VEIN_CHUNK_X, VEIN_CHUNK_Z, randomState, router, settings, generatorSettings,
-                        fluidPicker, context, 16 * 16 * settings.height() / 100);
             }
         }
     }
 
     private static void checkChunk(int chunkX, int chunkZ, RandomState randomState, NoiseRouter router,
             NoiseSettings settings, NoiseGeneratorSettings generatorSettings,
-            Aquifer.FluidPicker fluidPicker, CudaContext context, int allowedBlockMismatches) {
+            Aquifer.FluidPicker fluidPicker, CudaContext context) {
         int minY = settings.minY();
         int height = settings.height();
 
         DensityInterpreter density = lower(router.finalDensity());
         try (DensityEvaluatorGpu evaluator = new DensityEvaluatorGpu(context, density.program(), 2048)) {
             double[] densities = InterpolatedDensity.forChunk(evaluator, density, settings, chunkX, chunkZ);
-
-            // veinToggle and veinRidged are interpolated markers, so the veinifier has to be handed
-            // blended values rather than the sub-graph evaluated at the block.
-            double[] veinToggle = perBlock(evaluator, router.veinToggle(), settings, chunkX, chunkZ);
-            double[] veinRidged = perBlock(evaluator, router.veinRidged(), settings, chunkX, chunkZ);
+            double[] veinToggle = perBlock(context, router.veinToggle(), settings, chunkX, chunkZ);
+            double[] veinRidged = perBlock(context, router.veinRidged(), settings, chunkX, chunkZ);
 
             MaterialRules.RouterNoises noises = new MaterialRules.RouterNoises(
                     lower(router.barrierNoise()),
@@ -196,9 +148,8 @@ class MaterialRulesTest {
             int totalBlocks = blockMismatches;
             assertEquals(0, totalDensity,
                     () -> totalDensity + " densities differ; first: " + firstDensity[0]);
-            assertTrue(totalBlocks <= allowedBlockMismatches, () -> totalBlocks + " of "
-                    + vanilla.size() + " blocks differ (allowed " + allowedBlockMismatches
-                    + "); first: " + firstBlock[0]);
+            assertEquals(0, totalBlocks, () -> totalBlocks + " of " + vanilla.size()
+                    + " blocks differ; first: " + firstBlock[0]);
         }
     }
 
@@ -209,7 +160,7 @@ class MaterialRulesTest {
         RandomState randomState = OverworldFixture.randomState();
         int waterId = Block.getId(Blocks.WATER.defaultBlockState());
         int totalWater = 0;
-        for (int[] chunk : EXACT_CHUNKS) {
+        for (int[] chunk : CHUNKS) {
             VanillaChunkReference.ChunkBlocks vanilla =
                     VanillaChunkReference.generate(randomState, chunk[0], chunk[1]);
             for (int id : vanilla.stateIds()) {
@@ -226,11 +177,19 @@ class MaterialRulesTest {
      * {@code cache_all_in_cell}, so their interpolators take the {@code fillingCell == false} path and
      * blend Y then X then Z — the opposite of {@code final_density}. That is why vanilla has two
      * orders at all.
+     *
+     * <p>Each function needs its own evaluator: the marker roots and the instruction stream come from
+     * that function's own program, and reusing another program's image silently produces values from
+     * the wrong function.
      */
-    private static double[] perBlock(DensityEvaluatorGpu evaluator, DensityFunction function,
+    private static double[] perBlock(CudaContext context, DensityFunction function,
             NoiseSettings settings, int chunkX, int chunkZ) {
-        return InterpolatedDensity.forChunk(evaluator, lower(function), settings, chunkX, chunkZ,
-                CornerInterpolation.INCREMENTAL);
+        DensityInterpreter interpreter = lower(function);
+        try (DensityEvaluatorGpu evaluator =
+                new DensityEvaluatorGpu(context, interpreter.program(), 2048)) {
+            return InterpolatedDensity.forChunk(evaluator, interpreter, settings, chunkX, chunkZ,
+                    CornerInterpolation.INCREMENTAL);
+        }
     }
 
     private static int index(int x, int y, int z, int chunkX, int chunkZ, int minY, int height) {

@@ -114,6 +114,14 @@ neoForge {
             sourceSet(sourceSets.main)
         }
     }
+
+    // Makes the FML runtime available to the test source set. Without it, anything that touches
+    // Bootstrap / BuiltInRegistries fails with "There is no current FML Loader" — which is exactly
+    // what building a real RandomState needs.
+    unitTest {
+        enable()
+        testedMod = mods."${mod_id}"
+    }
 }
 
 configurations {
@@ -248,7 +256,9 @@ tasks.named('test', Test) {
     useJUnitPlatform()
     // The CUDA binding goes through java.lang.foreign, which is a restricted operation unless native
     // access is granted explicitly. Without this the tests still run, but every run prints a warning.
+    // FML loads the mod as the named module `terracuda`, so both the unnamed and that module need it.
     jvmArgs '--enable-native-access=ALL-UNNAMED'
+    jvmArgs '--enable-native-access=terracuda'
     testLogging {
         events 'passed', 'skipped', 'failed'
         exceptionFormat = 'full'

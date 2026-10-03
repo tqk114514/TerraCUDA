@@ -25,12 +25,29 @@ public final class NormalNoise {
         return new NormalNoise(random, parameters);
     }
 
+    /**
+     * Rebuilds a noise from octave stacks that were exported out of a live vanilla instance.
+     *
+     * <p>Used by the device-upload path: the permutation tables and origins are mirrored rather than
+     * re-derived, so the reconstruction is identical no matter how the world was seeded.
+     */
+    public static NormalNoise fromPerlinNoise(NoiseParameters parameters, PerlinNoise first, PerlinNoise second) {
+        return new NormalNoise(parameters, first, second);
+    }
+
     private NormalNoise(XoroshiroRandom random, NoiseParameters parameters) {
-        int firstOctave = parameters.firstOctave();
+        // The two PerlinNoise builds must happen in this order: `first` then `second`. Reversing them
+        // still yields a plausible noise, but not the vanilla one.
+        this(parameters,
+                new PerlinNoise(random, parameters.firstOctave(), parameters.amplitudes()),
+                new PerlinNoise(random, parameters.firstOctave(), parameters.amplitudes()));
+    }
+
+    private NormalNoise(NoiseParameters parameters, PerlinNoise first, PerlinNoise second) {
         double[] amplitudes = parameters.amplitudes();
         this.parameters = parameters;
-        this.first = new PerlinNoise(random, firstOctave, amplitudes);
-        this.second = new PerlinNoise(random, firstOctave, amplitudes);
+        this.first = first;
+        this.second = second;
 
         int minOctave = Integer.MAX_VALUE;
         int maxOctave = Integer.MIN_VALUE;

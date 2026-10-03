@@ -54,6 +54,29 @@ public final class PerlinNoise {
         this.maxValue = this.edgeValue(2.0);
     }
 
+    /**
+     * Rebuilds an octave stack from data exported out of a live vanilla instance, bypassing seed
+     * derivation entirely.
+     *
+     * <p>This is the receiving end of the device-upload path described in the design doc: the mod
+     * never re-derives octave seeds, it mirrors whatever the running game already instantiated.
+     *
+     * @param octaves index-aligned with {@code amplitudes}; {@code null} where the amplitude is zero
+     */
+    public PerlinNoise(int firstOctave, double[] amplitudes, ImprovedNoise[] octaves) {
+        if (octaves.length != amplitudes.length) {
+            throw new IllegalArgumentException("expected " + amplitudes.length + " octaves, got " + octaves.length);
+        }
+        this.firstOctave = firstOctave;
+        this.amplitudes = amplitudes.clone();
+        this.noiseLevels = octaves.clone();
+        int octaveCount = this.amplitudes.length;
+        int zeroOctaveIndex = -this.firstOctave;
+        this.lowestFreqInputFactor = Math.pow(2.0, -zeroOctaveIndex);
+        this.lowestFreqValueFactor = Math.pow(2.0, octaveCount - 1) / (Math.pow(2.0, octaveCount) - 1.0);
+        this.maxValue = this.edgeValue(2.0);
+    }
+
     public double maxValue() {
         return this.maxValue;
     }

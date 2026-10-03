@@ -49,6 +49,49 @@ public final class VanillaMath {
         return 30.0 * x * x * (x - 1.0) * (x - 1.0);
     }
 
+    public static double clamp(double value, double min, double max) {
+        return value < min ? min : Math.min(value, max);
+    }
+
+    public static double inverseLerp(double value, double min, double max) {
+        return (value - min) / (max - min);
+    }
+
+    public static double clampedLerp(double factor, double min, double max) {
+        if (factor < 0.0) {
+            return min;
+        }
+        return factor > 1.0 ? max : lerp(factor, min, max);
+    }
+
+    public static double clampedMap(double value, double fromMin, double fromMax, double toMin, double toMax) {
+        return clampedLerp(inverseLerp(value, fromMin, fromMax), toMin, toMax);
+    }
+
+    /** The {@code float} overload; the arithmetic stays in {@code float}, as vanilla's does. */
+    public static float lerp(float alpha, float start, float end) {
+        return start + alpha * (end - start);
+    }
+
+    /**
+     * {@code Mth.binarySearch}: the first index whose predicate holds, or {@code to} when none does.
+     * The cubic splines subtract one from the result to find the interval start.
+     */
+    public static int binarySearch(int from, int to, java.util.function.IntPredicate condition) {
+        int length = to - from;
+        while (length > 0) {
+            int half = length / 2;
+            int middle = from + half;
+            if (condition.test(middle)) {
+                length = half;
+            } else {
+                from = middle + 1;
+                length -= half + 1;
+            }
+        }
+        return from;
+    }
+
     /**
      * The positional seed hash used by {@code PositionalRandomFactory.at}.
      *

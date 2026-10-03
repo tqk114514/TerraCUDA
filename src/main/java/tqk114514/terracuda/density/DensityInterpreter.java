@@ -30,6 +30,8 @@ public final class DensityInterpreter {
     private final int[] stamp;
     private int version;
 
+    private java.util.Map<Integer, Double> overrides = java.util.Map.of();
+
     private int blockX;
     private int blockY;
     private int blockZ;
@@ -46,6 +48,24 @@ public final class DensityInterpreter {
 
     /** Evaluates the program's root at one block position. */
     public double evaluate(int x, int y, int z) {
+        this.overrides = java.util.Map.of();
+        setContext(x, y, z);
+        return eval(this.program.root());
+    }
+
+    /**
+     * Evaluates the program with some instructions' values supplied from outside.
+     *
+     * <p>This is how the interpolated markers are handled: vanilla samples them on a coarse grid and
+     * interpolates between the samples, so the density at a block is not what the sub-graph would
+     * compute there. Passing the interpolated values in as overrides lets the rest of the DAG be
+     * evaluated unchanged, which is exactly the split the GPU path uses — the corners come from the
+     * device, the arithmetic above them does not.
+     *
+     * @param overrides instruction index to value; the program's own computation is skipped for those
+     */
+    public double evaluate(int x, int y, int z, java.util.Map<Integer, Double> overrides) {
+        this.overrides = overrides;
         setContext(x, y, z);
         return eval(this.program.root());
     }
@@ -72,7 +92,8 @@ public final class DensityInterpreter {
         if (this.stamp[pc] == this.version) {
             return this.memo[pc];
         }
-        double value = compute(pc);
+        Double override = this.overrides.get(pc);
+        double value = override != null ? override : compute(pc);
         this.memo[pc] = value;
         this.stamp[pc] = this.version;
         return value;

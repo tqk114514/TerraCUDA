@@ -6,6 +6,7 @@ import net.minecraft.world.level.block.Blocks;
 import net.minecraft.world.level.block.state.BlockState;
 import net.minecraft.world.level.levelgen.Aquifer;
 import net.minecraft.world.level.levelgen.Beardifier;
+import net.minecraft.world.level.levelgen.DensityFunction;
 import net.minecraft.world.level.levelgen.NoiseChunk;
 import net.minecraft.world.level.levelgen.NoiseGeneratorSettings;
 import net.minecraft.world.level.levelgen.NoiseSettings;
@@ -31,22 +32,34 @@ public final class VanillaChunkReference {
     private static final Method GET_INTERPOLATED_STATE = interpolatedStateAccessor();
 
     /**
-     * The block state ids of one chunk, indexed {@code (x * 16 + z) * height + (y - minY)}.
+     * One chunk's output, indexed {@code (x * 16 + z) * height + (y - minY)}.
      *
-     * @param stateIds {@link Block#getId(BlockState)} per block
-     * @param minY     the chunk's lowest y
-     * @param height   the chunk's height
+     * @param stateIds  {@link Block#getId(BlockState)} per block
+     * @param densities the value the material rules saw, i.e. the interpolated {@code final_density}
+     *                  plus the beardifier — the number that decides solid from sky
+     * @param minY      the chunk's lowest y
+     * @param height    the chunk's height
      */
-    public record ChunkBlocks(int[] stateIds, int minY, int height) {
+    public record ChunkBlocks(int[] stateIds, double[] densities, int minY, int height) {
 
         public int at(int x, int y, int z) {
-            return this.stateIds[(x * 16 + z) * this.height + (y - this.minY)];
+            return this.stateIds[index(x, y, z)];
+        }
+
+        public double densityAt(int x, int y, int z) {
+            return this.densities[index(x, y, z)];
+        }
+
+        private int index(int x, int y, int z) {
+            return (x * 16 + z) * this.height + (y - this.minY);
         }
 
         public int size() {
             return this.stateIds.length;
         }
     }
+
+    private static final java.lang.reflect.Field FULL_NOISE_DENSITY = fullNoiseDensityAccessor();
 
     private VanillaChunkReference() {
     }
@@ -80,10 +93,12 @@ public final class VanillaChunkReference {
                 noiseSettings, Beardifier.EMPTY, settings, fluidPicker, Blender.empty());
 
         int[] stateIds = new int[16 * 16 * noiseSettings.height()];
+        double[] densities = new double[stateIds.length];
         int minY = noiseSettings.minY();
         int height = noiseSettings.height();
         int chunkMinBlockX = chunkX * 16;
         int chunkMinBlockZ = chunkZ * 16;
+        DensityFunction fullNoise = fullNoiseDensity(chunk);
 
         chunk.initializeForFirstCellX();
         for (int cellX = 0; cellX < cellCountXZ; cellX++) {
@@ -107,7 +122,9 @@ public final class VanillaChunkReference {
                                 if (state == null) {
                                     state = settings.defaultBlock();
                                 }
-                                stateIds[(x * 16 + z) * height + (posY - minY)] = Block.getId(state);
+                                int index = (x * 16 + z) * height + (posY - minY);
+                                stateIds[index] = Block.getId(state);
+                                densities[index] = fullNoise.compute(chunk);
                             }
                         }
                     }
@@ -117,7 +134,31 @@ public final class VanillaChunkReference {
         }
         chunk.stopInterpolation();
 
-        return new ChunkBlocks(stateIds, minY, height);
+        return new ChunkBlocks(stateIds, densities, minY, height);
+    }
+
+    /**
+     * The {@code cache_all_in_cell} node holding the interpolated density plus the beardifier — the
+     * exact number the material rules are handed. Private, so it is reached by reflection.
+     */
+    private static DensityFunction fullNoiseDensity(NoiseChunk chunk) {
+        try {
+            return (DensityFunction) FULL_NOISE_DENSITY.get(chunk);
+        } catch (IllegalAccessException e) {
+            throw new IllegalStateException("vanilla layout changed: NoiseChunk.fullNoiseDensity", e);
+        }
+    }
+
+    private static java.lang.reflect.Field fullNoiseDensityAccessor() {
+        try {
+            java.lang.reflect.Field field = NoiseChunk.class.getDeclaredField("fullNoiseDensity");
+            field.setAccessible(true);
+            return field;
+        } catch (NoSuchFieldException e) {
+            throw new IllegalStateException("vanilla layout changed: NoiseChunk.fullNoiseDensity", e);
+        } catch (RuntimeException e) {
+            throw new IllegalStateException("cannot access NoiseChunk.fullNoiseDensity", e);
+        }
     }
 
     private static BlockState interpolatedState(NoiseChunk chunk) {

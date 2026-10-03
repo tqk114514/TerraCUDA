@@ -9,6 +9,8 @@ import tqk114514.terracuda.cuda.KernelArguments;
 import tqk114514.terracuda.density.DensityProgram;
 import tqk114514.terracuda.density.DensityProgramImage;
 
+import net.minecraft.world.level.levelgen.NoiseSettings;
+
 /**
  * GPU-backed evaluation of a lowered density program: the K2 kernel of the design doc.
  *
@@ -26,6 +28,7 @@ public final class DensityEvaluatorGpu implements AutoCloseable {
     public static final String KERNEL_NAME = "terracuda_density_evaluate";
 
     private static final int BLOCK_SIZE = 128;
+    private static final int MIN_CAPACITY = 2048;
 
     private final CudaContext context;
     private final DensityProgramImage image;
@@ -34,6 +37,7 @@ public final class DensityEvaluatorGpu implements AutoCloseable {
     private final CudaContext.DeviceBuffer points;
     private final CudaContext.DeviceBuffer scratch;
     private final CudaContext.DeviceBuffer results;
+    private CudaContext.DeviceBuffer roots;
     private final int instructionCount;
     private final int root;
     private final int capacity;
@@ -41,6 +45,19 @@ public final class DensityEvaluatorGpu implements AutoCloseable {
 
     public DensityEvaluatorGpu(CudaContext context, DensityProgram program, int capacity) {
         this(context, DensityProgramImage.of(program), capacity);
+    }
+
+    /**
+     * Builds an evaluator sized for {@code program}'s chunk-scale work.
+     *
+     * <p>The capacity is the program's total marker grid, because those grids go out in one launch. A
+     * capacity that is too small is not wrong — the grids get split — but it gives up most of the win.
+     */
+    public static DensityEvaluatorGpu forProgram(CudaContext context, DensityProgram program,
+            NoiseSettings settings) {
+        DensityProgramImage image = DensityProgramImage.of(program);
+        int budget = Math.max(MIN_CAPACITY, ChunkCornerTables.pointBudget(image, settings));
+        return new DensityEvaluatorGpu(context, image, budget);
     }
 
     public DensityEvaluatorGpu(CudaContext context, DensityProgramImage image, int capacity) {
@@ -91,7 +108,7 @@ public final class DensityEvaluatorGpu implements AutoCloseable {
      * @return one density value per position
      */
     public double[] evaluate(int[] blockCoordinates) {
-        return evaluate(blockCoordinates, this.root);
+        return evaluate(blockCoordinates, this.root, null);
     }
 
     /**
@@ -104,6 +121,25 @@ public final class DensityEvaluatorGpu implements AutoCloseable {
      * @param rootInstruction the instruction to take the value of, instead of the program root
      */
     public double[] evaluate(int[] blockCoordinates, int rootInstruction) {
+        return evaluate(blockCoordinates, rootInstruction, null);
+    }
+
+    /**
+     * Evaluates several sub-graphs of the same program in one launch.
+     *
+     * <p>This is the point of the whole class. A launch of 1225 points against a 450-step serial chain
+     * leaves the device almost idle — the measured cost is flat at ~750 µs whether the launch carries
+     * one point or twenty-five — so folding every marker's grid into a single launch is worth several
+     * times the bookkeeping. The scratch is sized for the worst case, which is one instruction array
+     * per point regardless of how many roots are in play.
+     *
+     * @param roots one instruction index per point, or {@code null} to use the program root for all
+     */
+    public double[] evaluate(int[] blockCoordinates, int[] roots) {
+        return evaluate(blockCoordinates, this.root, roots);
+    }
+
+    private double[] evaluate(int[] blockCoordinates, int rootInstruction, int[] roots) {
         if (blockCoordinates.length % 3 != 0) {
             throw new IllegalArgumentException("expected interleaved xyz triples, got "
                     + blockCoordinates.length + " ints");
@@ -112,6 +148,9 @@ public final class DensityEvaluatorGpu implements AutoCloseable {
         if (count > this.capacity) {
             throw new IllegalArgumentException("batch of " + count + " points exceeds the "
                     + this.capacity + "-point capacity");
+        }
+        if (roots != null && roots.length != count) {
+            throw new IllegalArgumentException("expected " + count + " roots, got " + roots.length);
         }
         if (rootInstruction < 0 || rootInstruction >= this.instructionCount) {
             throw new IllegalArgumentException("root instruction " + rootInstruction
@@ -125,11 +164,22 @@ public final class DensityEvaluatorGpu implements AutoCloseable {
             MemorySegment hostPoints = arena.allocateFrom(ValueLayout.JAVA_INT, blockCoordinates);
             this.context.copyToDevice(hostPoints, this.points);
 
-            try (KernelArguments arguments = new KernelArguments(8)) {
+            long rootAddress = 0L;
+            if (roots != null) {
+                if (this.roots == null) {
+                    this.roots = this.context.allocate((long) this.capacity * Integer.BYTES);
+                }
+                MemorySegment hostRoots = arena.allocateFrom(ValueLayout.JAVA_INT, roots);
+                this.context.copyToDevice(hostRoots, this.roots);
+                rootAddress = this.roots.address();
+            }
+
+            try (KernelArguments arguments = new KernelArguments(9)) {
                 arguments.addDevicePointer(this.blob.address())
                         .addDevicePointer(this.offsets.address())
                         .addInt(this.instructionCount)
                         .addInt(rootInstruction)
+                        .addDevicePointer(rootAddress)
                         .addDevicePointer(this.points.address())
                         .addDevicePointer(this.scratch.address())
                         .addDevicePointer(this.results.address())
@@ -155,6 +205,9 @@ public final class DensityEvaluatorGpu implements AutoCloseable {
             return;
         }
         this.context.free(this.results);
+        if (this.roots != null) {
+            this.context.free(this.roots);
+        }
         this.context.free(this.scratch);
         this.context.free(this.points);
         this.context.free(this.offsets);

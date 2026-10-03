@@ -620,11 +620,17 @@ extern "C" __global__ void terracuda_improved_noise_points(
 
 // One thread per block position. `scratch` is count * instructionCount doubles, owned by the caller:
 // per-thread local memory would be far too large, and a device-side malloc per thread is worse.
+//
+// `roots` lets one launch evaluate several sub-graphs of the same program — a marker's root per point.
+// That matters more than it looks: a launch of 1225 points against a 450-step serial chain leaves the
+// device almost idle, so folding every marker's grid into one launch is worth several times the cost
+// of the extra bookkeeping. Pass NULL to use the single `root` for every point.
 extern "C" __global__ void terracuda_density_evaluate(
         const char* __restrict__ blob,
         const long long* __restrict__ offsets,
         int instructionCount,
         int root,
+        const int* __restrict__ roots,
         const int* __restrict__ points,   // 3 * count block coordinates
         double* __restrict__ scratch,     // count * instructionCount
         double* __restrict__ results,     // count
@@ -637,7 +643,7 @@ extern "C" __global__ void terracuda_density_evaluate(
     TcProgram program;
     program.blob = blob;
     program.offsets = offsets;
-    program.root = root;
+    program.root = roots == 0 ? root : roots[index];
     program.instructionCount = instructionCount;
     program.blockX = points[3 * index];
     program.blockY = points[3 * index + 1];
@@ -650,5 +656,5 @@ extern "C" __global__ void terracuda_density_evaluate(
     for (int pc = 0; pc < instructionCount; pc++) {
         values[pc] = tcCompute(program, values, pc);
     }
-    results[index] = values[root];
+    results[index] = values[program.root];
 }

@@ -75,9 +75,9 @@ public final class GpuChunkFiller implements AutoCloseable {
         this.veinGap = lower(this.router.veinGap());
         this.preliminarySurface = lower(this.router.preliminarySurfaceLevel());
 
-        this.densityEvaluator = new DensityEvaluatorGpu(context, this.density.program(), 2048);
-        this.veinToggleEvaluator = new DensityEvaluatorGpu(context, this.veinToggle.program(), 2048);
-        this.veinRidgedEvaluator = new DensityEvaluatorGpu(context, this.veinRidged.program(), 2048);
+        this.densityEvaluator = DensityEvaluatorGpu.forProgram(context, this.density.program(), this.geometry);
+        this.veinToggleEvaluator = DensityEvaluatorGpu.forProgram(context, this.veinToggle.program(), this.geometry);
+        this.veinRidgedEvaluator = DensityEvaluatorGpu.forProgram(context, this.veinRidged.program(), this.geometry);
     }
 
     public static GpuChunkFiller create(CudaContext context, RandomState randomState,

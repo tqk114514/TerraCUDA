@@ -93,9 +93,32 @@ public final class ChunkCornerTables {
     }
 
     /**
+     * The number of points a chunk's marker grids need in total.
+     *
+     * <p>Callers size the evaluator from this, because the grids are evaluated in one launch: a launch
+     * costs about the same whether it carries one point or twenty-five, so the marker grids have to
+     * travel together to be worth anything.
+     */
+    public static int pointBudget(DensityProgramImage image, NoiseSettings settings) {
+        int countY = cornerCountY(settings);
+        int total = 0;
+        for (int kind : image.markerKinds()) {
+            if (kind == DensityProgram.MARKER_INTERPOLATED) {
+                total += CORNERS_XZ * CORNERS_XZ * countY;
+            } else if (kind == DensityProgram.MARKER_FLAT_CACHE || kind == DensityProgram.MARKER_CACHE_2D) {
+                total += CORNERS_XZ * CORNERS_XZ;
+            }
+        }
+        return total;
+    }
+
+    /**
      * Evaluates every column cache and every interpolator corner grid for one chunk.
      *
-     * <p>Batches are split to the evaluator's capacity, so a single evaluator can serve any chunk size.
+     * <p>The grids are concatenated into a single launch, up to the evaluator's capacity. That is not
+     * a micro-optimisation: a launch of 1225 points against a 450-step serial chain leaves the device
+     * mostly idle, and the measured cost is flat at roughly 750 µs whether the launch carries one
+     * point or twenty-five. Eighteen separate launches therefore cost eighteen times the ramp.
      */
     public static List<MarkerGrid> compute(DensityEvaluatorGpu evaluator, NoiseSettings settings,
             int chunkX, int chunkZ) {
@@ -106,33 +129,60 @@ public final class ChunkCornerTables {
         int[] flats = flatCoordinates(settings, chunkX, chunkZ);
         int countY = cornerCountY(settings);
 
-        List<MarkerGrid> grids = new ArrayList<>();
+        List<Integer> markers = new ArrayList<>();
+        List<int[]> coordinates = new ArrayList<>();
         for (int i = 0; i < kinds.length; i++) {
             boolean isCorner = kinds[i] == DensityProgram.MARKER_INTERPOLATED;
             boolean isFlat = kinds[i] == DensityProgram.MARKER_FLAT_CACHE
                     || kinds[i] == DensityProgram.MARKER_CACHE_2D;
-            if (!isCorner && !isFlat) {
-                continue;
+            if (isCorner || isFlat) {
+                markers.add(i);
+                coordinates.add(isCorner ? corners : flats);
             }
-            int[] coordinates = isCorner ? corners : flats;
-            double[] values = evaluateInBatches(evaluator, coordinates, roots[i]);
-            grids.add(new MarkerGrid(kinds[i], roots[i], isCorner ? countY : 1, coordinates, values));
+        }
+
+        List<MarkerGrid> grids = new ArrayList<>();
+        int capacityPoints = evaluator.capacity();
+        int at = 0;
+        while (at < markers.size()) {
+            int points = 0;
+            int end = at;
+            while (end < markers.size()
+                    && points + coordinates.get(end).length / 3 <= capacityPoints) {
+                points += coordinates.get(end).length / 3;
+                end++;
+            }
+            if (end == at) {
+                throw new IllegalArgumentException("one marker grid needs " + coordinates.get(at).length / 3
+                        + " points, more than the evaluator's capacity of " + capacityPoints);
+            }
+
+            int[] combined = new int[3 * points];
+            int[] combinedRoots = new int[points];
+            int offset = 0;
+            for (int i = at; i < end; i++) {
+                int[] grid = coordinates.get(i);
+                System.arraycopy(grid, 0, combined, 3 * offset, grid.length);
+                int gridPoints = grid.length / 3;
+                java.util.Arrays.fill(combinedRoots, offset, offset + gridPoints, roots[markers.get(i)]);
+                offset += gridPoints;
+            }
+
+            double[] values = evaluator.evaluate(combined, combinedRoots);
+
+            int cursor = 0;
+            for (int i = at; i < end; i++) {
+                int[] grid = coordinates.get(i);
+                int gridPoints = grid.length / 3;
+                double[] slice = new double[gridPoints];
+                System.arraycopy(values, cursor, slice, 0, gridPoints);
+                int index = markers.get(i);
+                grids.add(new MarkerGrid(kinds[index], roots[index],
+                        kinds[index] == DensityProgram.MARKER_INTERPOLATED ? countY : 1, grid, slice));
+                cursor += gridPoints;
+            }
+            at = end;
         }
         return grids;
-    }
-
-    private static double[] evaluateInBatches(DensityEvaluatorGpu evaluator, int[] coordinates,
-            int root) {
-        int points = coordinates.length / 3;
-        double[] values = new double[points];
-        int batch = evaluator.capacity();
-        for (int start = 0; start < points; start += batch) {
-            int size = Math.min(batch, points - start);
-            int[] slice = new int[3 * size];
-            System.arraycopy(coordinates, 3 * start, slice, 0, 3 * size);
-            double[] partial = evaluator.evaluate(slice, root);
-            System.arraycopy(partial, 0, values, start, size);
-        }
-        return values;
     }
 }

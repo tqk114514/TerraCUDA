@@ -5,6 +5,7 @@ import net.minecraft.world.level.block.state.BlockState;
 import net.minecraft.world.level.levelgen.Aquifer;
 import net.minecraft.world.level.levelgen.NoiseSettings;
 import tqk114514.terracuda.density.DensityInterpreter;
+import tqk114514.terracuda.density.DensityProgram;
 import tqk114514.terracuda.math.VanillaMath;
 import tqk114514.terracuda.random.PositionalRandomFactory;
 import tqk114514.terracuda.random.XoroshiroRandom;
@@ -48,14 +49,79 @@ public final class MaterialRules {
     }
 
     /** The router's noise functions. The interpolated ones arrive as per-block values. */
+    /** Vanilla's flat cache is five by five: the chunk's four quart columns plus one. */
+    /** Vanilla's flat cache is five by five: the chunk's four quart columns plus one. */
+    private static final int FLAT_CACHE_SIZE = 5;
+
+    /**
+     * A router entry, wrapped the way vanilla wraps it.
+     *
+     * <p>{@code flat_cache} is not a pass-through in vanilla. {@code NoiseChunk.FlatCache} fills a
+     * five-by-five table at the chunk's quart columns, sampling the wrapped function at
+     * {@code (quartX << 2, 0, quartZ << 2)}, and answers every query inside the chunk from it —
+     * falling back to an exact evaluation only outside. The aquifer reads erosion and depth through
+     * exactly that wrapper, so evaluating them exactly instead moves the numbers on the narrow bands
+     * where the aquifer's decisions sit.
+     *
+     * <p>Whether an entry is wrapped is asked of the lowered program rather than hard-coded: if the
+     * marker at its root is a flat cache, vanilla wrapped it.
+     */
+    public static Entry entry(DensityInterpreter interpreter, DensityProgram program,
+            int chunkX, int chunkZ) {
+        if (!rootIsFlatCache(program)) {
+            return interpreter::evaluate;
+        }
+        int firstQuartX = chunkX * 16 >> 2;
+        int firstQuartZ = chunkZ * 16 >> 2;
+        double[] table = new double[FLAT_CACHE_SIZE * FLAT_CACHE_SIZE];
+        for (int x = 0; x < FLAT_CACHE_SIZE; x++) {
+            for (int z = 0; z < FLAT_CACHE_SIZE; z++) {
+                table[x + z * FLAT_CACHE_SIZE] =
+                        interpreter.evaluate((firstQuartX + x) << 2, 0, (firstQuartZ + z) << 2);
+            }
+        }
+        return (x, y, z) -> {
+            int qx = (x >> 2) - firstQuartX;
+            int qz = (z >> 2) - firstQuartZ;
+            return qx >= 0 && qz >= 0 && qx < FLAT_CACHE_SIZE && qz < FLAT_CACHE_SIZE
+                    ? table[qx + qz * FLAT_CACHE_SIZE]
+                    : interpreter.evaluate(x, y, z);
+        };
+    }
+
+    private static boolean rootIsFlatCache(DensityProgram program) {
+        int[] kinds = program.markerKinds();
+        int[] roots = program.markerRoots();
+        for (int i = 0; i < kinds.length; i++) {
+            if (kinds[i] == DensityProgram.MARKER_FLAT_CACHE && roots[i] == program.root()) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    /**
+     * A router entry as the material rules should read it.
+     *
+     * <p>Not a {@code DensityInterpreter} directly, because vanilla does not evaluate every entry the
+     * same way: the ones wrapped in {@code flat_cache} are sampled once per quart column at y=0 and
+     * answered from a five-by-five table, falling back to an exact evaluation only outside the
+     * chunk's own columns. Reading them exactly would give a different number on the narrow bands
+     * where the aquifer's decisions sit.
+     */
+    @FunctionalInterface
+    public interface Entry {
+        double at(int x, int y, int z);
+    }
+
     public record RouterNoises(
-            DensityInterpreter barrierNoise,
-            DensityInterpreter fluidLevelFloodednessNoise,
-            DensityInterpreter fluidLevelSpreadNoise,
-            DensityInterpreter lavaNoise,
-            DensityInterpreter erosion,
-            DensityInterpreter depth,
-            DensityInterpreter veinGap,
+            Entry barrierNoise,
+            Entry fluidLevelFloodednessNoise,
+            Entry fluidLevelSpreadNoise,
+            Entry lavaNoise,
+            Entry erosion,
+            Entry depth,
+            Entry veinGap,
             PerBlock veinToggle,
             PerBlock veinRidged) {
     }
@@ -379,7 +445,7 @@ public final class MaterialRules {
         double noiseValue;
         if (gradient >= -2.0 && gradient <= 2.0) {
             if (Double.isNaN(this.barrierNoiseScratch[0])) {
-                this.barrierNoiseScratch[0] = this.noises.barrierNoise().evaluate(posX, posY, posZ);
+                this.barrierNoiseScratch[0] = this.noises.barrierNoise().at(posX, posY, posZ);
             }
             noiseValue = this.barrierNoiseScratch[0];
         } else {
@@ -451,7 +517,7 @@ public final class MaterialRules {
                     ? VanillaMath.clampedMap(distanceBelowSurface, 0.0, 64.0, 1.0, 0.0)
                     : 0.0;
             double floodednessNoise = VanillaMath.clamp(
-                    this.noises.fluidLevelFloodednessNoise().evaluate(x, y, z), -1.0, 1.0);
+                    this.noises.fluidLevelFloodednessNoise().at(x, y, z), -1.0, 1.0);
             double fullyFloodedThreshold = VanillaMath.lerp(
                     VanillaMath.inverseLerp(floodednessFactor, 1.0, 0.0), -0.3, 0.8);
             double partiallyFloodedThreshold = VanillaMath.lerp(
@@ -475,7 +541,7 @@ public final class MaterialRules {
         int fluidLevelCellZ = Math.floorDiv(z, 16);
         int fluidCellMiddleY = fluidLevelCellY * 40 + 20;
         double spread = this.noises.fluidLevelSpreadNoise()
-                .evaluate(fluidLevelCellX, fluidLevelCellY, fluidLevelCellZ) * 10.0;
+                .at(fluidLevelCellX, fluidLevelCellY, fluidLevelCellZ) * 10.0;
         int quantized = VanillaMath.floor(spread / 3) * 3;
         int targetFluidSurfaceLevel = fluidCellMiddleY + quantized;
         return Math.min(lowestPreliminarySurface, targetFluidSurfaceLevel);
@@ -489,7 +555,7 @@ public final class MaterialRules {
             int fluidTypeCellY = Math.floorDiv(y, 40);
             int fluidTypeCellZ = Math.floorDiv(z, 64);
             double lavaNoise = this.noises.lavaNoise()
-                    .evaluate(fluidTypeCellX, fluidTypeCellY, fluidTypeCellZ);
+                    .at(fluidTypeCellX, fluidTypeCellY, fluidTypeCellZ);
             if (Math.abs(lavaNoise) > 0.3) {
                 fluidType = LAVA;
             }
@@ -502,8 +568,8 @@ public final class MaterialRules {
         // -0.22499999403953552 and 0.9F is 0.8999999761581421. Writing them as doubles moves both
         // boundaries by a few times 1e-8, which is enough to flip the aquifer's decision on the
         // narrow band where the deep-dark test sits.
-        return this.noises.erosion().evaluate(x, y, z) < -0.225F
-                && this.noises.depth().evaluate(x, y, z) > 0.9F;
+        return this.noises.erosion().at(x, y, z) < -0.225F
+                && this.noises.depth().at(x, y, z) > 0.9F;
     }
 
     private int getIndex(int gridX, int gridY, int gridZ) {
@@ -587,7 +653,7 @@ public final class MaterialRules {
         }
 
         double richness = VanillaMath.clampedMap(ridged, 0.4F, 0.6F, 0.1F, 0.3F);
-        if (random.nextFloat() < richness && this.noises.veinGap().evaluate(posX, posY, posZ) > -0.3F) {
+        if (random.nextFloat() < richness && this.noises.veinGap().at(posX, posY, posZ) > -0.3F) {
             return random.nextFloat() < 0.02F ? type.rawOreBlock : type.ore;
         }
         return type.filler;

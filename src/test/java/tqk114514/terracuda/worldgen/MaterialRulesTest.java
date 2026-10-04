@@ -90,13 +90,13 @@ class MaterialRulesTest {
             double[] veinRidged = perBlock(context, router.veinRidged(), settings, chunkX, chunkZ);
 
             MaterialRules.RouterNoises noises = new MaterialRules.RouterNoises(
-                    lower(router.barrierNoise()),
-                    lower(router.fluidLevelFloodednessNoise()),
-                    lower(router.fluidLevelSpreadNoise()),
-                    lower(router.lavaNoise()),
-                    lower(router.erosion()),
-                    lower(router.depth()),
-                    lower(router.veinGap()),
+                    entry(router.barrierNoise(), chunkX, chunkZ),
+                    entry(router.fluidLevelFloodednessNoise(), chunkX, chunkZ),
+                    entry(router.fluidLevelSpreadNoise(), chunkX, chunkZ),
+                    entry(router.lavaNoise(), chunkX, chunkZ),
+                    entry(router.erosion(), chunkX, chunkZ),
+                    entry(router.depth(), chunkX, chunkZ),
+                    entry(router.veinGap(), chunkX, chunkZ),
                     (x, y, z) -> veinToggle[index(x, y, z, chunkX, chunkZ, minY, height)],
                     (x, y, z) -> veinRidged[index(x, y, z, chunkX, chunkZ, minY, height)]);
 
@@ -201,6 +201,12 @@ class MaterialRulesTest {
     private static String where(int chunkX, int chunkZ, int x, int y, int z) {
         return "chunk (" + chunkX + ", " + chunkZ + ") at ("
                 + (chunkX * 16 + x) + ", " + y + ", " + (chunkZ * 16 + z) + ")";
+    }
+
+    /** A router entry, wrapped the way vanilla wraps it. */
+    private static MaterialRules.Entry entry(DensityFunction function, int chunkX, int chunkZ) {
+        DensityInterpreter interpreter = lower(function);
+        return MaterialRules.entry(interpreter, interpreter.program(), chunkX, chunkZ);
     }
 
     private static DensityInterpreter lower(DensityFunction function) {

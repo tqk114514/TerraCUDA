@@ -119,8 +119,13 @@ public final class GpuChunkFiller implements AutoCloseable {
                 CornerInterpolation.INCREMENTAL, veinRidgedValues);
 
         MaterialRules.RouterNoises noises = new MaterialRules.RouterNoises(
-                this.barrierNoise, this.floodedness, this.spread, this.lava, this.erosion,
-                this.depth, this.veinGap,
+                MaterialRules.entry(this.barrierNoise, this.barrierNoise.program(), chunkX, chunkZ),
+                MaterialRules.entry(this.floodedness, this.floodedness.program(), chunkX, chunkZ),
+                MaterialRules.entry(this.spread, this.spread.program(), chunkX, chunkZ),
+                MaterialRules.entry(this.lava, this.lava.program(), chunkX, chunkZ),
+                MaterialRules.entry(this.erosion, this.erosion.program(), chunkX, chunkZ),
+                MaterialRules.entry(this.depth, this.depth.program(), chunkX, chunkZ),
+                MaterialRules.entry(this.veinGap, this.veinGap.program(), chunkX, chunkZ),
                 (x, y, z) -> veinToggleValues[index(x, y, z, chunkX, chunkZ, minY, height)],
                 (x, y, z) -> veinRidgedValues[index(x, y, z, chunkX, chunkZ, minY, height)]);
 

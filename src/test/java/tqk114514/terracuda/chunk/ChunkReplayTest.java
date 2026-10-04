@@ -52,6 +52,10 @@ class ChunkReplayTest {
     private static final int HEIGHT = 384;
     private static final int COUNT = 16 * 16 * HEIGHT;
 
+    /** The overworld's geometry: the same cell sizes, so the replay's ordering matches. */
+    private static final net.minecraft.world.level.levelgen.NoiseSettings SETTINGS =
+            new net.minecraft.world.level.levelgen.NoiseSettings(MIN_Y, HEIGHT, 4, 8);
+
     /** Everything below this is stone. */
     private static final int STONE_TOP = 60;
     /** Water fills up to just under this. */
@@ -62,7 +66,7 @@ class ChunkReplayTest {
         ProtoChunk chunk = newChunk();
         EmittedChunk emitted = syntheticChunk();
 
-        ChunkReplay.write(chunk, emitted, MIN_Y, HEIGHT);
+        ChunkReplay.write(chunk, emitted, SETTINGS);
 
         int stone = Block.getId(Blocks.STONE.defaultBlockState());
         int water = Block.getId(Blocks.WATER.defaultBlockState());
@@ -139,7 +143,7 @@ class ChunkReplayTest {
         int[] ids = new int[COUNT];
         java.util.Arrays.fill(ids, air);
 
-        ChunkReplay.write(chunk, new EmittedChunk(ids, new long[(COUNT + 63) >>> 6]), MIN_Y, HEIGHT);
+        ChunkReplay.write(chunk, new EmittedChunk(ids, new long[(COUNT + 63) >>> 6]), SETTINGS);
 
         assertEquals(air, Block.getId(chunk.getBlockState(new net.minecraft.core.BlockPos(0, 0, 0))));
         // Heightmap.getFirstAvailable returns minY when nothing is there.
@@ -148,11 +152,52 @@ class ChunkReplayTest {
                         .getFirstAvailable(0, 0));
     }
 
+    /**
+     * The post-processing list is queued in {@code doFill}'s order, not in this loop's.
+     *
+     * <p>Two positions in the same cell at different y is the smallest case that tells the two apart.
+     * doFill walks cells and descends within them, so it queues the higher one first; a loop that
+     * walks y ascending queues the lower one first. Both put the same positions in the list.
+     */
+    @Test
+    void postProcessingIsQueuedInTheOrderDoFillUses() {
+        ProtoChunk chunk = newChunk();
+        int stone = Block.getId(Blocks.STONE.defaultBlockState());
+        int[] ids = new int[COUNT];
+        java.util.Arrays.fill(ids, stone);
+
+        // Same cell — cell width 4, cell height 8 — at yLocal 60 and 63, which are yInCell 4 and 7
+        // of the same cell row, and both in section 7.
+        int lower = index(0, MIN_Y + 60, 0);
+        int higher = index(0, MIN_Y + 63, 0);
+        long[] flags = new long[(COUNT + 63) >>> 6];
+        flags[lower >>> 6] |= 1L << (lower & 63);
+        flags[higher >>> 6] |= 1L << (higher & 63);
+
+        ChunkReplay.write(chunk, new EmittedChunk(ids, flags), SETTINGS);
+
+        int section = chunk.getSectionIndex(MIN_Y + 63);
+        var list = chunk.getPostProcessing()[section];
+        assertNotNull(list, "both positions are in one section and should have been queued");
+        assertEquals(2, list.size());
+        // The packed offset carries y within its section, which over one cell row is monotonic with
+        // y within the cell — enough to tell the two orders apart.
+        int firstY = (list.getShort(0) & 0xFFFF) >> 4 & 15;
+        int secondY = (list.getShort(1) & 0xFFFF) >> 4 & 15;
+        assertTrue(firstY > secondY,
+                "the higher y should be queued first, but the list is " + firstY + " then "
+                        + secondY);
+    }
+
+    private static int index(int x, int y, int z) {
+        return (x * 16 + z) * HEIGHT + (y - MIN_Y);
+    }
+
     @Test
     void aWrongSizedArrayIsRejected() {
         ProtoChunk chunk = newChunk();
         try {
-            ChunkReplay.write(chunk, new EmittedChunk(new int[16], new long[1]), MIN_Y, HEIGHT);
+            ChunkReplay.write(chunk, new EmittedChunk(new int[16], new long[1]), SETTINGS);
             throw new AssertionError("expected a size check");
         } catch (IllegalArgumentException expected) {
             assertTrue(expected.getMessage().contains("block ids"), expected.getMessage());

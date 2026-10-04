@@ -191,7 +191,7 @@ public final class GpuChunkFiller implements AutoCloseable {
         }
         try {
             EmittedChunk emitted = blockIds(chunk.getPos().x(), chunk.getPos().z());
-            ChunkReplay.write(chunk, emitted, minY, height);
+            ChunkReplay.write(chunk, emitted, this.geometry);
         } finally {
             for (LevelChunkSection section : held) {
                 section.release();

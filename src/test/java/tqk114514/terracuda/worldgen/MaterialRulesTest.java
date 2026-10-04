@@ -103,7 +103,8 @@ class MaterialRulesTest {
             MaterialRules rules = MaterialRules.forChunk(noises,
                     surfaceLevels(router.preliminarySurfaceLevel()), fluidPicker,
                     VanillaRandomExport.export(randomState.aquiferRandom()),
-                    VanillaRandomExport.export(randomState.oreRandom()), chunkX, chunkZ, settings);
+                    VanillaRandomExport.export(randomState.oreRandom()), chunkX, chunkZ, settings,
+                    generatorSettings.isAquifersEnabled(), generatorSettings.oreVeinsEnabled());
 
             VanillaChunkReference.ChunkBlocks vanilla =
                     VanillaChunkReference.generate(generatorSettings, randomState, chunkX, chunkZ);

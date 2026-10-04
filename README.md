@@ -34,6 +34,10 @@ anything that goes wrong falls through to vanilla, which writes every block itse
 - Java 25
 - An NVIDIA GPU with CUDA support
 
+Windows only for now: the driver library is loaded by its Windows name (`nvcuda.dll`), so on Linux the
+mod reports the device as unavailable and quietly uses vanilla. Adding `libcuda.so.1` as a second
+candidate is a one-line change in `CudaDriver`.
+
 ## Building
 
 ```bash

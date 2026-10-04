@@ -126,7 +126,8 @@ public final class GpuChunkFiller implements AutoCloseable {
 
         MaterialRules rules = MaterialRules.forChunk(noises, surfaceLevels(), fluidPicker(),
                 VanillaRandomExport.export(this.randomState.aquiferRandom()),
-                VanillaRandomExport.export(this.randomState.oreRandom()), chunkX, chunkZ, this.geometry);
+                VanillaRandomExport.export(this.randomState.oreRandom()), chunkX, chunkZ, this.geometry,
+                this.settings.isAquifersEnabled(), this.settings.oreVeinsEnabled());
 
         BlockState defaultBlock = this.settings.defaultBlock();
         int chunkMinBlockX = chunkX * 16;

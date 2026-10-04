@@ -70,8 +70,14 @@ public final class MaterialRules {
             {0, 0}, {-2, -1}, {-1, -1}, {0, -1}, {1, -1}, {-3, 0}, {-2, 0}, {-1, 0}, {1, 0},
             {-2, 1}, {-1, 1}, {0, 1}, {1, 1}
     };
-    /** {@code DimensionType.WAY_BELOW_MIN_Y}, which is {@code MIN_Y << 4}. */
-    private static final int WAY_BELOW_MIN_Y = -64 << 4;
+    /**
+     * {@code DimensionType.WAY_BELOW_MIN_Y}, the sentinel the aquifer uses for "no ceiling above".
+     *
+     * <p>Read from the constant rather than written out: it is {@code MIN_Y << 4} with
+     * {@code MIN_Y = -2032}, so the value is -32512, and hard-coding the overworld's -64 here would
+     * silently skip the lava check on any dimension deeper than -768.
+     */
+    private static final int WAY_BELOW_MIN_Y = net.minecraft.world.level.dimension.DimensionType.WAY_BELOW_MIN_Y;
 
     private static final BlockState AIR = Blocks.AIR.defaultBlockState();
     private static final BlockState WATER = Blocks.WATER.defaultBlockState();
@@ -116,12 +122,16 @@ public final class MaterialRules {
     private final int skipSamplingAboveY;
 
     private boolean shouldScheduleFluidUpdate;
+    private final boolean aquifersEnabled;
+    private final boolean oreVeinsEnabled;
     private final double[] barrierNoiseScratch = {Double.NaN};
 
     private MaterialRules(RouterNoises noises, SurfaceLevels surfaces,
             Aquifer.FluidPicker globalFluidPicker, PositionalRandomFactory aquiferRandom,
             PositionalRandomFactory oreRandom, int chunkMinBlockX, int chunkMinBlockZ,
-            NoiseSettings settings) {
+            NoiseSettings settings, boolean aquifersEnabled, boolean oreVeinsEnabled) {
+        this.aquifersEnabled = aquifersEnabled;
+        this.oreVeinsEnabled = oreVeinsEnabled;
         this.noises = noises;
         this.surfaces = surfaces;
         this.globalFluidPicker = globalFluidPicker;
@@ -155,9 +165,10 @@ public final class MaterialRules {
     /** Builds the aquifer state for one chunk. */
     public static MaterialRules forChunk(RouterNoises noises, SurfaceLevels surfaces,
             Aquifer.FluidPicker globalFluidPicker, PositionalRandomFactory aquiferRandom,
-            PositionalRandomFactory oreRandom, int chunkX, int chunkZ, NoiseSettings settings) {
+            PositionalRandomFactory oreRandom, int chunkX, int chunkZ, NoiseSettings settings,
+            boolean aquifersEnabled, boolean oreVeinsEnabled) {
         return new MaterialRules(noises, surfaces, globalFluidPicker, aquiferRandom, oreRandom,
-                chunkX * 16, chunkZ * 16, settings);
+                chunkX * 16, chunkZ * 16, settings, aquifersEnabled, oreVeinsEnabled);
     }
 
     /**
@@ -167,11 +178,27 @@ public final class MaterialRules {
      * @param density the interpolated {@code final_density} plus the beardifier
      */
     public BlockState compute(int posX, int posY, int posZ, double density) {
-        BlockState aquifer = this.aquiferSubstance(posX, posY, posZ, density);
+        BlockState aquifer = this.aquifersEnabled
+                ? this.aquiferSubstance(posX, posY, posZ, density)
+                : disabledAquifer(posX, posY, posZ, density);
         if (aquifer != null) {
             return aquifer;
         }
-        return this.veinifier(posX, posY, posZ);
+        return this.oreVeinsEnabled ? this.veinifier(posX, posY, posZ) : null;
+    }
+
+    /**
+     * What {@code Aquifer.createDisabled} does: the global fluid picker, and nothing else.
+     *
+     * <p>It still consults the density — {@code density > 0.0} means sky — but it never picks a
+     * neighbouring cell's status, and it never asks for a fluid tick. A dimension with aquifers off
+     * is therefore a flat fluid level rather than a network of pockets, and without this branch the
+     * nether would come out with overworld-style aquifers in it.
+     */
+    private BlockState disabledAquifer(int posX, int posY, int posZ, double density) {
+        this.shouldScheduleFluidUpdate = false;
+        return density > 0.0 ? null
+                : this.globalFluidPicker.computeFluid(posX, posY, posZ).at(posY);
     }
 
     /** Whether the aquifer wants the position queued for a fluid tick. */
@@ -471,8 +498,12 @@ public final class MaterialRules {
     }
 
     private boolean isDeepDarkRegion(int x, int y, int z) {
-        return this.noises.erosion().evaluate(x, y, z) < -0.225
-                && this.noises.depth().evaluate(x, y, z) > 0.9;
+        // The literals are floats in vanilla, and the comparison widens them: -0.225F is
+        // -0.22499999403953552 and 0.9F is 0.8999999761581421. Writing them as doubles moves both
+        // boundaries by a few times 1e-8, which is enough to flip the aquifer's decision on the
+        // narrow band where the deep-dark test sits.
+        return this.noises.erosion().evaluate(x, y, z) < -0.225F
+                && this.noises.depth().evaluate(x, y, z) > 0.9F;
     }
 
     private int getIndex(int gridX, int gridY, int gridZ) {

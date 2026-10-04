@@ -43,7 +43,16 @@ import tqk114514.terracuda.math.VanillaMath;
  */
 class MaterialRulesTest {
 
-    private static final int[][] CHUNKS = {{3, -7}, {0, 0}, {-40, 17}};
+    /**
+     * Land with water, a chunk near spawn, one dense with ore veins, and two that reach the deep
+     * dark.
+     *
+     * <p>The deep-dark pair matters out of proportion to their number. The aquifer's deep-dark test
+     * reads erosion and depth, and erosion is wrapped in {@code flat_cache} — so those chunks are the
+     * only ones that exercise the wrapper at all. Without them the flat-cache handling could be
+     * removed and the suite would not notice.
+     */
+    private static final int[][] CHUNKS = {{3, -7}, {0, 0}, {-40, 17}, {-22, -24}, {0, 34}};
 
     @Test
     void everyBlockOfEveryChunkMatchesVanilla() {
@@ -207,6 +216,50 @@ class MaterialRulesTest {
     private static MaterialRules.Entry entry(DensityFunction function, int chunkX, int chunkZ) {
         DensityInterpreter interpreter = lower(function);
         return MaterialRules.entry(interpreter, interpreter.program(), chunkX, chunkZ);
+    }
+
+    /**
+     * The flat-cache wrapper, tested where it actually differs.
+     *
+     * <p>A chunk-level test cannot cover this. The wrapper changes the erosion the deep-dark test
+     * reads, but only near that test's boundary, and no chunk found so far straddles it — the whole
+     * suite passes with the wrapper disabled. So this checks the wrapper itself: at a position whose
+     * quart column differs from its own coordinates, the entry must return the value sampled at the
+     * column's corner and y=0, not the exact one.
+     */
+    @Test
+    void flatCachedEntriesAreSampledPerQuartColumn() {
+        RandomState randomState = OverworldFixture.randomState();
+        DensityInterpreter erosion =
+                new DensityInterpreter(DensityCompiler.lower(randomState.router().erosion()));
+        int chunkX = -22;
+        int chunkZ = -24;
+        MaterialRules.Entry entry = MaterialRules.entry(erosion, erosion.program(), chunkX, chunkZ);
+
+        int differing = 0;
+        String[] first = new String[1];
+        for (int x = chunkX * 16; x < chunkX * 16 + 16; x++) {
+            for (int z = chunkZ * 16; z < chunkZ * 16 + 16; z++) {
+                double quantised = erosion.evaluate((x >> 2) << 2, 0, (z >> 2) << 2);
+                double exact = erosion.evaluate(x, 0, z);
+                if (quantised == exact) {
+                    continue;
+                }
+                if (differing == 0) {
+                    first[0] = "at (" + x + ", " + z + ") quantised=" + quantised
+                            + " exact=" + exact;
+                }
+                differing++;
+                double fromEntry = entry.at(x, 0, z);
+                String where = "at (" + x + ", " + z + ")";
+                assertEquals(Double.doubleToRawLongBits(quantised),
+                        Double.doubleToRawLongBits(fromEntry),
+                        "the entry should be the quantised sample " + where);
+            }
+        }
+        int total = differing;
+        assertTrue(total > 0, () -> "no position in this chunk differs between the quantised and "
+                + "exact erosion, so this test proves nothing");
     }
 
     private static DensityInterpreter lower(DensityFunction function) {

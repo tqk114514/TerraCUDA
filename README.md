@@ -43,11 +43,41 @@ to be the bottleneck, and the only thing that settled any of them was a number.
 | M1 — FFM + a kernel | **done.** A million points through the CUDA `ImprovedNoise` match the Java reference bit for bit. |
 | M2 — K0/K1/K2 | **done.** `preliminary_surface_level` and every per-chunk marker table (column caches and the 5×5×49 interpolator corner grids) are computed on the device, bit-identically to the CPU reference. |
 | M3 — K3/K4 + chunk replay | **done.** The material rules (aquifer and ore veinifier) are ported and reproduce vanilla's block for every one of 294912 blocks across three chunks; `GpuChunkFiller` turns that into a whole chunk's blocks; and `ChunkReplay` writes them into a chunk, with the heightmaps and the fluid-update flags `doFill` also maintains. |
-| M4 — batching, pinned buffers | **in progress, and the batching premise did not hold.** One launch per chunk per program instead of one per marker, the per-block pass moved onto the device, the dispatcher no longer blocks, and the host staging is reused: 16.2 ms per chunk became 6.7 ms, and 40 chunks a second became 64. Folding several chunks into one marker-table launch was measured at 0.7 ms a chunk for a scratch that grows from 25 MB to 200 MB — and the GPU is not the bottleneck anyway, so it is recorded rather than built. |
+| M4 — batching, pinned buffers | **partly done, partly declined, partly open.** See below. |
 
 The device path now generates terrain. It is off by default; with it on, the NOISE stage runs on the
 GPU and vanilla's own is cancelled. Anything that goes wrong falls through to vanilla, which writes
 every block itself.
+
+### M4: what is done, what was declined, what is open
+
+The plan defines M4 as "batching + pinned double-buffering + halo merging", with two acceptance
+criteria: amortising a batch of at least eight chunks, and a P95 latency report. "In progress" hid
+the fact that three of those four were never started, so they are listed here.
+
+**Done.** One launch per chunk per program instead of one per marker set; the per-block pass moved
+from the host onto the device; the dispatcher no longer blocks; the host staging buffers are reused
+instead of re-faulted. Together: 16.2 ms per chunk to 6.7 ms, and 40 chunks a second to 64.
+
+**Batching — measured, then declined.** Folding eight chunks into one marker-table launch is worth
+0.7 ms a chunk (1.55 → 0.97) at the cost of a scratch that grows from 25 MB to 200 MB, and the
+device is not the constraint anyway: its share of the work allows 149 chunks a second against 64
+delivered. It would raise a ceiling nobody is touching. The numbers are in `ChunkPassProfileTest`.
+
+**Pinned double-buffering — not started.** The device-to-host traffic is three 786 KB copies a chunk,
+about 0.24 ms of the 6.7, measured at 9.7 GB/s through pageable memory. Pinned buffers might double
+that, so the whole prize is under 2%. It is the cheapest of the three to try and the smallest.
+
+**Halo merging — not started, and not independently valuable.** A chunk's corner grid is 5×5 cell
+columns, and the far row and column belong to the neighbouring chunks: nine of the twenty-five are
+computed twice. Deduplicating them would save roughly a third of the marker-table work — but only if
+several chunks are in flight at once, which is the batching above, with the same scratch. It is a
+refinement of a thing already declined.
+
+**Acceptance criteria.** "At least eight chunks amortised" is not met, and that is the recorded
+decision above rather than an omission. "P95 latency report" is not met: the timing hook accumulates
+sums, not samples, so it can produce means and not percentiles. Producing one means keeping the
+samples, which is a small change to the timing hook and a re-run.
 
 ### Where the time goes, and where it does not
 

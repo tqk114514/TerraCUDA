@@ -36,6 +36,11 @@ public final class DensityInterpreter {
     private int[] lastOverrideIndices;
 
     private int blockX;
+    /** The chunk whose flat caches are in play, or {@code Integer.MIN_VALUE} for none. */
+    private int chunkMinX = Integer.MIN_VALUE;
+    private int chunkMinZ = Integer.MIN_VALUE;
+    private boolean[] flatCacheRoot;
+    private boolean resolvingFlatCache;
     private int blockY;
     private int blockZ;
 
@@ -134,6 +139,64 @@ public final class DensityInterpreter {
         return eval(instruction);
     }
 
+    /**
+     * Tells the interpreter which chunk's flat caches it is evaluating for.
+     *
+     * <p>Only the {@code flat_cache} handling needs this, and only for its out-of-chunk fallback.
+     * Without it set, every flat cache is answered from the quantised column, which is right for
+     * every position the material rules ask about and wrong for the few that fall outside.
+     */
+    public void setChunk(int minBlockX, int minBlockZ) {
+        this.chunkMinX = minBlockX;
+        this.chunkMinZ = minBlockZ;
+    }
+
+    /**
+     * {@code NoiseChunk.FlatCache}: the wrapped function sampled once per quart column at y=0.
+     *
+     * <p>Not a pass-through, and not only at the top of a program — the overworld's {@code depth}
+     * contains six of these nested inside it. A query at {@code (x, y, z)} reads the value at
+     * {@code ((x >> 2) << 2, 0, (z >> 2) << 2)} when that column is one of the chunk's own, and falls
+     * back to an exact evaluation when it is not.
+     *
+     * <p>Re-entrant by design: evaluating the marker at the column's corner walks back into this
+     * method, and {@code resolvingFlatCache} is what stops it quantising forever.
+     */
+    private double flatCache(int pc) {
+        int quartX = (this.blockX >> 2) << 2;
+        int quartZ = (this.blockZ >> 2) << 2;
+        boolean outside = this.chunkMinX != Integer.MIN_VALUE
+                && (quartX < this.chunkMinX || quartX > this.chunkMinX + 16
+                        || quartZ < this.chunkMinZ || quartZ > this.chunkMinZ + 16);
+        int savedX = this.blockX;
+        int savedY = this.blockY;
+        int savedZ = this.blockZ;
+        this.resolvingFlatCache = true;
+        try {
+            if (!outside) {
+                setContext(quartX, 0, quartZ);
+            }
+            return eval(pc);
+        } finally {
+            this.resolvingFlatCache = false;
+            setContext(savedX, savedY, savedZ);
+        }
+    }
+
+    private boolean isFlatCacheRoot(int pc) {
+        if (this.flatCacheRoot == null) {
+            this.flatCacheRoot = new boolean[this.program.size()];
+            int[] kinds = this.program.markerKinds();
+            int[] roots = this.program.markerRoots();
+            for (int i = 0; i < kinds.length; i++) {
+                if (kinds[i] == DensityProgram.MARKER_FLAT_CACHE) {
+                    this.flatCacheRoot[roots[i]] = true;
+                }
+            }
+        }
+        return this.flatCacheRoot[pc];
+    }
+
     private void setContext(int x, int y, int z) {
         this.blockX = x;
         this.blockY = y;
@@ -152,6 +215,13 @@ public final class DensityInterpreter {
     }
 
     private double compute(int pc) {
+        // Only when a chunk has been named. Without one this interpreter is standing in for
+        // vanilla's DensityFunction.compute, which knows nothing of chunks and evaluates flat
+        // caches exactly — the quantisation belongs to NoiseChunk, not to the function.
+        if (this.chunkMinX != Integer.MIN_VALUE && !this.resolvingFlatCache
+                && isFlatCacheRoot(pc)) {
+            return flatCache(pc);
+        }
         switch (this.program.op(pc)) {
             case DensityProgram.CONSTANT:
                 return this.program.da(pc);

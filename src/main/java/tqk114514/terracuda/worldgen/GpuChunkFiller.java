@@ -99,6 +99,14 @@ public final class GpuChunkFiller implements AutoCloseable {
         int height = this.geometry.height();
         int count = 16 * 16 * height;
 
+        // The material rules read router entries through interpreters, and a flat cache inside one
+        // of those needs to know which chunk's columns it is answering for.
+        for (DensityInterpreter interpreter : new DensityInterpreter[] {
+                this.barrierNoise, this.floodedness, this.spread, this.lava, this.erosion,
+                this.depth, this.veinGap, this.preliminarySurface}) {
+            interpreter.setChunk(chunkX * 16, chunkZ * 16);
+        }
+
         if (this.densities == null) {
             this.densities = new double[count];
             this.veinToggleValues = new double[count];

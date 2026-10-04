@@ -215,6 +215,7 @@ class MaterialRulesTest {
     /** A router entry, wrapped the way vanilla wraps it. */
     private static MaterialRules.Entry entry(DensityFunction function, int chunkX, int chunkZ) {
         DensityInterpreter interpreter = lower(function);
+        interpreter.setChunk(chunkX * 16, chunkZ * 16);
         return MaterialRules.entry(interpreter, interpreter.program(), chunkX, chunkZ);
     }
 

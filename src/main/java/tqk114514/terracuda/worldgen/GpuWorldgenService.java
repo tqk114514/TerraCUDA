@@ -1,6 +1,10 @@
 package tqk114514.terracuda.worldgen;
 
+import java.util.ArrayList;
+import java.util.List;
+import java.util.Map;
 import java.util.Optional;
+import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ArrayBlockingQueue;
 import java.util.concurrent.BlockingQueue;
 import java.util.concurrent.Callable;
@@ -42,6 +46,9 @@ import tqk114514.terracuda.cuda.CudaKernels;
 public final class GpuWorldgenService implements AutoCloseable {
 
     private static final int QUEUE_CAPACITY = 64;
+
+    /** One service per world. Released on server stop — see {@link #releaseAll()}. */
+    private static final Map<RandomState, GpuWorldgenService> SERVICES = new ConcurrentHashMap<>();
     private static final int INIT_TIMEOUT_SECONDS = 30;
 
     /** A unit of work for the GPU thread, which completes its own future. */
@@ -59,6 +66,33 @@ public final class GpuWorldgenService implements AutoCloseable {
 
     private CudaContext context;
     private GpuChunkFiller filler;
+
+    /**
+     * The service for {@code randomState}, built on first use.
+     *
+     * <p>Keyed by {@link RandomState} because that is what a world's generator settings and seed
+     * resolve to: the overworld, the nether and the end each get their own, with their own lowered
+     * programs and their own device buffers.
+     */
+    public static GpuWorldgenService forWorld(RandomState randomState,
+            NoiseGeneratorSettings settings) {
+        return SERVICES.computeIfAbsent(randomState, key -> of(key, settings));
+    }
+
+    /**
+     * Closes every service and forgets it.
+     *
+     * <p>Without this the map only ever grows: leaving a world and loading another leaves the first
+     * one's CUDA context, its device buffers — eight megabytes and up — and its daemon thread alive
+     * for the life of the process. Called from the server-stopping event.
+     */
+    public static void releaseAll() {
+        List<GpuWorldgenService> services = new ArrayList<>(SERVICES.values());
+        SERVICES.clear();
+        for (GpuWorldgenService service : services) {
+            service.close();
+        }
+    }
 
     private GpuWorldgenService(RandomState randomState, NoiseGeneratorSettings settings) {
         this.thread = new Thread(() -> run(randomState, settings), "TerraCUDA-GPU");

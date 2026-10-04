@@ -1,9 +1,7 @@
 package tqk114514.terracuda.mixin;
 
-import java.util.Map;
 import java.util.Optional;
 import java.util.concurrent.CompletableFuture;
-import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicLong;
 
@@ -53,7 +51,6 @@ import tqk114514.terracuda.worldgen.GpuWorldgenService;
 @Mixin(NoiseBasedChunkGenerator.class)
 public abstract class NoiseBasedChunkGeneratorMixin {
 
-    private static final Map<RandomState, GpuWorldgenService> SERVICES = new ConcurrentHashMap<>();
     private static final AtomicLong CHUNKS = new AtomicLong();
     private static final AtomicBoolean REPORTED_FAILURE = new AtomicBoolean();
     private static final AtomicBoolean REPORTED_HEIGHT_MISMATCH = new AtomicBoolean();
@@ -110,8 +107,7 @@ public abstract class NoiseBasedChunkGeneratorMixin {
                 return;
             }
 
-            GpuWorldgenService service = SERVICES.computeIfAbsent(randomState,
-                    key -> GpuWorldgenService.of(key, settings));
+            GpuWorldgenService service = GpuWorldgenService.forWorld(randomState, settings);
             if (!service.isReady()) {
                 if (REPORTED_FAILURE.compareAndSet(false, true)) {
                     TerraCUDA.LOGGER.info("TerraCUDA: device unavailable, using vanilla: {}",

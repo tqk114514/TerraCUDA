@@ -143,6 +143,77 @@ class GpuChunkFillerTest {
         }
     }
 
+    /**
+     * The same comparison with aquifers and ore veins switched off — the configuration the nether
+     * uses.
+     *
+     * <p>Vanilla builds {@code Aquifer.createDisabled} and skips the veinifier entirely when those
+     * flags are false, so a chunk comes out as a flat fluid level with no veins. This port ran both
+     * unconditionally, which the overworld never noticed and the nether always would have.
+     */
+    @Test
+    void chunksWithoutAquifersOrOreVeinsMatchVanilla() {
+        RandomState randomState = OverworldFixture.randomState();
+        NoiseGeneratorSettings overworld = OverworldFixture.generatorSettings();
+        NoiseGeneratorSettings dry = new NoiseGeneratorSettings(
+                overworld.noiseSettings(), overworld.defaultBlock(), overworld.defaultFluid(),
+                overworld.noiseRouter(), overworld.surfaceRule(), overworld.spawnTarget(),
+                overworld.seaLevel(), overworld.disableMobGeneration(),
+                false, false, overworld.useLegacyRandomSource());
+
+        CudaEnvironment environment = CudaEnvironment.detect();
+        assumeTrue(environment.available(), "no CUDA device on this machine");
+        Optional<CudaDriver> loaded = CudaDriver.tryLoad();
+        assumeTrue(loaded.isPresent(), "no CUDA driver library on this machine");
+
+        try (CudaDriver driver = loaded.get()) {
+            driver.init();
+            CudaDeviceInfo device = environment.firstDevice().orElseThrow();
+            try (CudaContext context = CudaContext.create(driver, device.index())) {
+                CudaKernels.loadModule(context, device);
+                try (GpuChunkFiller filler = GpuChunkFiller.create(context, randomState, dry)) {
+                    for (int[] chunk : CHUNKS) {
+                        int[] ids = filler.blockIds(chunk[0], chunk[1]).stateIds();
+                        VanillaChunkReference.ChunkBlocks vanilla =
+                                VanillaChunkReference.generate(dry, randomState, chunk[0], chunk[1]);
+
+                        int mismatches = 0;
+                        String[] first = new String[1];
+                        for (int i = 0; i < ids.length; i++) {
+                            if (ids[i] != vanilla.stateIds()[i]) {
+                                if (mismatches == 0) {
+                                    first[0] = "index " + i + " mine=" + Block.stateById(ids[i])
+                                            + " vanilla=" + Block.stateById(vanilla.stateIds()[i]);
+                                }
+                                mismatches++;
+                            }
+                        }
+                        int total = mismatches;
+                        assertEquals(0, total, () -> "chunk (" + chunk[0] + ", " + chunk[1]
+                                + ") with aquifers and veins off: " + total + " of " + ids.length
+                                + " ids differ; first: " + first[0]);
+
+                        // And prove the two configurations are not the same chunk, because otherwise
+                        // this test would pass without exercising anything.
+                        VanillaChunkReference.ChunkBlocks wet =
+                                VanillaChunkReference.generate(overworld, randomState, chunk[0],
+                                        chunk[1]);
+                        int differing = 0;
+                        for (int i = 0; i < ids.length; i++) {
+                            if (wet.stateIds()[i] != vanilla.stateIds()[i]) {
+                                differing++;
+                            }
+                        }
+                        int differingFinal = differing;
+                        assertTrue(differingFinal > 0, () -> "chunk (" + chunk[0] + ", " + chunk[1]
+                                + ") is identical with and without aquifers, so this test proves "
+                                + "nothing");
+                    }
+                }
+            }
+        }
+    }
+
     @Test
     void theChunksUnderTestActuallyContainWater() {
         // The rules are only meaningfully exercised where they have something to place.

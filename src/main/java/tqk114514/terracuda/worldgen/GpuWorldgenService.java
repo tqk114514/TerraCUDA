@@ -265,10 +265,11 @@ public final class GpuWorldgenService implements AutoCloseable {
         }
         int emitted = this.filler == null ? 0 : this.filler.emittedChunks();
         if (emitted > 0) {
-            // Where the time goes: the density program and the two vein programs run on the device
-            // thread, the rules loop and the write-back on the rules worker. Four numbers rather than
-            // one because the halves live on different threads now and can move independently.
-            // Shadow mode shows replay as zero, because it never writes a chunk.
+            // Where the time goes: the density program and the two vein programs are queued on the
+            // device thread and overlap on their own streams, the rules loop and the write-back run
+            // on the rules worker. Four numbers rather than one because the halves live on different
+            // threads and can move independently. Shadow mode shows replay as zero, because it
+            // never writes a chunk.
             double millis = 1.0e6 * emitted;
             message.append(" [density ").append(String.format("%.1f", this.filler.densityNanos() / millis))
                     .append(", veins ").append(String.format("%.1f", this.filler.veinNanos() / millis))

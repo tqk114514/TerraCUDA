@@ -47,12 +47,18 @@ public final class CudaContext implements AutoCloseable {
     private final MethodHandle cuMemFree;
     private final MethodHandle cuMemcpyHtoD;
     private final MethodHandle cuMemcpyDtoH;
+    private final MethodHandle cuMemcpyHtoDAsync;
+    private final MethodHandle cuMemcpyDtoHAsync;
     private final MethodHandle cuLaunchKernel;
     private final MethodHandle cuCtxSynchronize;
+    private final MethodHandle cuStreamCreate;
+    private final MethodHandle cuStreamDestroy;
+    private final MethodHandle cuStreamSynchronize;
 
     private final MemorySegment contextHandle;
     private final Map<String, MemorySegment> functions = new HashMap<>();
     private final List<DeviceBuffer> allocations = new ArrayList<>();
+    private final List<DeviceStream> streams = new ArrayList<>();
 
     private MemorySegment moduleHandle;
     private boolean closed;
@@ -78,12 +84,24 @@ public final class CudaContext implements AutoCloseable {
         this.cuMemcpyDtoH = driver.bindAny(
                 FunctionDescriptor.of(CU_INT, ValueLayout.ADDRESS, CU_SIZE, CU_SIZE),
                 "cuMemcpyDtoH_v2", "cuMemcpyDtoH");
+        this.cuMemcpyHtoDAsync = driver.bindAny(
+                FunctionDescriptor.of(CU_INT, CU_SIZE, ValueLayout.ADDRESS, CU_SIZE, ValueLayout.ADDRESS),
+                "cuMemcpyHtoDAsync_v2", "cuMemcpyHtoDAsync");
+        this.cuMemcpyDtoHAsync = driver.bindAny(
+                FunctionDescriptor.of(CU_INT, ValueLayout.ADDRESS, CU_SIZE, CU_SIZE, ValueLayout.ADDRESS),
+                "cuMemcpyDtoHAsync_v2", "cuMemcpyDtoHAsync");
         this.cuLaunchKernel = driver.bind("cuLaunchKernel", FunctionDescriptor.of(CU_INT,
                 ValueLayout.ADDRESS,
                 CU_INT, CU_INT, CU_INT,
                 CU_INT, CU_INT, CU_INT,
                 CU_INT, ValueLayout.ADDRESS, ValueLayout.ADDRESS, ValueLayout.ADDRESS));
         this.cuCtxSynchronize = driver.bind("cuCtxSynchronize", FunctionDescriptor.of(CU_INT));
+        this.cuStreamCreate = driver.bindAny(FunctionDescriptor.of(CU_INT, ValueLayout.ADDRESS, CU_INT),
+                "cuStreamCreate_v2", "cuStreamCreate");
+        this.cuStreamDestroy = driver.bindAny(FunctionDescriptor.of(CU_INT, ValueLayout.ADDRESS),
+                "cuStreamDestroy_v2", "cuStreamDestroy");
+        this.cuStreamSynchronize = driver.bind("cuStreamSynchronize",
+                FunctionDescriptor.of(CU_INT, ValueLayout.ADDRESS));
 
         MemorySegment handle = this.arena.allocate(ValueLayout.ADDRESS);
         int result = invokeInt(this.cuCtxCreate, handle, 0, device);
@@ -196,6 +214,73 @@ public final class CudaContext implements AutoCloseable {
         driver.check(invokeInt(this.cuCtxSynchronize), "cuCtxSynchronize");
     }
 
+    /**
+     * A stream, created and destroyed by the {@link CudaContext} that owns it.
+     *
+     * <p>Work queued on one stream executes in submission order, so a producer kernel and the copy
+     * that reads it need no event between them — but work on different streams overlaps, which is
+     * what this type exists for: the three per-chunk device passes used to run one after another
+     * behind a context-wide synchronize, and the device sat idle between them.
+     */
+    public record DeviceStream(MemorySegment handle) {
+    }
+
+    /**
+     * Creates a stream on this context. Destroyed with the context; no per-stream cleanup exists.
+     */
+    public DeviceStream createStream() {
+        try (Arena local = Arena.ofConfined()) {
+            MemorySegment handle = local.allocate(ValueLayout.ADDRESS);
+            int result = invokeInt(this.cuStreamCreate, handle, 0);
+            this.driver.check(result, "cuStreamCreate");
+            DeviceStream stream = new DeviceStream(handle.get(ValueLayout.ADDRESS, 0));
+            this.streams.add(stream);
+            return stream;
+        }
+    }
+
+    /** Blocks until everything queued on {@code stream} has completed — and only that stream. */
+    public void synchronizeStream(DeviceStream stream) {
+        driver.check(invokeInt(this.cuStreamSynchronize, stream.handle()), "cuStreamSynchronize");
+    }
+
+    /**
+     * Queues a host-to-device copy on {@code stream}, in order with the other work on it.
+     *
+     * <p>The host segment must stay unchanged until the copy completes; the callers own that by
+     * waiting on the stream before reusing the segment.
+     */
+    public void copyToDeviceAsync(MemorySegment host, DeviceBuffer device, DeviceStream stream) {
+        long bytes = host.byteSize();
+        requireFits(device, bytes, "copyToDeviceAsync");
+        driver.check(invokeInt(this.cuMemcpyHtoDAsync, device.address(), host, bytes, stream.handle()),
+                "cuMemcpyHtoDAsync");
+    }
+
+    /**
+     * Queues a device-to-host copy on {@code stream}, in order with the other work on it.
+     *
+     * <p>Read the destination only after {@link #synchronizeStream(DeviceStream)}.
+     */
+    public void copyFromDeviceAsync(DeviceBuffer device, MemorySegment host, DeviceStream stream) {
+        long bytes = host.byteSize();
+        requireFits(device, bytes, "copyFromDeviceAsync");
+        driver.check(invokeInt(this.cuMemcpyDtoHAsync, host, device.address(), bytes, stream.handle()),
+                "cuMemcpyDtoHAsync");
+    }
+
+    /**
+     * Launches a kernel on {@code stream}, in order with the copies and kernels already queued on it.
+     */
+    public void launch(String kernel, int gridX, int gridY, int gridZ,
+            int blockX, int blockY, int blockZ, KernelArguments arguments, DeviceStream stream) {
+        MemorySegment handle = function(kernel);
+        int result = invokeInt(this.cuLaunchKernel, handle,
+                gridX, gridY, gridZ, blockX, blockY, blockZ, 0,
+                stream.handle(), arguments.pointers(), MemorySegment.NULL);
+        driver.check(result, "cuLaunchKernel(" + kernel + ")");
+    }
+
     /** Whether {@link #close()} has run. Buffer owners check this before freeing. */
     public boolean isClosed() {
         return this.closed;
@@ -212,6 +297,11 @@ public final class CudaContext implements AutoCloseable {
                 invokeInt(this.cuMemFree, buffer.address());
             }
             this.allocations.clear();
+            // Streams must be destroyed before the context they belong to.
+            for (DeviceStream stream : List.copyOf(this.streams)) {
+                invokeInt(this.cuStreamDestroy, stream.handle());
+            }
+            this.streams.clear();
             if (this.moduleHandle != null) {
                 invokeInt(this.cuModuleUnload, this.moduleHandle);
                 this.moduleHandle = null;

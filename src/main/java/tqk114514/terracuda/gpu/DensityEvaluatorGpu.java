@@ -71,6 +71,20 @@ public final class DensityEvaluatorGpu implements AutoCloseable {
     private final int instructionCount;
     private final int root;
     private final int capacity;
+
+    /**
+     * This evaluator's private stream. Work queued on it runs in submission order — the corner
+     * tables, the block pass over them and the copy back need no events between them — while work on
+     * different evaluators' streams overlaps on the device. Three programs used to run strictly one
+     * after another behind a context-wide synchronize; the synchronize was the serialisation.
+     */
+    private final CudaContext.DeviceStream stream;
+
+    /** What {@link #submitChunk} queued and {@link #awaitChunk} will collect. */
+    private double[] pendingOut;
+    private MemorySegment pendingHost;
+    private int pendingCount;
+
     private boolean closed;
 
     public DensityEvaluatorGpu(CudaContext context, DensityProgram program, int capacity) {
@@ -110,6 +124,7 @@ public final class DensityEvaluatorGpu implements AutoCloseable {
         this.points = context.allocate(3L * capacity * Integer.BYTES);
         this.scratch = context.allocate((long) capacity * this.instructionCount * Double.BYTES);
         this.results = context.allocate((long) capacity * Double.BYTES);
+        this.stream = context.createStream();
     }
 
     /** Uploads one image's blob. */
@@ -194,7 +209,9 @@ public final class DensityEvaluatorGpu implements AutoCloseable {
         launch(blockCoordinates, rootInstruction, roots);
         int count = blockCoordinates.length / 3;
         MemorySegment host = hostDoubles(count);
-        this.context.copyFromDevice(this.results, host.asSlice(0, (long) count * Double.BYTES));
+        this.context.copyFromDeviceAsync(this.results, host.asSlice(0, (long) count * Double.BYTES),
+                this.stream);
+        this.context.synchronizeStream(this.stream);
         return host.asSlice(0, (long) count * Double.BYTES).toArray(ValueLayout.JAVA_DOUBLE);
     }
 
@@ -210,6 +227,11 @@ public final class DensityEvaluatorGpu implements AutoCloseable {
      * Measured across batch sizes, this call's fixed cost was 0.71 ms against a kernel that costs
      * 0.87 ms per chunk no matter how many chunks ride along — so the fixed cost is the whole of what
      * batching the marker tables would have bought, and reusing the buffers buys it directly.
+     *
+     * <p>The work is queued on this evaluator's stream and returns without waiting. Ordering within
+     * the stream carries every dependency — the copy of the points lands before the kernel that reads
+     * it, this kernel before whatever queued next — so no events are needed; the caller waits on the
+     * stream when it wants the values, and only then may it overwrite the staging segments.
      */
     private void launch(int[] blockCoordinates, int rootInstruction, int[] roots) {
         if (blockCoordinates.length % 3 != 0) {
@@ -237,7 +259,7 @@ public final class DensityEvaluatorGpu implements AutoCloseable {
             this.hostPoints = this.hostArena.allocate(pointBytes);
         }
         MemorySegment.copy(blockCoordinates, 0, this.hostPoints, ValueLayout.JAVA_INT, 0, 3 * count);
-        this.context.copyToDevice(this.hostPoints.asSlice(0, pointBytes), this.points);
+        this.context.copyToDeviceAsync(this.hostPoints.asSlice(0, pointBytes), this.points, this.stream);
 
         long rootAddress = 0L;
         if (roots != null) {
@@ -249,7 +271,7 @@ public final class DensityEvaluatorGpu implements AutoCloseable {
                 this.hostRoots = this.hostArena.allocate(rootBytes);
             }
             MemorySegment.copy(roots, 0, this.hostRoots, ValueLayout.JAVA_INT, 0, count);
-            this.context.copyToDevice(this.hostRoots.asSlice(0, rootBytes), this.roots);
+            this.context.copyToDeviceAsync(this.hostRoots.asSlice(0, rootBytes), this.roots, this.stream);
             rootAddress = this.roots.address();
         }
 
@@ -264,9 +286,8 @@ public final class DensityEvaluatorGpu implements AutoCloseable {
                     .addDevicePointer(this.results.address())
                     .addInt(count);
             int grid = (count + BLOCK_SIZE - 1) / BLOCK_SIZE;
-            this.context.launch(KERNEL_NAME, grid, 1, 1, BLOCK_SIZE, 1, 1, arguments);
+            this.context.launch(KERNEL_NAME, grid, 1, 1, BLOCK_SIZE, 1, 1, arguments, this.stream);
         }
-        this.context.synchronize();
     }
 
     /** A cached host segment of at least {@code doubles} doubles. */
@@ -304,6 +325,27 @@ public final class DensityEvaluatorGpu implements AutoCloseable {
      */
     public void blocksForChunk(NoiseSettings settings, int chunkX, int chunkZ, int order,
             double[] out) {
+        submitChunk(settings, chunkX, chunkZ, order, out);
+        awaitChunk();
+    }
+
+    /**
+     * Queues one chunk's whole device half — corner tables, block pass, and the copy back — and
+     * returns without waiting.
+     *
+     * <p>This split exists so a caller can queue the same chunk on several evaluators before waiting
+     * on any of them: the density, vein-toggle and vein-ridged programs of a chunk are independent,
+     * and their passes used to run strictly one after another behind a context-wide synchronize. On
+     * their own streams they overlap; the waits land on whichever finishes last.
+     *
+     * <p>Nothing may touch this evaluator's staging segments between {@code submitChunk} and
+     * {@link #awaitChunk()} — the host-side points upload is asynchronous, and overwriting the
+     * segment while the copy is in flight would corrupt the kernel's input. One caller at a time,
+     * submit-then-wait, is the contract the production path already follows.
+     *
+     * @param order {@link tqk114514.terracuda.density.CornerInterpolation#LERP3} or {@code INCREMENTAL}
+     */
+    public void submitChunk(NoiseSettings settings, int chunkX, int chunkZ, int order, double[] out) {
         int[] cornerRoots = interpolatedRoots(this.image);
         int[] slots = interpolatedRoots(this.blockImage);
         if (cornerRoots.length != slots.length) {
@@ -340,50 +382,69 @@ public final class DensityEvaluatorGpu implements AutoCloseable {
             this.markerSlots = this.context.allocate((long) Math.max(1, markerCount) * Integer.BYTES);
             this.blockResults = this.context.allocate((long) count * Double.BYTES);
             this.blockScratch = this.context.allocate((long) count * blockInstructions * Double.BYTES);
+
+            // Bases and slots never change — where a marker's corner grid starts in the results and
+            // which instruction its blend lands in are properties of the program, not the chunk. They
+            // were uploaded per chunk inside a confined arena, which also meant the arena had to
+            // outlive nothing; now it really doesn't.
+            try (Arena arena = Arena.ofConfined()) {
+                int[] bases = new int[markerCount];
+                for (int m = 0; m < markerCount; m++) {
+                    bases[m] = m * perMarker;
+                }
+                this.context.copyToDevice(arena.allocateFrom(ValueLayout.JAVA_INT, bases),
+                        this.markerBases);
+                this.context.copyToDevice(arena.allocateFrom(ValueLayout.JAVA_INT, slots),
+                        this.markerSlots);
+            }
         }
 
-        try (Arena arena = Arena.ofConfined()) {
-            int[] bases = new int[markerCount];
-            for (int m = 0; m < markerCount; m++) {
-                bases[m] = m * perMarker;
-            }
-            MemorySegment hostBases = arena.allocateFrom(ValueLayout.JAVA_INT, bases);
-            this.context.copyToDevice(hostBases, this.markerBases);
-            MemorySegment hostSlots = arena.allocateFrom(ValueLayout.JAVA_INT, slots);
-            this.context.copyToDevice(hostSlots, this.markerSlots);
-
-            try (KernelArguments arguments = new KernelArguments(20)) {
-                arguments.addDevicePointer(this.blockBlob.address())
-                        .addDevicePointer(this.blockOffsets.address())
-                        .addInt(blockInstructions)
-                        .addInt(this.blockImage.root())
-                        .addDevicePointer(this.results.address())
-                        .addDevicePointer(this.markerBases.address())
-                        .addDevicePointer(this.markerSlots.address())
-                        .addInt(markerCount)
-                        .addInt(settings.getCellWidth())
-                        .addInt(settings.getCellHeight())
-                        .addInt(countY)
-                        .addInt(CHUNK_SIZE_XZ)
-                        .addInt(settings.height())
-                        .addInt(order)
-                        .addInt(chunkX * CHUNK_SIZE_XZ)
-                        .addInt(settings.minY())
-                        .addInt(chunkZ * CHUNK_SIZE_XZ)
-                        .addDevicePointer(this.blockScratch.address())
-                        .addDevicePointer(this.blockResults.address())
-                        .addInt(count);
-                int grid = (count + BLOCK_SIZE - 1) / BLOCK_SIZE;
-                this.context.launch(BLOCKS_KERNEL_NAME, grid, 1, 1, BLOCK_SIZE, 1, 1, arguments);
-            }
-            this.context.synchronize();
-
-            // The staging segment is reused across calls: a fresh native allocation of this size pays
-            // for its own page faults every time, which measured at more than the copy itself.
-            MemorySegment host = hostDoubles(count);
-            this.context.copyFromDevice(this.blockResults, host);
-            MemorySegment.copy(host, ValueLayout.JAVA_DOUBLE, 0L, out, 0, count);
+        try (KernelArguments arguments = new KernelArguments(20)) {
+            arguments.addDevicePointer(this.blockBlob.address())
+                    .addDevicePointer(this.blockOffsets.address())
+                    .addInt(blockInstructions)
+                    .addInt(this.blockImage.root())
+                    .addDevicePointer(this.results.address())
+                    .addDevicePointer(this.markerBases.address())
+                    .addDevicePointer(this.markerSlots.address())
+                    .addInt(markerCount)
+                    .addInt(settings.getCellWidth())
+                    .addInt(settings.getCellHeight())
+                    .addInt(countY)
+                    .addInt(CHUNK_SIZE_XZ)
+                    .addInt(settings.height())
+                    .addInt(order)
+                    .addInt(chunkX * CHUNK_SIZE_XZ)
+                    .addInt(settings.minY())
+                    .addInt(chunkZ * CHUNK_SIZE_XZ)
+                    .addDevicePointer(this.blockScratch.address())
+                    .addDevicePointer(this.blockResults.address())
+                    .addInt(count);
+            int grid = (count + BLOCK_SIZE - 1) / BLOCK_SIZE;
+            this.context.launch(BLOCKS_KERNEL_NAME, grid, 1, 1, BLOCK_SIZE, 1, 1, arguments,
+                    this.stream);
         }
+
+        // The staging segment is reused across calls: a fresh native allocation of this size pays
+        // for its own page faults every time, which measured at more than the copy itself.
+        MemorySegment host = hostDoubles(count);
+        this.context.copyFromDeviceAsync(this.blockResults, host.asSlice(0, (long) count * Double.BYTES),
+                this.stream);
+        this.pendingOut = out;
+        this.pendingHost = host;
+        this.pendingCount = count;
+    }
+
+    /**
+     * Waits for the work {@link #submitChunk} queued and fills the array it was given.
+     *
+     * <p>Safe to call once per submission; waiting for a second evaluator's stream in between does
+     * not affect this one's results — the copy back already queued behind this stream's own kernels.
+     */
+    public void awaitChunk() {
+        this.context.synchronizeStream(this.stream);
+        MemorySegment.copy(this.pendingHost, ValueLayout.JAVA_DOUBLE, 0L, this.pendingOut, 0,
+                this.pendingCount);
     }
 
     /** The image instruction each interpolated marker wraps, in the image's own marker order. */

@@ -159,14 +159,22 @@ public final class GpuChunkFiller implements AutoCloseable {
         DensityBuffers buffers = acquireBuffers(count);
 
         long began = TIMING ? System.nanoTime() : 0L;
-        this.densityEvaluator.blocksForChunk(this.geometry, chunkX, chunkZ,
+        // Three submissions, then three waits: the three programs are independent and now run on
+        // separate streams, so their corner tables, block passes and copies overlap on the device.
+        // Submitting one and waiting before the next was the serialisation.
+        this.densityEvaluator.submitChunk(this.geometry, chunkX, chunkZ,
                 CornerInterpolation.LERP3, buffers.density());
-        long densityAt = TIMING ? System.nanoTime() : 0L;
         if (this.oreVeinsEnabled) {
-            this.veinToggleEvaluator.blocksForChunk(this.geometry, chunkX, chunkZ,
+            this.veinToggleEvaluator.submitChunk(this.geometry, chunkX, chunkZ,
                     CornerInterpolation.INCREMENTAL, buffers.veinToggle());
-            this.veinRidgedEvaluator.blocksForChunk(this.geometry, chunkX, chunkZ,
+            this.veinRidgedEvaluator.submitChunk(this.geometry, chunkX, chunkZ,
                     CornerInterpolation.INCREMENTAL, buffers.veinRidged());
+        }
+        long densityAt = TIMING ? System.nanoTime() : 0L;
+        this.densityEvaluator.awaitChunk();
+        if (this.oreVeinsEnabled) {
+            this.veinToggleEvaluator.awaitChunk();
+            this.veinRidgedEvaluator.awaitChunk();
         }
         long veinsAt = TIMING ? System.nanoTime() : 0L;
         if (TIMING) {

@@ -49,7 +49,21 @@ public final class TerracudaConfig {
         return Boolean.getBoolean(PREFIX + "verbose");
     }
 
+    /**
+     * Time the GPU thread and split a chunk's service time into its two halves.
+     *
+     * <p>This exists because the mod's own service time was inferred from a rate rather than
+     * measured, and the inference disagreed with the offline profile: 52 chunks/s implies about
+     * 19 ms per chunk, while {@code ChunkPassProfileTest} measures 6.7 ms. The gap is presumably
+     * the chunk write-back, which the profile does not cover because it was taken in shadow mode.
+     * Measuring where the thread's time actually goes is cheaper than arguing about it.
+     */
+    public static boolean timing() {
+        return Boolean.getBoolean(PREFIX + "timing");
+    }
+
     public static String summary() {
-        return "gpu=" + gpuEnabled() + ", shadow=" + shadowMode() + ", verbose=" + verbose();
+        return "gpu=" + gpuEnabled() + ", shadow=" + shadowMode() + ", verbose=" + verbose()
+                + ", timing=" + timing();
     }
 }

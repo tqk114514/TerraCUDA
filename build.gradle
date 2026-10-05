@@ -80,6 +80,8 @@ java.toolchain.languageVersion = JavaLanguageVersion.of(25)
 def terracudaShadow = project.hasProperty('terracuda.shadow') || project.hasProperty('shadow')
 def terracudaTakeover = project.hasProperty('terracuda.takeover') || project.hasProperty('takeover')
 def terracudaVerbose = project.hasProperty('terracuda.verbose') || project.hasProperty('verbose')
+// -Ptiming times the GPU thread and splits a chunk into "produce blocks" and "write them back".
+def terracudaTiming = project.hasProperty('terracuda.timing') || project.hasProperty('timing')
 
 neoForge {
     version = project.neo_version
@@ -127,6 +129,9 @@ neoForge {
             }
             if (terracudaVerbose) {
                 jvmArguments.add('-Dterracuda.verbose=true')
+            }
+            if (terracudaTiming) {
+                jvmArguments.add('-Dterracuda.timing=true')
             }
 
             logLevel = org.slf4j.event.Level.DEBUG

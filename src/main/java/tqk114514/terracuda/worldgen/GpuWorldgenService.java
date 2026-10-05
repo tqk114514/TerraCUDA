@@ -24,6 +24,8 @@ import tqk114514.terracuda.cuda.CudaDriver;
 import tqk114514.terracuda.cuda.CudaEnvironment;
 import tqk114514.terracuda.cuda.CudaException;
 import tqk114514.terracuda.cuda.CudaKernels;
+import tqk114514.terracuda.TerraCUDA;
+import tqk114514.terracuda.config.TerracudaConfig;
 
 /**
  * Owns the GPU side of world generation for one {@link RandomState}.
@@ -63,6 +65,21 @@ public final class GpuWorldgenService implements AutoCloseable {
     private volatile boolean ready;
     private volatile String unavailableReason = "not started";
     private volatile boolean closed;
+
+    /** Read once; see the note on the same field in {@link GpuChunkFiller}. */
+    private static final boolean TIMING = TerracudaConfig.timing();
+    private static final int TIMING_EVERY = 128;
+
+    /**
+     * Time actually spent running jobs, and the wall clock it was measured over.
+     *
+     * <p>The wall clock starts at the first job rather than at startup, so an idle thread waiting for
+     * the world to load does not count as idle capacity. That is deliberate: the question is whether
+     * the thread is saturated while chunks are arriving, not whether it is busy over the session.
+     */
+    private long busyNanos;
+    private long timedJobs;
+    private long windowStartNanos;
 
     private CudaContext context;
     private GpuChunkFiller filler;
@@ -132,13 +149,78 @@ public final class GpuWorldgenService implements AutoCloseable {
             while (!this.closed) {
                 Job job = this.jobs.poll(200, TimeUnit.MILLISECONDS);
                 if (job != null) {
+                    long began = TIMING ? System.nanoTime() : 0L;
                     job.run(this.filler);
+                    if (TIMING) {
+                        this.busyNanos += System.nanoTime() - began;
+                        if (this.timedJobs == 0L) {
+                            this.windowStartNanos = began;
+                        }
+                        if (++this.timedJobs % TIMING_EVERY == 0) {
+                            reportTiming();
+                        }
+                    }
                 }
             }
         } catch (InterruptedException e) {
             Thread.currentThread().interrupt();
         } finally {
+            if (TIMING && this.timedJobs > 0) {
+                reportTiming();
+            }
             closeQuietly();
+        }
+    }
+
+    /**
+     * Logs what the GPU thread did over the last {@value #TIMING_EVERY} jobs, then starts a new
+     * window.
+     *
+     * <p>The busy fraction is the one number that settles whether this thread is the throughput
+     * limit: a saturated queue shows a fraction near 100%, and a thread waiting on something
+     * upstream shows the gap. Reporting per window rather than cumulatively matters because a
+     * single average over a whole run hides the difference between "busy throughout" and "busy
+     * during the initial burst and idle afterwards".
+     */
+    private void reportTiming() {
+        long wall = System.nanoTime() - this.windowStartNanos;
+        if (wall <= 0 || this.timedJobs == 0) {
+            return;
+        }
+        double perSecond = this.timedJobs * 1.0e9 / wall;
+        double busyPct = 100.0 * this.busyNanos / wall;
+        double serviceMs = this.busyNanos / 1.0e6 / this.timedJobs;
+
+        int filled = this.filler == null ? 0 : this.filler.filledChunks();
+        StringBuilder message = new StringBuilder(128)
+                .append("TerraCUDA: GPU thread ").append(String.format("%.1f", perSecond))
+                .append(" chunks/s, busy ").append(String.format("%.1f", busyPct))
+                .append("%, service ").append(String.format("%.1f", serviceMs)).append(" ms");
+        if (filled > 0) {
+            // Only takeover fills chunks; shadow mode has no write-back to report.
+            message.append(" (emit ").append(String.format("%.1f", this.filler.emitNanos() / 1.0e6 / filled))
+                    .append(" + replay ").append(String.format("%.1f", this.filler.replayNanos() / 1.0e6 / filled))
+                    .append(")");
+        }
+        int emitted = this.filler == null ? 0 : this.filler.emittedChunks();
+        if (emitted > 0) {
+            // Where emit goes: the density program, the two vein programs, and the per-block rules
+            // loop. Three numbers rather than one because the first two are device passes that a
+            // future change could skip, and the third is CPU work a future change could move.
+            double millis = 1.0e6 * emitted;
+            message.append(" [density ").append(String.format("%.1f", this.filler.densityNanos() / millis))
+                    .append(", veins ").append(String.format("%.1f", this.filler.veinNanos() / millis))
+                    .append(", rules ").append(String.format("%.1f", this.filler.rulesNanos() / millis))
+                    .append("]");
+        }
+        message.append(" over ").append(this.timedJobs).append(" chunks");
+        TerraCUDA.LOGGER.info(message.toString());
+
+        this.busyNanos = 0L;
+        this.timedJobs = 0L;
+        this.windowStartNanos = System.nanoTime();
+        if (this.filler != null) {
+            this.filler.resetTiming();
         }
     }
 

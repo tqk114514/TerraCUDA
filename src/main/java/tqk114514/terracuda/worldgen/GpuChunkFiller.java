@@ -12,6 +12,7 @@ import net.minecraft.world.level.levelgen.NoiseSettings;
 import net.minecraft.world.level.levelgen.RandomState;
 import tqk114514.terracuda.chunk.ChunkReplay;
 import tqk114514.terracuda.chunk.EmittedChunk;
+import tqk114514.terracuda.config.TerracudaConfig;
 import tqk114514.terracuda.cuda.CudaContext;
 import tqk114514.terracuda.density.CornerInterpolation;
 import tqk114514.terracuda.density.DensityCompiler;
@@ -62,6 +63,19 @@ public final class GpuChunkFiller implements AutoCloseable {
     private double[] densities;
     private double[] veinToggleValues;
     private double[] veinRidgedValues;
+
+    /** Read once: a per-chunk branch on a volatile-free static is not worth the noise. */
+    private static final boolean TIMING = TerracudaConfig.timing();
+
+    private long emitNanos;
+    private long replayNanos;
+    private int filledChunks;
+
+    /** A finer split of {@link #emitNanos}: the density program, the two vein programs, the rules. */
+    private long densityNanos;
+    private long veinNanos;
+    private long rulesNanos;
+    private int emittedChunks;
 
     /**
      * Whether the material rules will ever ask for a vein value.
@@ -134,16 +148,23 @@ public final class GpuChunkFiller implements AutoCloseable {
         double[] veinToggleValues = this.veinToggleValues;
         double[] veinRidgedValues = this.veinRidgedValues;
 
+        long began = TIMING ? System.nanoTime() : 0L;
         // final_density is a cache_all_in_cell marker, so the rules see the lerp3 blend; the vein
         // functions are read straight, so they take the incremental one. The difference is in the last
         // bits and InterpolationOrderTest pins it down.
         this.densityEvaluator.blocksForChunk(this.geometry, chunkX, chunkZ,
                 CornerInterpolation.LERP3, densities);
+        long densityAt = TIMING ? System.nanoTime() : 0L;
         if (this.oreVeinsEnabled) {
             this.veinToggleEvaluator.blocksForChunk(this.geometry, chunkX, chunkZ,
                     CornerInterpolation.INCREMENTAL, veinToggleValues);
             this.veinRidgedEvaluator.blocksForChunk(this.geometry, chunkX, chunkZ,
                     CornerInterpolation.INCREMENTAL, veinRidgedValues);
+        }
+        long veinsAt = TIMING ? System.nanoTime() : 0L;
+        if (TIMING) {
+            this.densityNanos += densityAt - began;
+            this.veinNanos += veinsAt - densityAt;
         }
 
         MaterialRules.RouterNoises noises = new MaterialRules.RouterNoises(
@@ -187,6 +208,10 @@ public final class GpuChunkFiller implements AutoCloseable {
                 }
             }
         }
+        if (TIMING) {
+            this.rulesNanos += System.nanoTime() - veinsAt;
+            this.emittedChunks++;
+        }
         return new EmittedChunk(ids, fluidUpdates);
     }
 
@@ -226,13 +251,69 @@ public final class GpuChunkFiller implements AutoCloseable {
             held.add(section);
         }
         try {
+            // The two halves are timed separately because the offline profile only covers the first
+            // one: ChunkPassProfileTest measures blockIds, and the write-back was never included
+            // because that profile was taken in shadow mode, where nothing is written.
+            long began = TIMING ? System.nanoTime() : 0L;
             EmittedChunk emitted = blockIds(chunk.getPos().x(), chunk.getPos().z());
+            long emittedAt = TIMING ? System.nanoTime() : 0L;
             ChunkReplay.write(chunk, emitted, this.geometry);
+            if (TIMING) {
+                long writtenAt = System.nanoTime();
+                this.emitNanos += emittedAt - began;
+                this.replayNanos += writtenAt - emittedAt;
+                this.filledChunks++;
+            }
         } finally {
             for (LevelChunkSection section : held) {
                 section.release();
             }
         }
+    }
+
+    /** Cumulative nanoseconds spent producing blocks, since the last {@link #resetTiming()}. */
+    public long emitNanos() {
+        return this.emitNanos;
+    }
+
+    /** Cumulative nanoseconds spent writing them into the chunk, since the last reset. */
+    public long replayNanos() {
+        return this.replayNanos;
+    }
+
+    /** Chunks filled since the last reset; zero in shadow mode, which never writes a chunk. */
+    public int filledChunks() {
+        return this.filledChunks;
+    }
+
+    /** Nanoseconds in the density program, across every {@link #blockIds} call since the reset. */
+    public long densityNanos() {
+        return this.densityNanos;
+    }
+
+    /** Nanoseconds in the two vein programs, or zero when ore veins are off. */
+    public long veinNanos() {
+        return this.veinNanos;
+    }
+
+    /** Nanoseconds in the per-block material-rules loop; this one is on the CPU. */
+    public long rulesNanos() {
+        return this.rulesNanos;
+    }
+
+    /** Blocks emitted since the reset, which is what the three figures above divide by. */
+    public int emittedChunks() {
+        return this.emittedChunks;
+    }
+
+    public void resetTiming() {
+        this.emitNanos = 0L;
+        this.replayNanos = 0L;
+        this.filledChunks = 0;
+        this.densityNanos = 0L;
+        this.veinNanos = 0L;
+        this.rulesNanos = 0L;
+        this.emittedChunks = 0;
     }
 
     private MaterialRules.SurfaceLevels surfaceLevels() {

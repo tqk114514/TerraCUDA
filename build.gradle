@@ -82,6 +82,8 @@ def terracudaTakeover = project.hasProperty('terracuda.takeover') || project.has
 def terracudaVerbose = project.hasProperty('terracuda.verbose') || project.hasProperty('verbose')
 // -Ptiming times the GPU thread and splits a chunk into "produce blocks" and "write them back".
 def terracudaTiming = project.hasProperty('terracuda.timing') || project.hasProperty('timing')
+// -Pinflight=N raises vanilla's player-ticket in-flight limit (default 4) for the upstream experiment.
+def terracudaInflight = (findProperty('terracuda.maxInFlight') ?: findProperty('inflight') ?: '0').toString()
 
 neoForge {
     version = project.neo_version
@@ -137,6 +139,9 @@ neoForge {
             }
             if (terracudaTiming) {
                 jvmArguments.add('-Dterracuda.timing=true')
+            }
+            if (terracudaInflight != '0') {
+                jvmArguments.add("-Dterracuda.maxInFlight=$terracudaInflight")
             }
 
             logLevel = org.slf4j.event.Level.DEBUG

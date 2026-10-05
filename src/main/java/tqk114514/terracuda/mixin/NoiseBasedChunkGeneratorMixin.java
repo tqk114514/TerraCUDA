@@ -219,4 +219,60 @@ public abstract class NoiseBasedChunkGeneratorMixin {
         int rank = Math.min(sorted.length, (sorted.length * hundredths + 99) / 100);
         return sorted[rank - 1];
     }
+
+    /**
+     * Noise-stage completions, counted whichever path filled the chunk.
+     *
+     * <p>The vanilla baseline has no instrumentation of its own, and the first attempt to compare it
+     * against this mod by wall clock failed exactly there: the moment a loading session "finishes"
+     * is not observable from outside, and the quit time is not it. This counts what both sides can
+     * count — completions of the stage — through the same window in both modes, so the vanilla
+     * baseline and the takeover run produce directly comparable curves, tails included.
+     *
+     * <p>It hooks the method's return rather than any path-specific point: in vanilla mode that is
+     * vanilla's own future, in takeover it is the one this mixin hands back (which covers the
+     * fallback too, because the re-entered vanilla fill completes inside it). Completions arrive on
+     * several threads, so the counter is atomic and exactly one thread closes each window.
+     */
+    private static final AtomicLong NOISE_STAGE_COMPLETIONS = new AtomicLong();
+    private static final int NOISE_STAGE_WINDOW = 128;
+    private static volatile long noiseStageWindowStart;
+
+    @Inject(method = "fillFromNoise", at = @At("RETURN"), require = 0)
+    private void terracuda$countNoiseStage(Blender blender, RandomState randomState,
+            StructureManager structureManager, ChunkAccess centerChunk,
+            CallbackInfoReturnable<CompletableFuture<ChunkAccess>> cir) {
+        if (!TerracudaConfig.timing()) {
+            return;
+        }
+        CompletableFuture<ChunkAccess> future = cir.getReturnValue();
+        if (future != null) {
+            future.thenRun(NoiseBasedChunkGeneratorMixin::noiseStageCompleted);
+        }
+    }
+
+    private static void noiseStageCompleted() {
+        long count = NOISE_STAGE_COMPLETIONS.incrementAndGet();
+        if (count == 1L) {
+            noiseStageWindowStart = System.nanoTime();
+            return;
+        }
+        if (count % NOISE_STAGE_WINDOW != 0) {
+            return;
+        }
+        long now = System.nanoTime();
+        double perSecond = NOISE_STAGE_WINDOW / ((now - noiseStageWindowStart) / 1.0e9);
+        StringBuilder message = new StringBuilder(96)
+                .append("TerraCUDA: noise stage ").append(String.format("%.1f", perSecond))
+                .append(" completions/s over ").append(NOISE_STAGE_WINDOW)
+                .append(" (total ").append(count).append(')');
+        String throttle = tqk114514.terracuda.worldgen.TicketThrottle.describe();
+        if (!throttle.isEmpty()) {
+            // The throttle state next to the rate it governs: in-flight positions and whether the
+            // queue is sleeping, at the same moment the window closed.
+            message.append("; tickets [").append(throttle).append(']');
+        }
+        TerraCUDA.LOGGER.info(message.toString());
+        noiseStageWindowStart = now;
+    }
 }

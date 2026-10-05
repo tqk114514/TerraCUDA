@@ -54,6 +54,8 @@ public final class CudaContext implements AutoCloseable {
     private final MethodHandle cuStreamCreate;
     private final MethodHandle cuStreamDestroy;
     private final MethodHandle cuStreamSynchronize;
+    private final MethodHandle cuMemHostRegister;
+    private final MethodHandle cuMemHostUnregister;
 
     private final MemorySegment contextHandle;
     private final Map<String, MemorySegment> functions = new HashMap<>();
@@ -102,6 +104,12 @@ public final class CudaContext implements AutoCloseable {
                 "cuStreamDestroy_v2", "cuStreamDestroy");
         this.cuStreamSynchronize = driver.bind("cuStreamSynchronize",
                 FunctionDescriptor.of(CU_INT, ValueLayout.ADDRESS));
+        this.cuMemHostRegister = driver.bindAny(
+                FunctionDescriptor.of(CU_INT, ValueLayout.ADDRESS, CU_SIZE, CU_INT),
+                "cuMemHostRegister_v2", "cuMemHostRegister");
+        this.cuMemHostUnregister = driver.bindAny(
+                FunctionDescriptor.of(CU_INT, ValueLayout.ADDRESS),
+                "cuMemHostUnregister_v2", "cuMemHostUnregister");
 
         MemorySegment handle = this.arena.allocate(ValueLayout.ADDRESS);
         int result = invokeInt(this.cuCtxCreate, handle, 0, device);
@@ -242,6 +250,26 @@ public final class CudaContext implements AutoCloseable {
     /** Blocks until everything queued on {@code stream} has completed — and only that stream. */
     public void synchronizeStream(DeviceStream stream) {
         driver.check(invokeInt(this.cuStreamSynchronize, stream.handle()), "cuStreamSynchronize");
+    }
+
+    /**
+     * Registers a host segment as page-locked, so async copies into and out of it truly queue.
+     *
+     * <p>The one asymmetry that matters here: an async copy out of pageable memory may block the
+     * caller while the driver stages it — a copy <em>into</em> pageable memory always does, because
+     * the driver cannot defer a write into memory the host might reuse. The first streams change
+     * measured flat until this was pointed at the copy-back staging segment: every submission ends
+     * in a device-to-host copy, and with a pageable destination that copy waited for the whole
+     * stream behind it before submitting returned — the overlap the streams existed for never
+     * happened.
+     */
+    public void pin(MemorySegment host) {
+        driver.check(invokeInt(this.cuMemHostRegister, host, host.byteSize(), 0), "cuMemHostRegister");
+    }
+
+    /** Undoes {@link #pin(MemorySegment)}; must run before the segment's memory is released. */
+    public void unpin(MemorySegment host) {
+        driver.check(invokeInt(this.cuMemHostUnregister, host), "cuMemHostUnregister");
     }
 
     /**

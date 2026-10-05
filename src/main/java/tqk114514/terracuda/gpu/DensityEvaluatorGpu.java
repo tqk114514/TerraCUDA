@@ -290,11 +290,16 @@ public final class DensityEvaluatorGpu implements AutoCloseable {
         }
     }
 
-    /** A cached host segment of at least {@code doubles} doubles. */
+    /** A cached host segment of at least {@code doubles} doubles, page-locked for true async copies. */
     private MemorySegment hostDoubles(int doubles) {
         long bytes = (long) doubles * Double.BYTES;
         if (this.hostDoubles == null || this.hostDoubles.byteSize() < bytes) {
-            this.hostDoubles = this.hostArena.allocate(Math.max(bytes, 1L << 16));
+            MemorySegment replacement = this.hostArena.allocate(Math.max(bytes, 1L << 16));
+            this.context.pin(replacement);
+            if (this.hostDoubles != null) {
+                this.context.unpin(this.hostDoubles);
+            }
+            this.hostDoubles = replacement;
         }
         return this.hostDoubles;
     }
@@ -473,6 +478,9 @@ public final class DensityEvaluatorGpu implements AutoCloseable {
             return;
         }
         this.closed = true;
+        if (this.hostDoubles != null && !this.context.isClosed()) {
+            this.context.unpin(this.hostDoubles);
+        }
         this.hostArena.close();
         if (this.context.isClosed()) {
             return;

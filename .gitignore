@@ -39,3 +39,6 @@ run/
 **/src/generated/**/.cache/
 repo/
 !**/src/**/repo/
+
+commit-message scratch files
+*.tmp

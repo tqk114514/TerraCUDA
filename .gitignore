@@ -31,6 +31,9 @@ bin/
 logs/
 crash-reports/
 
+# The C2ME source checkout is reference material for benchmarking, not part of this mod.
+C2ME-fabric/
+
 run/
 !**/src/**/run/
 **/src/generated/**/.cache/

@@ -35,10 +35,11 @@ import tqk114514.terracuda.gpu.DensityEvaluatorGpu;
  * <p>The class is split at that same seam, because the halves measured differently: the rules and the
  * write-back were 6.3 of the 11.6 ms the device thread spent per chunk, all of it CPU work serialised
  * behind the device. In takeover the halves run on different threads — the device thread produces
- * {@link DensityBuffers} and a rules worker consumes them — while shadow mode and the tests use the
- * synchronous composition, {@link #blockIds}. Each half is single-threaded by ownership: the
- * evaluators are touched only by the device half, the interpreters and the replay only by the rules
- * half, and the buffer pool is the single crossing point.
+ * {@link DensityBuffers} and the rules workers consume them, each through its own
+ * {@link RulesContext} — while shadow mode and the tests use the synchronous composition,
+ * {@link #blockIds}. Ownership keeps each half to its own state: the evaluators are touched only by
+ * the device half, each worker's interpreters only by that worker, and the buffer pool is the
+ * single crossing point.
  *
  * <p>Everything is per world: the lowered programs and the device buffers are built once and reused
  * for every chunk.
@@ -49,14 +50,22 @@ public final class GpuChunkFiller implements AutoCloseable {
     private final NoiseSettings geometry;
     private final RandomState randomState;
 
-    private final DensityInterpreter barrierNoise;
-    private final DensityInterpreter floodedness;
-    private final DensityInterpreter spread;
-    private final DensityInterpreter lava;
-    private final DensityInterpreter erosion;
-    private final DensityInterpreter depth;
-    private final DensityInterpreter veinGap;
-    private final DensityInterpreter preliminarySurface;
+    /** The eight router programs, lowered once and shared by every rules worker's context. */
+    private final DensityProgram barrierNoiseProgram;
+    private final DensityProgram floodednessProgram;
+    private final DensityProgram spreadProgram;
+    private final DensityProgram lavaProgram;
+    private final DensityProgram erosionProgram;
+    private final DensityProgram depthProgram;
+    private final DensityProgram veinGapProgram;
+    private final DensityProgram preliminarySurfaceProgram;
+
+    /**
+     * The context the synchronous composition runs through: shadow mode and the parity tests,
+     * single-threaded by construction. Takeover workers each get their own via
+     * {@link #createRulesContext()}.
+     */
+    private final RulesContext inlineRules;
 
     private final DensityEvaluatorGpu densityEvaluator;
     private final DensityEvaluatorGpu veinToggleEvaluator;
@@ -86,16 +95,17 @@ public final class GpuChunkFiller implements AutoCloseable {
 
     /**
      * A finer split of the chunk's time: the density program, the two vein programs, the rules, and
-     * the write-back. Each is written by exactly one thread — the first two by the device half, the
-     * last two by the rules half — and read across threads only by the periodic timing report, so
-     * they are volatile for visibility and the report tolerates a straddling window.
+     * the write-back. The first two are written by the device thread alone; the last two are added
+     * to from as many rules workers as there are, so they are adders rather than plain fields, and
+     * all are read across threads only by the periodic timing report, which tolerates a window
+     * straddling a reset.
      */
     private volatile long densityNanos;
     private volatile long veinNanos;
-    private volatile long rulesNanos;
-    private volatile long replayNanos;
-    private volatile int emittedChunks;
-    private volatile int filledChunks;
+    private final java.util.concurrent.atomic.LongAdder rulesNanos = new java.util.concurrent.atomic.LongAdder();
+    private final java.util.concurrent.atomic.LongAdder replayNanos = new java.util.concurrent.atomic.LongAdder();
+    private final java.util.concurrent.atomic.LongAdder emittedChunks = new java.util.concurrent.atomic.LongAdder();
+    private final java.util.concurrent.atomic.LongAdder filledChunks = new java.util.concurrent.atomic.LongAdder();
 
     /**
      * Whether the material rules will ever ask for a vein value.
@@ -119,14 +129,15 @@ public final class GpuChunkFiller implements AutoCloseable {
         DensityProgram density = DensityCompiler.lower(router.finalDensity());
         DensityProgram veinToggle = DensityCompiler.lower(router.veinToggle());
         DensityProgram veinRidged = DensityCompiler.lower(router.veinRidged());
-        this.barrierNoise = lower(router.barrierNoise());
-        this.floodedness = lower(router.fluidLevelFloodednessNoise());
-        this.spread = lower(router.fluidLevelSpreadNoise());
-        this.lava = lower(router.lavaNoise());
-        this.erosion = lower(router.erosion());
-        this.depth = lower(router.depth());
-        this.veinGap = lower(router.veinGap());
-        this.preliminarySurface = lower(router.preliminarySurfaceLevel());
+        this.barrierNoiseProgram = DensityCompiler.lower(router.barrierNoise());
+        this.floodednessProgram = DensityCompiler.lower(router.fluidLevelFloodednessNoise());
+        this.spreadProgram = DensityCompiler.lower(router.fluidLevelSpreadNoise());
+        this.lavaProgram = DensityCompiler.lower(router.lavaNoise());
+        this.erosionProgram = DensityCompiler.lower(router.erosion());
+        this.depthProgram = DensityCompiler.lower(router.depth());
+        this.veinGapProgram = DensityCompiler.lower(router.veinGap());
+        this.preliminarySurfaceProgram = DensityCompiler.lower(router.preliminarySurfaceLevel());
+        this.inlineRules = createRulesContext();
 
         this.densityEvaluator = DensityEvaluatorGpu.forProgram(context, density, this.geometry);
         this.oreVeinsEnabled = settings.oreVeinsEnabled();
@@ -188,21 +199,19 @@ public final class GpuChunkFiller implements AutoCloseable {
      * The CPU half of one chunk: the material rules over values the device already produced, plus
      * the fluid-update bitmap {@code doFill} maintains.
      *
-     * <p>Runs on the rules worker in takeover, on the caller in the synchronous composition. The
-     * interpreters it reads carry per-chunk state ({@code setChunk} for the flat caches), which is
-     * why this half must be single-threaded: two chunks through it at once would answer each
-     * other's columns.
+     * <p>Runs on a rules worker in takeover, on the caller in the synchronous composition. The
+     * interpreters in {@code context} carry per-chunk state ({@code setChunk} for the flat caches),
+     * which is why a context belongs to one worker: two chunks through the same context at once
+     * would answer each other's columns.
      */
-    public EmittedChunk applyRules(int chunkX, int chunkZ, DensityBuffers buffers) {
+    public EmittedChunk applyRules(int chunkX, int chunkZ, DensityBuffers buffers, RulesContext context) {
         int minY = this.geometry.minY();
         int height = this.geometry.height();
         long began = TIMING ? System.nanoTime() : 0L;
         try {
             // The material rules read router entries through interpreters, and a flat cache inside one
             // of those needs to know which chunk's columns it is answering for.
-            for (DensityInterpreter interpreter : new DensityInterpreter[] {
-                    this.barrierNoise, this.floodedness, this.spread, this.lava, this.erosion,
-                    this.depth, this.veinGap, this.preliminarySurface}) {
+            for (DensityInterpreter interpreter : context.all()) {
                 interpreter.setChunk(chunkX * 16, chunkZ * 16);
             }
 
@@ -211,17 +220,17 @@ public final class GpuChunkFiller implements AutoCloseable {
             double[] veinRidgedValues = buffers.veinRidged();
 
             MaterialRules.RouterNoises noises = new MaterialRules.RouterNoises(
-                    MaterialRules.entry(this.barrierNoise, this.barrierNoise.program(), chunkX, chunkZ),
-                    MaterialRules.entry(this.floodedness, this.floodedness.program(), chunkX, chunkZ),
-                    MaterialRules.entry(this.spread, this.spread.program(), chunkX, chunkZ),
-                    MaterialRules.entry(this.lava, this.lava.program(), chunkX, chunkZ),
-                    MaterialRules.entry(this.erosion, this.erosion.program(), chunkX, chunkZ),
-                    MaterialRules.entry(this.depth, this.depth.program(), chunkX, chunkZ),
-                    MaterialRules.entry(this.veinGap, this.veinGap.program(), chunkX, chunkZ),
+                    MaterialRules.entry(context.barrierNoise, context.barrierNoise.program(), chunkX, chunkZ),
+                    MaterialRules.entry(context.floodedness, context.floodedness.program(), chunkX, chunkZ),
+                    MaterialRules.entry(context.spread, context.spread.program(), chunkX, chunkZ),
+                    MaterialRules.entry(context.lava, context.lava.program(), chunkX, chunkZ),
+                    MaterialRules.entry(context.erosion, context.erosion.program(), chunkX, chunkZ),
+                    MaterialRules.entry(context.depth, context.depth.program(), chunkX, chunkZ),
+                    MaterialRules.entry(context.veinGap, context.veinGap.program(), chunkX, chunkZ),
                     (x, y, z) -> veinValue(veinToggleValues, "veinToggle", x, y, z, chunkX, chunkZ, minY, height),
                     (x, y, z) -> veinValue(veinRidgedValues, "veinRidged", x, y, z, chunkX, chunkZ, minY, height));
 
-            MaterialRules rules = MaterialRules.forChunk(noises, surfaceLevels(), fluidPicker(),
+            MaterialRules rules = MaterialRules.forChunk(noises, surfaceLevels(context), fluidPicker(),
                     VanillaRandomExport.export(this.randomState.aquiferRandom()),
                     VanillaRandomExport.export(this.randomState.oreRandom()), chunkX, chunkZ, this.geometry,
                     this.settings.isAquifersEnabled(), this.settings.oreVeinsEnabled());
@@ -254,8 +263,8 @@ public final class GpuChunkFiller implements AutoCloseable {
             return new EmittedChunk(ids, fluidUpdates);
         } finally {
             if (TIMING) {
-                this.rulesNanos += System.nanoTime() - began;
-                this.emittedChunks++;
+                this.rulesNanos.add(System.nanoTime() - began);
+                this.emittedChunks.increment();
             }
             releaseBuffers(buffers);
         }
@@ -268,7 +277,7 @@ public final class GpuChunkFiller implements AutoCloseable {
      * and the tests want. Takeover does not come through here — it runs the halves as a pipeline.
      */
     public EmittedChunk blockIds(int chunkX, int chunkZ) {
-        return applyRules(chunkX, chunkZ, emitDensities(chunkX, chunkZ));
+        return applyRules(chunkX, chunkZ, emitDensities(chunkX, chunkZ), this.inlineRules);
     }
 
     /**
@@ -290,11 +299,11 @@ public final class GpuChunkFiller implements AutoCloseable {
     /**
      * The rules half plus the write-back: turns one chunk's borrowed buffers into written blocks.
      *
-     * <p>Runs on the rules worker in takeover. The sections are held for the duration, the way
-     * {@code fillFromNoise} holds them around {@code doFill}: the write is not atomic, and another
-     * thread may reach the chunk while it is being filled.
+     * <p>Runs on a rules worker in takeover, through that worker's own context. The sections are
+     * held for the duration, the way {@code fillFromNoise} holds them around {@code doFill}: the
+     * write is not atomic, and another thread may reach the chunk while it is being filled.
      */
-    public void fill(ChunkAccess chunk, DensityBuffers buffers) {
+    public void fill(ChunkAccess chunk, DensityBuffers buffers, RulesContext context) {
         int minY = this.geometry.minY();
         int height = this.geometry.height();
         int top = chunk.getSectionIndex(minY + height - 1);
@@ -307,12 +316,12 @@ public final class GpuChunkFiller implements AutoCloseable {
             held.add(section);
         }
         try {
-            EmittedChunk emitted = applyRules(chunk.getPos().x(), chunk.getPos().z(), buffers);
+            EmittedChunk emitted = applyRules(chunk.getPos().x(), chunk.getPos().z(), buffers, context);
             long rulesDone = TIMING ? System.nanoTime() : 0L;
             ChunkReplay.write(chunk, emitted, this.geometry);
             if (TIMING) {
-                this.replayNanos += System.nanoTime() - rulesDone;
-                this.filledChunks++;
+                this.replayNanos.add(System.nanoTime() - rulesDone);
+                this.filledChunks.increment();
             }
         } finally {
             for (LevelChunkSection section : held) {
@@ -345,37 +354,37 @@ public final class GpuChunkFiller implements AutoCloseable {
         return this.veinNanos;
     }
 
-    /** Nanoseconds in the material rules; this half runs on a CPU. */
+    /** Nanoseconds in the material rules, added across every rules worker; this half runs on CPUs. */
     public long rulesNanos() {
-        return this.rulesNanos;
+        return this.rulesNanos.sum();
     }
 
     /** Nanoseconds writing emitted blocks into chunks; zero in shadow mode, which writes nothing. */
     public long replayNanos() {
-        return this.replayNanos;
+        return this.replayNanos.sum();
     }
 
     /** Blocks emitted since the reset, which is what the segment figures divide by. */
-    public int emittedChunks() {
-        return this.emittedChunks;
+    public long emittedChunks() {
+        return this.emittedChunks.sum();
     }
 
     /** Chunks written since the reset; zero in shadow mode, which never writes a chunk. */
-    public int filledChunks() {
-        return this.filledChunks;
+    public long filledChunks() {
+        return this.filledChunks.sum();
     }
 
     public void resetTiming() {
         this.densityNanos = 0L;
         this.veinNanos = 0L;
-        this.rulesNanos = 0L;
-        this.replayNanos = 0L;
-        this.emittedChunks = 0;
-        this.filledChunks = 0;
+        this.rulesNanos.reset();
+        this.replayNanos.reset();
+        this.emittedChunks.reset();
+        this.filledChunks.reset();
     }
 
-    private MaterialRules.SurfaceLevels surfaceLevels() {
-        DensityInterpreter interpreter = this.preliminarySurface;
+    private MaterialRules.SurfaceLevels surfaceLevels(RulesContext context) {
+        DensityInterpreter interpreter = context.preliminarySurface;
         // Vanilla caches the preliminary surface level per column, and it matters: the aquifer asks
         // for the same columns over and over — thirteen sampling offsets times every grid cell — and
         // each miss is a find_top_surface, which walks the density downwards in steps of eight.
@@ -422,8 +431,56 @@ public final class GpuChunkFiller implements AutoCloseable {
         return ((x - chunkX * 16) * 16 + (z - chunkZ * 16)) * height + (y - minY);
     }
 
-    private static DensityInterpreter lower(DensityFunction function) {
-        return new DensityInterpreter(DensityCompiler.lower(function));
+    /**
+     * One rules worker's interpreter set, over programs every context shares.
+     *
+     * <p>The interpreters carry per-chunk mutable state — {@code setChunk} points the flat caches at
+     * the chunk the rules are asking about — so a context belongs to exactly one worker: two chunks
+     * through one context at once would answer each other's columns. The programs underneath are
+     * immutable and lowered once per world, so a context is eight thin wrappers, cheap to make per
+     * worker.
+     */
+    public static final class RulesContext {
+        final DensityInterpreter barrierNoise;
+        final DensityInterpreter floodedness;
+        final DensityInterpreter spread;
+        final DensityInterpreter lava;
+        final DensityInterpreter erosion;
+        final DensityInterpreter depth;
+        final DensityInterpreter veinGap;
+        final DensityInterpreter preliminarySurface;
+
+        private RulesContext(DensityInterpreter barrierNoise, DensityInterpreter floodedness,
+                DensityInterpreter spread, DensityInterpreter lava, DensityInterpreter erosion,
+                DensityInterpreter depth, DensityInterpreter veinGap,
+                DensityInterpreter preliminarySurface) {
+            this.barrierNoise = barrierNoise;
+            this.floodedness = floodedness;
+            this.spread = spread;
+            this.lava = lava;
+            this.erosion = erosion;
+            this.depth = depth;
+            this.veinGap = veinGap;
+            this.preliminarySurface = preliminarySurface;
+        }
+
+        DensityInterpreter[] all() {
+            return new DensityInterpreter[] { this.barrierNoise, this.floodedness, this.spread,
+                    this.lava, this.erosion, this.depth, this.veinGap, this.preliminarySurface };
+        }
+    }
+
+    /** Builds one rules worker's context over the shared, immutable router programs. */
+    public RulesContext createRulesContext() {
+        return new RulesContext(
+                new DensityInterpreter(this.barrierNoiseProgram),
+                new DensityInterpreter(this.floodednessProgram),
+                new DensityInterpreter(this.spreadProgram),
+                new DensityInterpreter(this.lavaProgram),
+                new DensityInterpreter(this.erosionProgram),
+                new DensityInterpreter(this.depthProgram),
+                new DensityInterpreter(this.veinGapProgram),
+                new DensityInterpreter(this.preliminarySurfaceProgram));
     }
 
     @Override

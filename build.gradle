@@ -84,6 +84,8 @@ def terracudaVerbose = project.hasProperty('terracuda.verbose') || project.hasPr
 def terracudaTiming = project.hasProperty('terracuda.timing') || project.hasProperty('timing')
 // -Pinflight=N raises vanilla's player-ticket in-flight limit (default 4) for the upstream experiment.
 def terracudaInflight = (findProperty('terracuda.maxInFlight') ?: findProperty('inflight') ?: '0').toString()
+// -PrulesWorkers=N sets the rules-and-write-back worker count (default 2).
+def terracudaWorkers = (findProperty('terracuda.rulesWorkers') ?: findProperty('rulesWorkers') ?: '2').toString()
 
 neoForge {
     version = project.neo_version
@@ -142,6 +144,9 @@ neoForge {
             }
             if (terracudaInflight != '0') {
                 jvmArguments.add("-Dterracuda.maxInFlight=$terracudaInflight")
+            }
+            if (terracudaWorkers != '2') {
+                jvmArguments.add("-Dterracuda.rulesWorkers=$terracudaWorkers")
             }
 
             logLevel = org.slf4j.event.Level.DEBUG

@@ -76,8 +76,23 @@ public final class TerracudaConfig {
         return Integer.getInteger(PREFIX + "maxInFlight", 0);
     }
 
+    /**
+     * Moves vanilla's radius-zero generation stages (NOISE, SURFACE, CARVERS) off the serial stage
+     * dispatcher, onto the background executor.
+     *
+     * <p>The experiment matrix settled that the dispatcher is the wall: every configuration bounced
+     * off ~65-70 chunks/s, and raising the ticket throttle only deepened the queue in front of it.
+     * Only those three stages have {@code blockStateWriteRadius() == 0} — they write their own
+     * chunk and nothing else — while FEATURES writes its neighbours and stays serial. Vanilla
+     * applies all of them on one dispatcher thread; this lets the radius-zero bodies run elsewhere.
+     * See {@code docs/性能笔记.md} for the measurements behind this.
+     */
+    public static boolean offload() {
+        return Boolean.getBoolean(PREFIX + "offload");
+    }
+
     public static String summary() {
         return "gpu=" + gpuEnabled() + ", shadow=" + shadowMode() + ", verbose=" + verbose()
-                + ", timing=" + timing() + ", maxInFlight=" + maxInFlight();
+                + ", timing=" + timing() + ", maxInFlight=" + maxInFlight() + ", offload=" + offload();
     }
 }

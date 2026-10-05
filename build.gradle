@@ -84,6 +84,9 @@ def terracudaVerbose = project.hasProperty('terracuda.verbose') || project.hasPr
 def terracudaTiming = project.hasProperty('terracuda.timing') || project.hasProperty('timing')
 // -Pinflight=N raises vanilla's player-ticket in-flight limit (default 4) for the upstream experiment.
 def terracudaInflight = (findProperty('terracuda.maxInFlight') ?: findProperty('inflight') ?: '0').toString()
+// -Poffload moves vanilla's radius-zero generation stages (NOISE, SURFACE, CARVERS) off the serial
+// stage dispatcher, the wall the experiment matrix identified.
+def terracudaOffload = project.hasProperty('terracuda.offload') || project.hasProperty('offload')
 
 neoForge {
     version = project.neo_version
@@ -142,6 +145,9 @@ neoForge {
             }
             if (terracudaInflight != '0') {
                 jvmArguments.add("-Dterracuda.maxInFlight=$terracudaInflight")
+            }
+            if (terracudaOffload) {
+                jvmArguments.add('-Dterracuda.offload=true')
             }
 
             logLevel = org.slf4j.event.Level.DEBUG

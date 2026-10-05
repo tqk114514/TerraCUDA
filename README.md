@@ -101,8 +101,9 @@ Add `-Pverbose` to log every chunk rather than every 256th. (`-Pterracuda.shadow
 Windows shell splits it at the dot, so the dotless form is the one to use there.)
 
 For benchmarking, `-Ptiming` reports the device thread and the noise stage per window — it also
-works on a vanilla run, which is how the baseline is measured — and `-Pinflight=N` raises vanilla's
-player-ticket in-flight limit from 4, which is the experiment described in
+works on a vanilla run, which is how the baseline is measured. `-Pinflight=N` raises vanilla's
+player-ticket in-flight limit from 4, and `-Poffload` moves vanilla's radius-zero generation stages
+off the serial stage dispatcher; both are experiments described in
 [`docs/性能笔记.md`](docs/性能笔记.md).
 
 ## GPU kernels

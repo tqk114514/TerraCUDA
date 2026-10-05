@@ -3,6 +3,7 @@
   "package": "tqk114514.terracuda.mixin",
   "compatibilityLevel": "JAVA_25",
   "mixins": [
+    "ChunkStepMixin",
     "DistanceManagerMixin",
     "NoiseBasedChunkGeneratorMixin",
     "ThrottlingChunkTaskDispatcherMixin"

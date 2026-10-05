@@ -112,11 +112,12 @@ neoForge {
             systemProperty 'forge.logging.markers', 'REGISTRIES'
 
             // Required for the java.lang.foreign CUDA binding to run inside a dev client/server.
-            // ALL-UNNAMED covers the unnamed module; FML loads the mod as the named module
-            // `terracuda`, which warns on every FFM downcall unless it is named too -- the
-            // dedicated-server run made that visible as one WARNING block per lookup.
+            // Naming the mod here does not work: FML creates the `terracuda` module after JVM
+            // startup, so a startup flag cannot refer to it -- the dedicated-server run showed
+            // `Unknown module: terracuda` and the FFM warnings stayed. The downstream fix is the
+            // Enable-Native-Access manifest attribute (JDK 24+), left for release packaging; the
+            // warnings in dev runs are cosmetic and the calls still succeed.
             jvmArguments.add('--enable-native-access=ALL-UNNAMED')
-            jvmArguments.add('--enable-native-access=terracuda')
 
             // -Pshadow runs the device path in observation mode, so it can be tried without changing
             // what the game generates:

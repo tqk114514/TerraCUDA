@@ -142,6 +142,11 @@ public abstract class NoiseBasedChunkGeneratorMixin {
                                     centerChunk);
                         });
                 cir.setReturnValue(result);
+                if (TerracudaConfig.timing()) {
+                    // The cancel path this mixin just took bypasses the RETURN injection that counts
+                    // completions, so a taken-over chunk counts here instead: on its own future.
+                    result.thenRun(NoiseBasedChunkGeneratorMixin::noiseStageCompleted);
+                }
                 return;
             }
 
@@ -242,7 +247,10 @@ public abstract class NoiseBasedChunkGeneratorMixin {
     private void terracuda$countNoiseStage(Blender blender, RandomState randomState,
             StructureManager structureManager, ChunkAccess centerChunk,
             CallbackInfoReturnable<CompletableFuture<ChunkAccess>> cir) {
-        if (!TerracudaConfig.timing()) {
+        if (!TerracudaConfig.timing() || Boolean.TRUE.equals(IN_VANILLA.get())) {
+            // The re-entry guard is not about the flag it reads: a fallback's vanilla fill is
+            // counted on the takeover future that triggered it, and counting it here too would
+            // double the chunk.
             return;
         }
         CompletableFuture<ChunkAccess> future = cir.getReturnValue();

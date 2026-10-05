@@ -87,6 +87,8 @@ def terracudaInflight = (findProperty('terracuda.maxInFlight') ?: findProperty('
 // -Poffload moves vanilla's radius-zero generation stages (NOISE, SURFACE, CARVERS) off the serial
 // stage dispatcher, the wall the experiment matrix identified.
 def terracudaOffload = project.hasProperty('terracuda.offload') || project.hasProperty('offload')
+// -PrulesWorkers=N sets the rules-and-write-back worker count (default 2).
+def terracudaWorkers = (findProperty('terracuda.rulesWorkers') ?: findProperty('rulesWorkers') ?: '2').toString()
 
 neoForge {
     version = project.neo_version
@@ -148,6 +150,9 @@ neoForge {
             }
             if (terracudaOffload) {
                 jvmArguments.add('-Dterracuda.offload=true')
+            }
+            if (terracudaWorkers != '2') {
+                jvmArguments.add("-Dterracuda.rulesWorkers=$terracudaWorkers")
             }
 
             logLevel = org.slf4j.event.Level.DEBUG

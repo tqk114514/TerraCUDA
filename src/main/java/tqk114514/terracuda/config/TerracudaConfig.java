@@ -91,8 +91,22 @@ public final class TerracudaConfig {
         return Boolean.getBoolean(PREFIX + "offload");
     }
 
+    /**
+     * How many rules-and-write-back workers run the CPU half of a chunk. The router interpreters
+     * carry per-chunk state, so each worker owns a set.
+     *
+     * <p>The default of two comes from the walls on either side, not from taste: one worker drains
+     * the ~7 ms rules+write-back at ~145 chunks/s and leaves the multi-stream device thread
+     * waiting, while two clear it and hand the ceiling to the serial dispatcher's remaining stages
+     * — a third would have nothing to pick up until that dispatcher is dealt with.
+     */
+    public static int rulesWorkers() {
+        return Integer.getInteger(PREFIX + "rulesWorkers", 2);
+    }
+
     public static String summary() {
         return "gpu=" + gpuEnabled() + ", shadow=" + shadowMode() + ", verbose=" + verbose()
-                + ", timing=" + timing() + ", maxInFlight=" + maxInFlight() + ", offload=" + offload();
+                + ", timing=" + timing() + ", maxInFlight=" + maxInFlight() + ", offload=" + offload()
+                + ", rulesWorkers=" + rulesWorkers();
     }
 }

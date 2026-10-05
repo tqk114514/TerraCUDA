@@ -82,7 +82,7 @@ public final class GpuWorldgenService implements AutoCloseable {
     private final BlockingQueue<ReplayJob> replayJobs = new ArrayBlockingQueue<>(REPLAY_CAPACITY);
     private final CountDownLatch initialised = new CountDownLatch(1);
     private final Thread thread;
-    private Thread replayThread;
+    private Thread[] replayThreads = new Thread[0];
 
     private volatile boolean ready;
     private volatile String unavailableReason = "not started";
@@ -199,15 +199,17 @@ public final class GpuWorldgenService implements AutoCloseable {
     }
 
     /**
-     * The rules worker: applies the material rules and writes chunks, one at a time.
+     * One rules worker's loop: applies the material rules and writes chunks through the context it
+     * owns, one chunk at a time.
      *
-     * <p>Single-threaded on purpose. The router interpreters it reads carry per-chunk state (the
-     * flat-cache gate answers for the chunk the rules are asking about), so two chunks through this
-     * loop at once would answer each other's columns. The work it owns measured at 6.3 ms a chunk,
-     * which one thread drains at roughly 160 chunks/s — above anything upstream has been observed to
-     * supply — and the queue in front of it is what makes the device thread wait rather than wander.
+     * <p>There are several workers now, and the reason there can be is the context: the router
+     * interpreters carry per-chunk state (the flat-cache gate answers for the chunk the rules are
+     * asking about), so the single-threadedness the loop needed lives per context, not per service.
+     * One worker drained the ~7 ms chunk at ~145 chunks/s and the multi-stream device thread ran
+     * out of work to hand it; {@link TerracudaConfig#rulesWorkers()} more of them clear the device
+     * thread and run into the serial dispatcher's remaining stages instead.
      */
-    private void runReplay() {
+    private void runReplay(GpuChunkFiller.RulesContext context) {
         try {
             // Drains before exiting: a handed-over chunk whose future never completes would hang the
             // stage that is waiting on it, and the fallback only fires on failure, not on silence.
@@ -217,7 +219,7 @@ public final class GpuWorldgenService implements AutoCloseable {
                     continue;
                 }
                 try {
-                    job.filler().fill(job.chunk(), job.buffers());
+                    job.filler().fill(job.chunk(), job.buffers(), context);
                     job.done().complete(null);
                 } catch (Throwable t) {
                     job.done().completeExceptionally(t);
@@ -263,7 +265,7 @@ public final class GpuWorldgenService implements AutoCloseable {
                     .append(", p95 ").append(String.format("%.1f", percentile(window, 95) / 1.0e6))
                     .append(")");
         }
-        int emitted = this.filler == null ? 0 : this.filler.emittedChunks();
+        long emitted = this.filler == null ? 0 : this.filler.emittedChunks();
         if (emitted > 0) {
             // Where the time goes: the density program and the two vein programs are queued on the
             // device thread and overlap on their own streams, the rules loop and the write-back run
@@ -313,9 +315,14 @@ public final class GpuWorldgenService implements AutoCloseable {
         CudaKernels.loadModule(this.context, device);
 
         this.filler = GpuChunkFiller.create(this.context, randomState, settings);
-        this.replayThread = new Thread(this::runReplay, "TerraCUDA-replay");
-        this.replayThread.setDaemon(true);
-        this.replayThread.start();
+        int workers = Math.max(1, TerracudaConfig.rulesWorkers());
+        this.replayThreads = new Thread[workers];
+        for (int i = 0; i < workers; i++) {
+            GpuChunkFiller.RulesContext context = this.filler.createRulesContext();
+            this.replayThreads[i] = new Thread(() -> runReplay(context), "TerraCUDA-replay-" + i);
+            this.replayThreads[i].setDaemon(true);
+            this.replayThreads[i].start();
+        }
         this.ready = true;
         this.unavailableReason = "";
     }

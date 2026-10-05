@@ -63,6 +63,17 @@ public final class GpuChunkFiller implements AutoCloseable {
     private double[] veinToggleValues;
     private double[] veinRidgedValues;
 
+    /**
+     * Whether the material rules will ever ask for a vein value.
+     *
+     * <p>They will not: {@code MaterialRules.compute} returns null without calling the veinifier when
+     * ore veins are off, and the veinifier is the only reader of {@code veinToggle} and
+     * {@code veinRidged}. Evaluating both for a chunk that cannot use either was two full-chunk
+     * device passes thrown away — a third of the thread's service time, for a dimension whose
+     * settings say it has none.
+     */
+    private final boolean oreVeinsEnabled;
+
     private boolean closed;
 
     private GpuChunkFiller(CudaContext context, RandomState randomState, NoiseGeneratorSettings settings) {
@@ -84,8 +95,13 @@ public final class GpuChunkFiller implements AutoCloseable {
         this.preliminarySurface = lower(router.preliminarySurfaceLevel());
 
         this.densityEvaluator = DensityEvaluatorGpu.forProgram(context, density, this.geometry);
-        this.veinToggleEvaluator = DensityEvaluatorGpu.forProgram(context, veinToggle, this.geometry);
-        this.veinRidgedEvaluator = DensityEvaluatorGpu.forProgram(context, veinRidged, this.geometry);
+        this.oreVeinsEnabled = settings.oreVeinsEnabled();
+        this.veinToggleEvaluator = this.oreVeinsEnabled
+                ? DensityEvaluatorGpu.forProgram(context, veinToggle, this.geometry)
+                : null;
+        this.veinRidgedEvaluator = this.oreVeinsEnabled
+                ? DensityEvaluatorGpu.forProgram(context, veinRidged, this.geometry)
+                : null;
     }
 
     public static GpuChunkFiller create(CudaContext context, RandomState randomState,
@@ -109,8 +125,10 @@ public final class GpuChunkFiller implements AutoCloseable {
 
         if (this.densities == null) {
             this.densities = new double[count];
-            this.veinToggleValues = new double[count];
-            this.veinRidgedValues = new double[count];
+            if (this.oreVeinsEnabled) {
+                this.veinToggleValues = new double[count];
+                this.veinRidgedValues = new double[count];
+            }
         }
         double[] densities = this.densities;
         double[] veinToggleValues = this.veinToggleValues;
@@ -121,10 +139,12 @@ public final class GpuChunkFiller implements AutoCloseable {
         // bits and InterpolationOrderTest pins it down.
         this.densityEvaluator.blocksForChunk(this.geometry, chunkX, chunkZ,
                 CornerInterpolation.LERP3, densities);
-        this.veinToggleEvaluator.blocksForChunk(this.geometry, chunkX, chunkZ,
-                CornerInterpolation.INCREMENTAL, veinToggleValues);
-        this.veinRidgedEvaluator.blocksForChunk(this.geometry, chunkX, chunkZ,
-                CornerInterpolation.INCREMENTAL, veinRidgedValues);
+        if (this.oreVeinsEnabled) {
+            this.veinToggleEvaluator.blocksForChunk(this.geometry, chunkX, chunkZ,
+                    CornerInterpolation.INCREMENTAL, veinToggleValues);
+            this.veinRidgedEvaluator.blocksForChunk(this.geometry, chunkX, chunkZ,
+                    CornerInterpolation.INCREMENTAL, veinRidgedValues);
+        }
 
         MaterialRules.RouterNoises noises = new MaterialRules.RouterNoises(
                 MaterialRules.entry(this.barrierNoise, this.barrierNoise.program(), chunkX, chunkZ),
@@ -134,8 +154,8 @@ public final class GpuChunkFiller implements AutoCloseable {
                 MaterialRules.entry(this.erosion, this.erosion.program(), chunkX, chunkZ),
                 MaterialRules.entry(this.depth, this.depth.program(), chunkX, chunkZ),
                 MaterialRules.entry(this.veinGap, this.veinGap.program(), chunkX, chunkZ),
-                (x, y, z) -> veinToggleValues[index(x, y, z, chunkX, chunkZ, minY, height)],
-                (x, y, z) -> veinRidgedValues[index(x, y, z, chunkX, chunkZ, minY, height)]);
+                (x, y, z) -> veinValue(veinToggleValues, "veinToggle", x, y, z, chunkX, chunkZ, minY, height),
+                (x, y, z) -> veinValue(veinRidgedValues, "veinRidged", x, y, z, chunkX, chunkZ, minY, height));
 
         MaterialRules rules = MaterialRules.forChunk(noises, surfaceLevels(), fluidPicker(),
                 VanillaRandomExport.export(this.randomState.aquiferRandom()),
@@ -168,6 +188,22 @@ public final class GpuChunkFiller implements AutoCloseable {
             }
         }
         return new EmittedChunk(ids, fluidUpdates);
+    }
+
+    /**
+     * Reads a vein value that the caller has already computed for the whole chunk.
+     *
+     * <p>The null check is not defensive coding: when ore veins are off the arrays are never filled,
+     * and a read means the material rules started asking for them without the gate that is supposed
+     * to stop them. Failing loudly there is the point — a stale or zero value would produce plausible
+     * terrain with the wrong ore in it.
+     */
+    private static double veinValue(double[] values, String name, int x, int y, int z,
+            int chunkX, int chunkZ, int minY, int height) {
+        if (values == null) {
+            throw new IllegalStateException(name + " was read while ore veins are disabled");
+        }
+        return values[index(x, y, z, chunkX, chunkZ, minY, height)];
     }
 
     /**
@@ -259,6 +295,9 @@ public final class GpuChunkFiller implements AutoCloseable {
         this.closed = true;
         for (DensityEvaluatorGpu evaluator : new DensityEvaluatorGpu[] {
                 this.densityEvaluator, this.veinToggleEvaluator, this.veinRidgedEvaluator}) {
+            if (evaluator == null) {
+                continue;
+            }
             try {
                 evaluator.close();
             } catch (RuntimeException ignored) {

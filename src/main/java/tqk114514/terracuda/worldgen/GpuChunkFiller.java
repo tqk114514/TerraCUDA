@@ -1,5 +1,7 @@
 package tqk114514.terracuda.worldgen;
 
+import java.util.concurrent.LinkedBlockingQueue;
+
 import net.minecraft.world.level.block.Block;
 import net.minecraft.world.level.block.state.BlockState;
 import net.minecraft.world.level.chunk.ChunkAccess;
@@ -21,8 +23,8 @@ import tqk114514.terracuda.density.DensityProgram;
 import tqk114514.terracuda.gpu.DensityEvaluatorGpu;
 
 /**
- * Produces a chunk's blocks: the density comes from the device, the material rules run here, and the
- * result is written into the chunk.
+ * Produces a chunk's blocks: the density comes from the device, the material rules run on a CPU, and
+ * the result is written into the chunk.
  *
  * <p>This is M3's K3 and K4 joined up, and it is a hybrid on purpose. The design doc puts the material
  * rules in the K3 kernel too, but they are branch- and table-driven rather than floating-point heavy —
@@ -30,9 +32,16 @@ import tqk114514.terracuda.gpu.DensityEvaluatorGpu;
  * on the device. Moving the aquifer across would mean a per-thread copy of its grid and caches for
  * very little gain, so it stays here until something measures otherwise.
  *
- * <p>Everything is per world: the lowered programs and the device buffers are built once and reused for
- * every chunk. Not thread-safe — one instance belongs to one thread, which is why
- * {@link GpuWorldgenService} owns it from a single dedicated thread.
+ * <p>The class is split at that same seam, because the halves measured differently: the rules and the
+ * write-back were 6.3 of the 11.6 ms the device thread spent per chunk, all of it CPU work serialised
+ * behind the device. In takeover the halves run on different threads — the device thread produces
+ * {@link DensityBuffers} and a rules worker consumes them — while shadow mode and the tests use the
+ * synchronous composition, {@link #blockIds}. Each half is single-threaded by ownership: the
+ * evaluators are touched only by the device half, the interpreters and the replay only by the rules
+ * half, and the buffer pool is the single crossing point.
+ *
+ * <p>Everything is per world: the lowered programs and the device buffers are built once and reused
+ * for every chunk.
  */
 public final class GpuChunkFiller implements AutoCloseable {
 
@@ -54,28 +63,39 @@ public final class GpuChunkFiller implements AutoCloseable {
     private final DensityEvaluatorGpu veinRidgedEvaluator;
 
     /**
-     * The three per-block arrays, reused across chunks.
+     * One chunk's device-produced values, on loan from {@link #bufferPool} until
+     * {@link #applyRules} returns them.
      *
-     * <p>Each is 786 KB and there are three, so filling them fresh every chunk would hand the
-     * collector about two and a half megabytes a chunk for nothing. They belong to different
-     * evaluators, so all three are live at once and none can share.
+     * <p>Each array is 786 KB, so a set is about two and a half megabytes when veins are on; they are
+     * pooled because handing the collector a fresh set per chunk measured as page faults that cost
+     * more than the copy the arrays exist to hold. The two vein arrays are {@code null} when the
+     * world has no ore veins, mirroring the evaluators that would fill them.
      */
-    private double[] densities;
-    private double[] veinToggleValues;
-    private double[] veinRidgedValues;
+    public record DensityBuffers(double[] density, double[] veinToggle, double[] veinRidged) {
+    }
+
+    /**
+     * Free buffer sets. Unbounded in principle, bounded in practice by the chunks in flight: the
+     * device thread borrows a set, the rules worker returns it, and the worker queue in front of it
+     * has a fixed capacity that the device thread blocks on rather than outrunning.
+     */
+    private final LinkedBlockingQueue<DensityBuffers> bufferPool = new LinkedBlockingQueue<>();
 
     /** Read once: a per-chunk branch on a volatile-free static is not worth the noise. */
     private static final boolean TIMING = TerracudaConfig.timing();
 
-    private long emitNanos;
-    private long replayNanos;
-    private int filledChunks;
-
-    /** A finer split of {@link #emitNanos}: the density program, the two vein programs, the rules. */
-    private long densityNanos;
-    private long veinNanos;
-    private long rulesNanos;
-    private int emittedChunks;
+    /**
+     * A finer split of the chunk's time: the density program, the two vein programs, the rules, and
+     * the write-back. Each is written by exactly one thread — the first two by the device half, the
+     * last two by the rules half — and read across threads only by the periodic timing report, so
+     * they are volatile for visibility and the report tolerates a straddling window.
+     */
+    private volatile long densityNanos;
+    private volatile long veinNanos;
+    private volatile long rulesNanos;
+    private volatile long replayNanos;
+    private volatile int emittedChunks;
+    private volatile int filledChunks;
 
     /**
      * Whether the material rules will ever ask for a vein value.
@@ -123,96 +143,124 @@ public final class GpuChunkFiller implements AutoCloseable {
         return new GpuChunkFiller(context, randomState, settings);
     }
 
-    /** One chunk's blocks, indexed {@code (x * 16 + z) * height + (y - minY)}. */
-    public EmittedChunk blockIds(int chunkX, int chunkZ) {
-        int minY = this.geometry.minY();
-        int height = this.geometry.height();
-        int count = 16 * 16 * height;
-
-        // The material rules read router entries through interpreters, and a flat cache inside one
-        // of those needs to know which chunk's columns it is answering for.
-        for (DensityInterpreter interpreter : new DensityInterpreter[] {
-                this.barrierNoise, this.floodedness, this.spread, this.lava, this.erosion,
-                this.depth, this.veinGap, this.preliminarySurface}) {
-            interpreter.setChunk(chunkX * 16, chunkZ * 16);
-        }
-
-        if (this.densities == null) {
-            this.densities = new double[count];
-            if (this.oreVeinsEnabled) {
-                this.veinToggleValues = new double[count];
-                this.veinRidgedValues = new double[count];
-            }
-        }
-        double[] densities = this.densities;
-        double[] veinToggleValues = this.veinToggleValues;
-        double[] veinRidgedValues = this.veinRidgedValues;
+    /**
+     * The device half of one chunk: every density the material rules will read, in borrowed buffers.
+     *
+     * <p>Runs on the device thread. The buffers are on loan until handed to {@link #applyRules},
+     * which returns them; the synchronous composition does that immediately, the takeover pipeline
+     * does it on the rules worker after the chunk crosses the queue.
+     *
+     * <p>final_density is a cache_all_in_cell marker, so the rules see the lerp3 blend; the vein
+     * functions are read straight, so they take the incremental one. The difference is in the last
+     * bits and InterpolationOrderTest pins it down.
+     */
+    public DensityBuffers emitDensities(int chunkX, int chunkZ) {
+        int count = 16 * 16 * this.geometry.height();
+        DensityBuffers buffers = acquireBuffers(count);
 
         long began = TIMING ? System.nanoTime() : 0L;
-        // final_density is a cache_all_in_cell marker, so the rules see the lerp3 blend; the vein
-        // functions are read straight, so they take the incremental one. The difference is in the last
-        // bits and InterpolationOrderTest pins it down.
         this.densityEvaluator.blocksForChunk(this.geometry, chunkX, chunkZ,
-                CornerInterpolation.LERP3, densities);
+                CornerInterpolation.LERP3, buffers.density());
         long densityAt = TIMING ? System.nanoTime() : 0L;
         if (this.oreVeinsEnabled) {
             this.veinToggleEvaluator.blocksForChunk(this.geometry, chunkX, chunkZ,
-                    CornerInterpolation.INCREMENTAL, veinToggleValues);
+                    CornerInterpolation.INCREMENTAL, buffers.veinToggle());
             this.veinRidgedEvaluator.blocksForChunk(this.geometry, chunkX, chunkZ,
-                    CornerInterpolation.INCREMENTAL, veinRidgedValues);
+                    CornerInterpolation.INCREMENTAL, buffers.veinRidged());
         }
         long veinsAt = TIMING ? System.nanoTime() : 0L;
         if (TIMING) {
             this.densityNanos += densityAt - began;
             this.veinNanos += veinsAt - densityAt;
         }
+        return buffers;
+    }
 
-        MaterialRules.RouterNoises noises = new MaterialRules.RouterNoises(
-                MaterialRules.entry(this.barrierNoise, this.barrierNoise.program(), chunkX, chunkZ),
-                MaterialRules.entry(this.floodedness, this.floodedness.program(), chunkX, chunkZ),
-                MaterialRules.entry(this.spread, this.spread.program(), chunkX, chunkZ),
-                MaterialRules.entry(this.lava, this.lava.program(), chunkX, chunkZ),
-                MaterialRules.entry(this.erosion, this.erosion.program(), chunkX, chunkZ),
-                MaterialRules.entry(this.depth, this.depth.program(), chunkX, chunkZ),
-                MaterialRules.entry(this.veinGap, this.veinGap.program(), chunkX, chunkZ),
-                (x, y, z) -> veinValue(veinToggleValues, "veinToggle", x, y, z, chunkX, chunkZ, minY, height),
-                (x, y, z) -> veinValue(veinRidgedValues, "veinRidged", x, y, z, chunkX, chunkZ, minY, height));
+    /**
+     * The CPU half of one chunk: the material rules over values the device already produced, plus
+     * the fluid-update bitmap {@code doFill} maintains.
+     *
+     * <p>Runs on the rules worker in takeover, on the caller in the synchronous composition. The
+     * interpreters it reads carry per-chunk state ({@code setChunk} for the flat caches), which is
+     * why this half must be single-threaded: two chunks through it at once would answer each
+     * other's columns.
+     */
+    public EmittedChunk applyRules(int chunkX, int chunkZ, DensityBuffers buffers) {
+        int minY = this.geometry.minY();
+        int height = this.geometry.height();
+        long began = TIMING ? System.nanoTime() : 0L;
+        try {
+            // The material rules read router entries through interpreters, and a flat cache inside one
+            // of those needs to know which chunk's columns it is answering for.
+            for (DensityInterpreter interpreter : new DensityInterpreter[] {
+                    this.barrierNoise, this.floodedness, this.spread, this.lava, this.erosion,
+                    this.depth, this.veinGap, this.preliminarySurface}) {
+                interpreter.setChunk(chunkX * 16, chunkZ * 16);
+            }
 
-        MaterialRules rules = MaterialRules.forChunk(noises, surfaceLevels(), fluidPicker(),
-                VanillaRandomExport.export(this.randomState.aquiferRandom()),
-                VanillaRandomExport.export(this.randomState.oreRandom()), chunkX, chunkZ, this.geometry,
-                this.settings.isAquifersEnabled(), this.settings.oreVeinsEnabled());
+            double[] densities = buffers.density();
+            double[] veinToggleValues = buffers.veinToggle();
+            double[] veinRidgedValues = buffers.veinRidged();
 
-        BlockState defaultBlock = this.settings.defaultBlock();
-        int chunkMinBlockX = chunkX * 16;
-        int chunkMinBlockZ = chunkZ * 16;
-        int[] ids = new int[count];
-        long[] fluidUpdates = new long[(count + 63) >>> 6];
+            MaterialRules.RouterNoises noises = new MaterialRules.RouterNoises(
+                    MaterialRules.entry(this.barrierNoise, this.barrierNoise.program(), chunkX, chunkZ),
+                    MaterialRules.entry(this.floodedness, this.floodedness.program(), chunkX, chunkZ),
+                    MaterialRules.entry(this.spread, this.spread.program(), chunkX, chunkZ),
+                    MaterialRules.entry(this.lava, this.lava.program(), chunkX, chunkZ),
+                    MaterialRules.entry(this.erosion, this.erosion.program(), chunkX, chunkZ),
+                    MaterialRules.entry(this.depth, this.depth.program(), chunkX, chunkZ),
+                    MaterialRules.entry(this.veinGap, this.veinGap.program(), chunkX, chunkZ),
+                    (x, y, z) -> veinValue(veinToggleValues, "veinToggle", x, y, z, chunkX, chunkZ, minY, height),
+                    (x, y, z) -> veinValue(veinRidgedValues, "veinRidged", x, y, z, chunkX, chunkZ, minY, height));
 
-        for (int yLocal = 0; yLocal < height; yLocal++) {
-            int y = minY + yLocal;
-            for (int x = 0; x < 16; x++) {
-                for (int z = 0; z < 16; z++) {
-                    int blockIndex = (x * 16 + z) * height + yLocal;
-                    double value = densities[blockIndex];
-                    BlockState state = rules.compute(chunkMinBlockX + x, y, chunkMinBlockZ + z, value);
-                    if (state == null) {
-                        state = defaultBlock;
-                    }
-                    ids[blockIndex] = Block.getId(state);
-                    // doFill's condition, in the same place it evaluates it: inside the branch that
-                    // actually writes a block.
-                    if (rules.shouldScheduleFluidUpdate() && !state.getFluidState().isEmpty()) {
-                        fluidUpdates[blockIndex >>> 6] |= 1L << (blockIndex & 63);
+            MaterialRules rules = MaterialRules.forChunk(noises, surfaceLevels(), fluidPicker(),
+                    VanillaRandomExport.export(this.randomState.aquiferRandom()),
+                    VanillaRandomExport.export(this.randomState.oreRandom()), chunkX, chunkZ, this.geometry,
+                    this.settings.isAquifersEnabled(), this.settings.oreVeinsEnabled());
+
+            BlockState defaultBlock = this.settings.defaultBlock();
+            int chunkMinBlockX = chunkX * 16;
+            int chunkMinBlockZ = chunkZ * 16;
+            int[] ids = new int[16 * 16 * height];
+            long[] fluidUpdates = new long[(ids.length + 63) >>> 6];
+
+            for (int yLocal = 0; yLocal < height; yLocal++) {
+                int y = minY + yLocal;
+                for (int x = 0; x < 16; x++) {
+                    for (int z = 0; z < 16; z++) {
+                        int blockIndex = (x * 16 + z) * height + yLocal;
+                        double value = densities[blockIndex];
+                        BlockState state = rules.compute(chunkMinBlockX + x, y, chunkMinBlockZ + z, value);
+                        if (state == null) {
+                            state = defaultBlock;
+                        }
+                        ids[blockIndex] = Block.getId(state);
+                        // doFill's condition, in the same place it evaluates it: inside the branch that
+                        // actually writes a block.
+                        if (rules.shouldScheduleFluidUpdate() && !state.getFluidState().isEmpty()) {
+                            fluidUpdates[blockIndex >>> 6] |= 1L << (blockIndex & 63);
+                        }
                     }
                 }
             }
+            return new EmittedChunk(ids, fluidUpdates);
+        } finally {
+            if (TIMING) {
+                this.rulesNanos += System.nanoTime() - began;
+                this.emittedChunks++;
+            }
+            releaseBuffers(buffers);
         }
-        if (TIMING) {
-            this.rulesNanos += System.nanoTime() - veinsAt;
-            this.emittedChunks++;
-        }
-        return new EmittedChunk(ids, fluidUpdates);
+    }
+
+    /**
+     * One chunk's blocks, indexed {@code (x * 16 + z) * height + (y - minY)}.
+     *
+     * <p>The synchronous composition: both halves on the calling thread, which is what shadow mode
+     * and the tests want. Takeover does not come through here — it runs the halves as a pipeline.
+     */
+    public EmittedChunk blockIds(int chunkX, int chunkZ) {
+        return applyRules(chunkX, chunkZ, emitDensities(chunkX, chunkZ));
     }
 
     /**
@@ -232,13 +280,13 @@ public final class GpuChunkFiller implements AutoCloseable {
     }
 
     /**
-     * Emits the chunk's blocks and writes them into {@code chunk}.
+     * The rules half plus the write-back: turns one chunk's borrowed buffers into written blocks.
      *
-     * <p>The sections are held for the duration, the way {@code fillFromNoise} holds them around
-     * {@code doFill}: the write is not atomic, and another thread may reach the chunk while it is
-     * being filled.
+     * <p>Runs on the rules worker in takeover. The sections are held for the duration, the way
+     * {@code fillFromNoise} holds them around {@code doFill}: the write is not atomic, and another
+     * thread may reach the chunk while it is being filled.
      */
-    public void fill(ChunkAccess chunk) {
+    public void fill(ChunkAccess chunk, DensityBuffers buffers) {
         int minY = this.geometry.minY();
         int height = this.geometry.height();
         int top = chunk.getSectionIndex(minY + height - 1);
@@ -251,17 +299,11 @@ public final class GpuChunkFiller implements AutoCloseable {
             held.add(section);
         }
         try {
-            // The two halves are timed separately because the offline profile only covers the first
-            // one: ChunkPassProfileTest measures blockIds, and the write-back was never included
-            // because that profile was taken in shadow mode, where nothing is written.
-            long began = TIMING ? System.nanoTime() : 0L;
-            EmittedChunk emitted = blockIds(chunk.getPos().x(), chunk.getPos().z());
-            long emittedAt = TIMING ? System.nanoTime() : 0L;
+            EmittedChunk emitted = applyRules(chunk.getPos().x(), chunk.getPos().z(), buffers);
+            long rulesDone = TIMING ? System.nanoTime() : 0L;
             ChunkReplay.write(chunk, emitted, this.geometry);
             if (TIMING) {
-                long writtenAt = System.nanoTime();
-                this.emitNanos += emittedAt - began;
-                this.replayNanos += writtenAt - emittedAt;
+                this.replayNanos += System.nanoTime() - rulesDone;
                 this.filledChunks++;
             }
         } finally {
@@ -271,22 +313,21 @@ public final class GpuChunkFiller implements AutoCloseable {
         }
     }
 
-    /** Cumulative nanoseconds spent producing blocks, since the last {@link #resetTiming()}. */
-    public long emitNanos() {
-        return this.emitNanos;
+    private DensityBuffers acquireBuffers(int count) {
+        DensityBuffers buffers = this.bufferPool.poll();
+        if (buffers == null) {
+            buffers = new DensityBuffers(new double[count],
+                    this.oreVeinsEnabled ? new double[count] : null,
+                    this.oreVeinsEnabled ? new double[count] : null);
+        }
+        return buffers;
     }
 
-    /** Cumulative nanoseconds spent writing them into the chunk, since the last reset. */
-    public long replayNanos() {
-        return this.replayNanos;
+    private void releaseBuffers(DensityBuffers buffers) {
+        this.bufferPool.offer(buffers);
     }
 
-    /** Chunks filled since the last reset; zero in shadow mode, which never writes a chunk. */
-    public int filledChunks() {
-        return this.filledChunks;
-    }
-
-    /** Nanoseconds in the density program, across every {@link #blockIds} call since the reset. */
+    /** Nanoseconds in the density program, across every emit since the last {@link #resetTiming()}. */
     public long densityNanos() {
         return this.densityNanos;
     }
@@ -296,24 +337,33 @@ public final class GpuChunkFiller implements AutoCloseable {
         return this.veinNanos;
     }
 
-    /** Nanoseconds in the per-block material-rules loop; this one is on the CPU. */
+    /** Nanoseconds in the material rules; this half runs on a CPU. */
     public long rulesNanos() {
         return this.rulesNanos;
     }
 
-    /** Blocks emitted since the reset, which is what the three figures above divide by. */
+    /** Nanoseconds writing emitted blocks into chunks; zero in shadow mode, which writes nothing. */
+    public long replayNanos() {
+        return this.replayNanos;
+    }
+
+    /** Blocks emitted since the reset, which is what the segment figures divide by. */
     public int emittedChunks() {
         return this.emittedChunks;
     }
 
+    /** Chunks written since the reset; zero in shadow mode, which never writes a chunk. */
+    public int filledChunks() {
+        return this.filledChunks;
+    }
+
     public void resetTiming() {
-        this.emitNanos = 0L;
-        this.replayNanos = 0L;
-        this.filledChunks = 0;
         this.densityNanos = 0L;
         this.veinNanos = 0L;
         this.rulesNanos = 0L;
+        this.replayNanos = 0L;
         this.emittedChunks = 0;
+        this.filledChunks = 0;
     }
 
     private MaterialRules.SurfaceLevels surfaceLevels() {

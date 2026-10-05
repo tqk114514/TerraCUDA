@@ -30,9 +30,12 @@ import tqk114514.terracuda.config.TerracudaConfig;
 /**
  * Owns the GPU side of world generation for one {@link RandomState}.
  *
- * <p>The CUDA context is thread-affine and the device work is serialised anyway, so this runs a single
- * dedicated thread that creates the context, builds the density program and executes submitted jobs.
- * Chunk generation happens on several {@code wgen_fill_noise} dispatcher threads, and none of them may
+ * <p>The CUDA context is thread-affine and the device work is serialised anyway, so the device half
+ * runs on a single dedicated thread that creates the context, builds the density program and emits
+ * chunk densities. The CPU half of a chunk — the material rules and the write-back — runs on a rules
+ * worker, handed buffers across a bounded queue: that is the measured 6.3 of the old 11.6 ms of
+ * service time, all of it CPU work that used to serialise the device thread behind it. Chunk
+ * generation happens on several {@code wgen_fill_noise} dispatcher threads, and none of them may
  * touch the context directly.
  *
  * <p>Two ways in, and the difference matters. {@link #fill} hands back a future and returns at once, so
@@ -49,6 +52,18 @@ public final class GpuWorldgenService implements AutoCloseable {
 
     private static final int QUEUE_CAPACITY = 64;
 
+    /**
+     * Chunks waiting for their rules and write-back, handed from the device thread to the rules
+     * worker.
+     *
+     * <p>Bounded on purpose: when it is full the device thread blocks on the hand-off, which is the
+     * backpressure — the producer slows to the consumer instead of converting queue depth into
+     * two-and-a-half-megabyte buffer sets. The queue in front of the device thread is what turns
+     * overload into a vanilla fallback; this one is inside the pipeline, where waiting is the
+     * intended behaviour.
+     */
+    private static final int REPLAY_CAPACITY = 4;
+
     /** One service per world. Released on server stop — see {@link #releaseAll()}. */
     private static final Map<RandomState, GpuWorldgenService> SERVICES = new ConcurrentHashMap<>();
     private static final int INIT_TIMEOUT_SECONDS = 30;
@@ -58,9 +73,16 @@ public final class GpuWorldgenService implements AutoCloseable {
         void run(GpuChunkFiller filler);
     }
 
+    /** One chunk handed between the halves of the pipeline. */
+    private record ReplayJob(GpuChunkFiller filler, ChunkAccess chunk,
+            GpuChunkFiller.DensityBuffers buffers, CompletableFuture<Void> done) {
+    }
+
     private final BlockingQueue<Job> jobs = new ArrayBlockingQueue<>(QUEUE_CAPACITY);
+    private final BlockingQueue<ReplayJob> replayJobs = new ArrayBlockingQueue<>(REPLAY_CAPACITY);
     private final CountDownLatch initialised = new CountDownLatch(1);
     private final Thread thread;
+    private Thread replayThread;
 
     private volatile boolean ready;
     private volatile String unavailableReason = "not started";
@@ -177,6 +199,36 @@ public final class GpuWorldgenService implements AutoCloseable {
     }
 
     /**
+     * The rules worker: applies the material rules and writes chunks, one at a time.
+     *
+     * <p>Single-threaded on purpose. The router interpreters it reads carry per-chunk state (the
+     * flat-cache gate answers for the chunk the rules are asking about), so two chunks through this
+     * loop at once would answer each other's columns. The work it owns measured at 6.3 ms a chunk,
+     * which one thread drains at roughly 160 chunks/s — above anything upstream has been observed to
+     * supply — and the queue in front of it is what makes the device thread wait rather than wander.
+     */
+    private void runReplay() {
+        try {
+            // Drains before exiting: a handed-over chunk whose future never completes would hang the
+            // stage that is waiting on it, and the fallback only fires on failure, not on silence.
+            while (!this.closed || !this.replayJobs.isEmpty()) {
+                ReplayJob job = this.replayJobs.poll(200, TimeUnit.MILLISECONDS);
+                if (job == null) {
+                    continue;
+                }
+                try {
+                    job.filler().fill(job.chunk(), job.buffers());
+                    job.done().complete(null);
+                } catch (Throwable t) {
+                    job.done().completeExceptionally(t);
+                }
+            }
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+        }
+    }
+
+    /**
      * Logs what the GPU thread did over the last {@value #TIMING_EVERY} jobs, then starts a new
      * window.
      *
@@ -195,7 +247,6 @@ public final class GpuWorldgenService implements AutoCloseable {
         double busyPct = 100.0 * this.busyNanos / wall;
         double serviceMs = this.busyNanos / 1.0e6 / this.timedJobs;
 
-        int filled = this.filler == null ? 0 : this.filler.filledChunks();
         StringBuilder message = new StringBuilder(128)
                 .append("TerraCUDA: GPU thread ").append(String.format("%.1f", perSecond))
                 .append(" chunks/s, busy ").append(String.format("%.1f", busyPct))
@@ -212,21 +263,17 @@ public final class GpuWorldgenService implements AutoCloseable {
                     .append(", p95 ").append(String.format("%.1f", percentile(window, 95) / 1.0e6))
                     .append(")");
         }
-        if (filled > 0) {
-            // Only takeover fills chunks; shadow mode has no write-back to report.
-            message.append(" (emit ").append(String.format("%.1f", this.filler.emitNanos() / 1.0e6 / filled))
-                    .append(" + replay ").append(String.format("%.1f", this.filler.replayNanos() / 1.0e6 / filled))
-                    .append(")");
-        }
         int emitted = this.filler == null ? 0 : this.filler.emittedChunks();
         if (emitted > 0) {
-            // Where emit goes: the density program, the two vein programs, and the per-block rules
-            // loop. Three numbers rather than one because the first two are device passes that a
-            // future change could skip, and the third is CPU work a future change could move.
+            // Where the time goes: the density program and the two vein programs run on the device
+            // thread, the rules loop and the write-back on the rules worker. Four numbers rather than
+            // one because the halves live on different threads now and can move independently.
+            // Shadow mode shows replay as zero, because it never writes a chunk.
             double millis = 1.0e6 * emitted;
             message.append(" [density ").append(String.format("%.1f", this.filler.densityNanos() / millis))
                     .append(", veins ").append(String.format("%.1f", this.filler.veinNanos() / millis))
                     .append(", rules ").append(String.format("%.1f", this.filler.rulesNanos() / millis))
+                    .append(", replay ").append(String.format("%.1f", this.filler.replayNanos() / millis))
                     .append("]");
         }
         message.append(" over ").append(this.timedJobs).append(" chunks");
@@ -265,6 +312,9 @@ public final class GpuWorldgenService implements AutoCloseable {
         CudaKernels.loadModule(this.context, device);
 
         this.filler = GpuChunkFiller.create(this.context, randomState, settings);
+        this.replayThread = new Thread(this::runReplay, "TerraCUDA-replay");
+        this.replayThread.setDaemon(true);
+        this.replayThread.start();
         this.ready = true;
         this.unavailableReason = "";
     }
@@ -280,11 +330,12 @@ public final class GpuWorldgenService implements AutoCloseable {
     }
 
     /**
-     * Emits one chunk's blocks and writes them into {@code chunk}, on the GPU thread.
+     * Emits one chunk's densities on the device thread and hands it to the rules worker.
      *
-     * <p>Returns immediately. The future completes once the chunk has been written, or completes
-     * exceptionally if the device path could not do it — the caller is expected to fall back to
-     * vanilla in that case, which is why this reports failure rather than swallowing it.
+     * <p>Returns immediately. The future completes once the worker has applied the rules and
+     * written the chunk, or completes exceptionally if either half could not do its part — the
+     * caller is expected to fall back to vanilla in that case, which is why this reports failure
+     * rather than swallowing it.
      */
     public CompletableFuture<Void> fill(ChunkAccess chunk) {
         CompletableFuture<Void> done = new CompletableFuture<>();
@@ -294,8 +345,11 @@ public final class GpuWorldgenService implements AutoCloseable {
         }
         Job job = filler -> {
             try {
-                filler.fill(chunk);
-                done.complete(null);
+                GpuChunkFiller.DensityBuffers buffers =
+                        filler.emitDensities(chunk.getPos().x(), chunk.getPos().z());
+                // A blocking hand-off: when the rules worker is REPLAY_CAPACITY chunks behind, the
+                // device thread waits here rather than running ahead in memory.
+                this.replayJobs.put(new ReplayJob(filler, chunk, buffers, done));
             } catch (Throwable t) {
                 done.completeExceptionally(t);
             }

@@ -197,7 +197,8 @@ public abstract class NoiseBasedChunkGeneratorMixin {
      *
      * <p>Only the takeover path samples: its latency was declared the price of the mod, while the
      * shadow path's number is a service profile already covered by {@code ChunkPassProfileTest}.
-     * Takeover completions are serialised on the single GPU thread, so plain fields are safe.
+     * Takeover completions are serialised on the single rules worker — the pipeline hands each
+     * chunk across and completes it there, one at a time — so plain fields are safe.
      */
     private static void sampleLatency(long micros) {
         long[] samples = LATENCY_SAMPLES;

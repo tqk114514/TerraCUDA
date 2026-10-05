@@ -176,5 +176,46 @@ public abstract class NoiseBasedChunkGeneratorMixin {
             TerraCUDA.LOGGER.info("TerraCUDA{}: chunk {} in {} us ({} chunks seen)",
                     takeover ? "" : " shadow", pos, micros, count);
         }
+        if (takeover && TerracudaConfig.timing()) {
+            sampleLatency(micros);
+        }
+    }
+
+    /**
+     * The takeover latencies held before a window is reported.
+     *
+     * <p>A window rather than a running sum because the question M4 left open was the tail, and an
+     * average cannot answer it: "every chunk takes 105 ms" and "most take 20 and a few take 800" are
+     * the same mean and very different queues.
+     */
+    private static final int LATENCY_WINDOW = 256;
+    private static final long[] LATENCY_SAMPLES = new long[LATENCY_WINDOW];
+    private static long latencyFilled;
+
+    /**
+     * Records one takeover completion's latency and reports percentiles when a window closes.
+     *
+     * <p>Only the takeover path samples: its latency was declared the price of the mod, while the
+     * shadow path's number is a service profile already covered by {@code ChunkPassProfileTest}.
+     * Takeover completions are serialised on the single GPU thread, so plain fields are safe.
+     */
+    private static void sampleLatency(long micros) {
+        long[] samples = LATENCY_SAMPLES;
+        samples[(int) (latencyFilled % LATENCY_WINDOW)] = micros;
+        if (++latencyFilled % LATENCY_WINDOW == 0) {
+            long[] window = samples.clone();
+            java.util.Arrays.sort(window);
+            TerraCUDA.LOGGER.info("TerraCUDA: noise-stage latency over the last {} chunks: "
+                            + "p50 {} us, p95 {} us, p99 {} us, max {} us",
+                    LATENCY_WINDOW,
+                    percentile(window, 50), percentile(window, 95), percentile(window, 99),
+                    window[window.length - 1]);
+        }
+    }
+
+    /** Nearest-rank percentile of a sorted array: the ceil(p · count)-th smallest sample. */
+    private static long percentile(long[] sorted, int hundredths) {
+        int rank = Math.min(sorted.length, (sorted.length * hundredths + 99) / 100);
+        return sorted[rank - 1];
     }
 }

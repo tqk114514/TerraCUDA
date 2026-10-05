@@ -80,6 +80,8 @@ public final class GpuWorldgenService implements AutoCloseable {
     private long busyNanos;
     private long timedJobs;
     private long windowStartNanos;
+    /** Per-job service times of the current window, kept for percentiles rather than a mean alone. */
+    private final long[] serviceNanos = new long[TIMING_EVERY];
 
     private CudaContext context;
     private GpuChunkFiller filler;
@@ -152,7 +154,9 @@ public final class GpuWorldgenService implements AutoCloseable {
                     long began = TIMING ? System.nanoTime() : 0L;
                     job.run(this.filler);
                     if (TIMING) {
-                        this.busyNanos += System.nanoTime() - began;
+                        long took = System.nanoTime() - began;
+                        this.busyNanos += took;
+                        this.serviceNanos[(int) (this.timedJobs % TIMING_EVERY)] = took;
                         if (this.timedJobs == 0L) {
                             this.windowStartNanos = began;
                         }
@@ -196,6 +200,18 @@ public final class GpuWorldgenService implements AutoCloseable {
                 .append("TerraCUDA: GPU thread ").append(String.format("%.1f", perSecond))
                 .append(" chunks/s, busy ").append(String.format("%.1f", busyPct))
                 .append("%, service ").append(String.format("%.1f", serviceMs)).append(" ms");
+        // The mean says how much capacity the thread has; the percentiles say what the mean hides.
+        // The first chunk's JIT, collector pauses, and a client sharing the CUDA device with its
+        // renderer all live in the tail, and the tail is what a queue feels like.
+        int samples = (int) Math.min(this.timedJobs, TIMING_EVERY);
+        if (samples > 0) {
+            long[] window = new long[samples];
+            System.arraycopy(this.serviceNanos, 0, window, 0, samples);
+            java.util.Arrays.sort(window);
+            message.append(" (p50 ").append(String.format("%.1f", percentile(window, 50) / 1.0e6))
+                    .append(", p95 ").append(String.format("%.1f", percentile(window, 95) / 1.0e6))
+                    .append(")");
+        }
         if (filled > 0) {
             // Only takeover fills chunks; shadow mode has no write-back to report.
             message.append(" (emit ").append(String.format("%.1f", this.filler.emitNanos() / 1.0e6 / filled))
@@ -222,6 +238,12 @@ public final class GpuWorldgenService implements AutoCloseable {
         if (this.filler != null) {
             this.filler.resetTiming();
         }
+    }
+
+    /** Nearest-rank percentile of a sorted array: the ceil(p · count)-th smallest sample. */
+    private static long percentile(long[] sorted, int hundredths) {
+        int rank = Math.min(sorted.length, (sorted.length * hundredths + 99) / 100);
+        return sorted[rank - 1];
     }
 
     private void initialise(RandomState randomState, NoiseGeneratorSettings settings) {

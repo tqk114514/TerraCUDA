@@ -70,7 +70,7 @@ settled an argument about this code.
 | M1 — FFM + a kernel | **done.** A million points through the CUDA `ImprovedNoise` match the Java reference bit for bit. |
 | M2 — K0/K1/K2 | **done.** `preliminary_surface_level` and every per-chunk marker table are computed on the device, bit-identically to the CPU reference. |
 | M3 — K3/K4 + chunk replay | **done.** The material rules are ported and reproduce vanilla's block for every one of 294912 blocks across three chunks; the chunk's blocks are produced end to end and written back, with the heightmaps and fluid-update flags `doFill` also maintains. |
-| M4 — batching, pinned buffers | **partly done, partly declined, partly open.** Batching was measured and declined, pinned buffers were not started, and the P95 latency report is the one item that is neither done nor decided. See [`docs/性能笔记.md`](docs/性能笔记.md). |
+| M4 — batching, pinned buffers, P95 | **settled, each on a measurement or a decision.** Batching was measured and declined, pinned buffers were dismissed by the same arithmetic, and the P95 latency report — the one item that was neither — is now built behind `-Ptiming`, which keeps per-chunk samples and reports percentiles rather than sums. See [`docs/性能笔记.md`](docs/性能笔记.md). |
 
 ## Trying it in a game
 

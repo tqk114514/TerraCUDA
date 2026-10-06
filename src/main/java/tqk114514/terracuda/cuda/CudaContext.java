@@ -190,14 +190,24 @@ public final class CudaContext implements AutoCloseable {
     public void copyToDevice(MemorySegment host, DeviceBuffer device) {
         long bytes = host.byteSize();
         requireFits(device, bytes, "copyToDevice");
-        driver.check(invokeInt(this.cuMemcpyHtoD, device.address(), host, bytes), "cuMemcpyHtoD");
+        try {
+            driver.check((int) this.cuMemcpyHtoD.invokeExact(device.address(), host, bytes),
+                    "cuMemcpyHtoD");
+        } catch (Throwable t) {
+            throw bindingFailure("cuMemcpyHtoD", t);
+        }
     }
 
     /** Copies a device buffer back into host memory. The host segment must fit inside the buffer. */
     public void copyFromDevice(DeviceBuffer device, MemorySegment host) {
         long bytes = host.byteSize();
         requireFits(device, bytes, "copyFromDevice");
-        driver.check(invokeInt(this.cuMemcpyDtoH, host, device.address(), bytes), "cuMemcpyDtoH");
+        try {
+            driver.check((int) this.cuMemcpyDtoH.invokeExact(host, device.address(), bytes),
+                    "cuMemcpyDtoH");
+        } catch (Throwable t) {
+            throw bindingFailure("cuMemcpyDtoH", t);
+        }
     }
 
     private static void requireFits(DeviceBuffer device, long bytes, String operation) {
@@ -210,16 +220,18 @@ public final class CudaContext implements AutoCloseable {
     /** Launches a kernel on the default stream with the given grid and block dimensions. */
     public void launch(String kernel, int gridX, int gridY, int gridZ,
             int blockX, int blockY, int blockZ, KernelArguments arguments) {
-        MemorySegment handle = function(kernel);
-        int result = invokeInt(this.cuLaunchKernel, handle,
-                gridX, gridY, gridZ, blockX, blockY, blockZ, 0,
-                MemorySegment.NULL, arguments.pointers(), MemorySegment.NULL);
-        driver.check(result, "cuLaunchKernel(" + kernel + ")");
+        driver.check(invokeLaunch(function(kernel), gridX, gridY, gridZ,
+                blockX, blockY, blockZ, MemorySegment.NULL, arguments.pointers()),
+                "cuLaunchKernel(" + kernel + ")");
     }
 
     /** Blocks until every previously issued call on the context has completed. */
     public void synchronize() {
-        driver.check(invokeInt(this.cuCtxSynchronize), "cuCtxSynchronize");
+        try {
+            driver.check((int) this.cuCtxSynchronize.invokeExact(), "cuCtxSynchronize");
+        } catch (Throwable t) {
+            throw bindingFailure("cuCtxSynchronize", t);
+        }
     }
 
     /**
@@ -249,7 +261,12 @@ public final class CudaContext implements AutoCloseable {
 
     /** Blocks until everything queued on {@code stream} has completed — and only that stream. */
     public void synchronizeStream(DeviceStream stream) {
-        driver.check(invokeInt(this.cuStreamSynchronize, stream.handle()), "cuStreamSynchronize");
+        try {
+            driver.check((int) this.cuStreamSynchronize.invokeExact(stream.handle()),
+                    "cuStreamSynchronize");
+        } catch (Throwable t) {
+            throw bindingFailure("cuStreamSynchronize", t);
+        }
     }
 
     /**
@@ -281,8 +298,12 @@ public final class CudaContext implements AutoCloseable {
     public void copyToDeviceAsync(MemorySegment host, DeviceBuffer device, DeviceStream stream) {
         long bytes = host.byteSize();
         requireFits(device, bytes, "copyToDeviceAsync");
-        driver.check(invokeInt(this.cuMemcpyHtoDAsync, device.address(), host, bytes, stream.handle()),
-                "cuMemcpyHtoDAsync");
+        try {
+            driver.check((int) this.cuMemcpyHtoDAsync.invokeExact(
+                    device.address(), host, bytes, stream.handle()), "cuMemcpyHtoDAsync");
+        } catch (Throwable t) {
+            throw bindingFailure("cuMemcpyHtoDAsync", t);
+        }
     }
 
     /**
@@ -293,8 +314,12 @@ public final class CudaContext implements AutoCloseable {
     public void copyFromDeviceAsync(DeviceBuffer device, MemorySegment host, DeviceStream stream) {
         long bytes = host.byteSize();
         requireFits(device, bytes, "copyFromDeviceAsync");
-        driver.check(invokeInt(this.cuMemcpyDtoHAsync, host, device.address(), bytes, stream.handle()),
-                "cuMemcpyDtoHAsync");
+        try {
+            driver.check((int) this.cuMemcpyDtoHAsync.invokeExact(
+                    host, device.address(), bytes, stream.handle()), "cuMemcpyDtoHAsync");
+        } catch (Throwable t) {
+            throw bindingFailure("cuMemcpyDtoHAsync", t);
+        }
     }
 
     /**
@@ -302,11 +327,30 @@ public final class CudaContext implements AutoCloseable {
      */
     public void launch(String kernel, int gridX, int gridY, int gridZ,
             int blockX, int blockY, int blockZ, KernelArguments arguments, DeviceStream stream) {
-        MemorySegment handle = function(kernel);
-        int result = invokeInt(this.cuLaunchKernel, handle,
-                gridX, gridY, gridZ, blockX, blockY, blockZ, 0,
-                stream.handle(), arguments.pointers(), MemorySegment.NULL);
-        driver.check(result, "cuLaunchKernel(" + kernel + ")");
+        driver.check(invokeLaunch(function(kernel), gridX, gridY, gridZ,
+                blockX, blockY, blockZ, stream.handle(), arguments.pointers()),
+                "cuLaunchKernel(" + kernel + ")");
+    }
+
+    /**
+     * Hot-path kernel launch via invokeExact: the generic invokeInt boxed eleven arguments on every
+     * call, which was the per-call overhead this change removes. The types must match the
+     * FunctionDescriptor exactly, or invokeExact throws at runtime — that is the contract.
+     */
+    private int invokeLaunch(MemorySegment function, int gridX, int gridY, int gridZ,
+            int blockX, int blockY, int blockZ, MemorySegment stream, MemorySegment params) {
+        try {
+            return (int) this.cuLaunchKernel.invokeExact(function,
+                    gridX, gridY, gridZ, blockX, blockY, blockZ, 0,
+                    stream, params, MemorySegment.NULL);
+        } catch (Throwable t) {
+            throw bindingFailure("cuLaunchKernel", t);
+        }
+    }
+
+    private CudaException bindingFailure(String name, Throwable t) {
+        return new CudaException(CudaException.BINDING_FAILURE, "CUDA_ERROR_BINDING",
+                "CUDA entry point could not be invoked: " + name, t);
     }
 
     /** Whether {@link #close()} has run. Buffer owners check this before freeing. */

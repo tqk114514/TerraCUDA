@@ -40,9 +40,13 @@ import tqk114514.terracuda.worldgen.FeaturesGate;
  *       already in flight. A large pregeneration has plenty of non-adjacent pairs.</li>
  * </ul>
  *
- * <p>The rest of the stages cost microseconds (STRUCTURE_STARTS 0.6 ms, BIOMES 67 µs, LIGHT,
- * SPAWN, FULL) and stay on the dispatcher; LIGHT is not thread-safe without the kind of audit
- * C2ME's {@code fixes-threading} modules represent, so it does not move either.
+ * <p>The rest of the stages cost microseconds (STRUCTURE_STARTS 0.6 ms, BIOMES 67 µs, SPAWN,
+ * FULL) but they add up to ~0.8 ms a chunk of serial dispatcher time that the pipeline's supply
+ * rate pays for. They have no declared write radius ({@code -1}), which means the Builder never
+ * set one — they write only their own chunk, the same safety argument as radius zero covers them,
+ * and STRUCTURE_STARTS was the largest remaining serial cost on the dispatcher. LIGHT stays on
+ * the dispatcher: the light engine's internal state has no thread-safety audit, and that is the
+ * kind of engineering C2ME's {@code fixes-threading} modules represent.
  *
  * <p>The wrap is on the {@code doWork} call rather than a rewrite of {@code apply}, so the status
  * bookkeeping, the profiling hook and the completion chain stay exactly vanilla on the dispatcher;
@@ -90,10 +94,10 @@ public abstract class ChunkStepMixin {
         }
 
         int radius = step.blockStateWriteRadius();
-        if (radius == 0) {
+        if (radius <= 0 && step.targetStatus() != net.minecraft.world.level.chunk.status.ChunkStatus.LIGHT) {
             if (REPORTED_RADIUS_ZERO.compareAndSet(false, true)) {
-                TerraCUDA.LOGGER.info("TerraCUDA: moving radius-zero stages off the serial "
-                        + "dispatcher ({})", step.targetStatus());
+                TerraCUDA.LOGGER.info("TerraCUDA: moving radius-{} stages off the serial "
+                        + "dispatcher ({})", radius, step.targetStatus());
             }
             // supplyAsync wraps doWork's own future in another future; thenCompose flattens the two
             // so the caller still sees the stage's completion, exactly as it would synchronously.

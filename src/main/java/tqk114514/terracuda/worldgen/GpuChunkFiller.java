@@ -312,14 +312,18 @@ public final class GpuChunkFiller implements AutoCloseable {
     }
 
     /**
-     * The rules half plus the write-back: turns one chunk's borrowed buffers into written blocks.
+     * The write-back half of the rules pipeline, on its own thread: turns one chunk's computed
+     * block states into written blocks, holding the sections for the duration the way
+     * {@code fillFromNoise} holds them around {@code doFill}.
      *
-     * <p>Runs on a rules worker in takeover, through that worker's own context. The sections are
-     * held for the duration, the way {@code fillFromNoise} holds them around {@code doFill}: the
-     * write is not atomic, and another thread may reach the chunk while it is being filled.
+     * <p>Split from {@link #applyRules} because the halves measured differently on the pipeline:
+     * the rules computation is 4.8 ms of CPU per chunk and the write is 2.1 ms of memory traffic,
+     * and running both on one worker meant the device thread waited 2 ms per chunk on the handoff
+     * that the combined 7 ms created. On separate threads the rules workers turn at 4.8 ms
+     * (~208/s each) and the write workers at 2.1 ms (~476/s each), and the device thread's
+     * queue drains before it fills.
      */
-    public void fill(ChunkAccess chunk, DensityBuffers buffers, RulesContext context,
-            Beardifier beardifier) {
+    public void writeChunk(ChunkAccess chunk, EmittedChunk emitted) {
         int minY = this.geometry.minY();
         int height = this.geometry.height();
         int top = chunk.getSectionIndex(minY + height - 1);
@@ -332,12 +336,10 @@ public final class GpuChunkFiller implements AutoCloseable {
             held.add(section);
         }
         try {
-            EmittedChunk emitted = applyRules(chunk.getPos().x(), chunk.getPos().z(), buffers,
-                    context, beardifier);
-            long rulesDone = TIMING ? System.nanoTime() : 0L;
+            long began = TIMING ? System.nanoTime() : 0L;
             ChunkReplay.write(chunk, emitted, this.geometry);
             if (TIMING) {
-                this.replayNanos.add(System.nanoTime() - rulesDone);
+                this.replayNanos.add(System.nanoTime() - began);
                 this.filledChunks.increment();
             }
         } finally {

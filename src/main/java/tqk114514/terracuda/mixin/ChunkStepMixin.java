@@ -56,19 +56,16 @@ public abstract class ChunkStepMixin {
     private static final AtomicBoolean REPORTED_FEATURES = new AtomicBoolean();
 
     /**
-     * The dedicated FEATURES executor, deliberately a single thread.
+     * The dedicated FEATURES executor, deliberately two threads behind a blocking gate.
      *
-     * <p>The first attempt ran FEATURES bodies in the shared {@code backgroundExecutor()} and
-     * measured 4.8 chunks/s: OreFeature's BulkSectionAccess blocks on PalettedContainer
-     * semaphores that the replay worker holds, and every blocked ForkJoinPool worker is a
-     * worker the NOISE stage body queued behind it cannot have. A dedicated thread makes the
-     * blocking irrelevant — the dispatcher is already free, the ForkJoinPool is untouched,
-     * and one thread cannot deadlock against itself on section semaphores.
-     *
-     * <p>One thread is also the right throughput: FEATURES costs ~4.3 ms a chunk, so one
-     * thread clears ~233/s, above anything the pipeline currently supplies (~155/s). A second
-     * thread would only pay its way when the rest of the pipeline runs past that, and it would
-     * reintroduce the cross-thread section locking that the write-area gate exists to prevent.
+     * <p>One thread ran at 77% utilization at the measured 180 cps and was the only single-thread
+     * left in the pipeline. Two threads double the ceiling to ~466/s — more than the device
+     * thread's ~285/s — and the write-area gate keeps them off each other's chunks: each stage
+     * blocking-acquires the 3×3 neighbourhood before running, so adjacent FEATURES stages
+     * queue behind each other rather than racing on section semaphores. The deadlock that killed
+     * the first attempt was the serial fallback running on the dispatcher against the dedicated
+     * thread; with both stages on gate-holding executor threads, one waits and the other
+     * finishes — no cycle.
      */
     private static final java.util.concurrent.ExecutorService FEATURES_EXECUTOR =
             java.util.concurrent.Executors.newSingleThreadExecutor(runnable -> {
@@ -111,13 +108,6 @@ public abstract class ChunkStepMixin {
                 TerraCUDA.LOGGER.info("TerraCUDA: moving FEATURES to a dedicated thread "
                         + "({})", TerracudaConfig.summary());
             }
-            // Always to the dedicated executor; never a serial fallback. The first version tried
-            // a gate: when a neighbour held the write area, the stage ran on the dispatcher —
-            // and that serial body then deadlocked against the dedicated thread's on section
-            // semaphores, each holding sections the other needed. One thread means no competing
-            // FEATURES and no circular dependency; the status system already keeps FEATURES and
-            // the replay pipeline off the same chunk. The gate infrastructure stays for the day
-            // a second thread earns its keep.
             return CompletableFuture.supplyAsync(() -> original.call(task, context, step, cache, chunk),
                             FEATURES_EXECUTOR)
                     .thenCompose(future -> future);

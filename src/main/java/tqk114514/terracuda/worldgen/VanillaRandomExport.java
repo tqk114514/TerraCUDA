@@ -1,8 +1,8 @@
 package tqk114514.terracuda.worldgen;
 
 import java.lang.reflect.Field;
-import java.util.HashMap;
 import java.util.Map;
+import java.util.concurrent.ConcurrentHashMap;
 import net.minecraft.world.level.levelgen.PositionalRandomFactory;
 
 /**
@@ -15,7 +15,8 @@ import net.minecraft.world.level.levelgen.PositionalRandomFactory;
  */
 public final class VanillaRandomExport {
 
-    private static final Map<Class<?>, Field[]> FIELDS = new HashMap<>();
+    /** Per-class reflection handles, shared across every rules worker; safe for concurrent compute. */
+    private static final Map<Class<?>, Field[]> FIELDS = new ConcurrentHashMap<>();
 
     private VanillaRandomExport() {
     }

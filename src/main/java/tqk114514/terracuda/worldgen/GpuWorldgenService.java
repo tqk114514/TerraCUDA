@@ -64,7 +64,16 @@ public final class GpuWorldgenService implements AutoCloseable {
      * overload into a vanilla fallback; this one is inside the pipeline, where waiting is the
      * intended behaviour.
      */
-    private static final int REPLAY_CAPACITY = 4;
+    /**
+     * Chunks between the device thread and the rules workers.
+     *
+     * <p>Sized by the coupling loss it prevents, not by memory: the device thread and the rules
+     * workers are rate-matched (both ~286/s at full throughput), and a small queue makes matched
+     * stages alternately starve and flood each other — the measurement at capacity 4 showed both
+     * sides at 63% busy, the 37% gap being pure queue-coupling loss. Sixteen absorbs the jitter,
+     * and the density buffer pool self-limits to the chunks actually in flight (~19 sets × 2.3 MB).
+     */
+    private static final int REPLAY_CAPACITY = 16;
 
     /** One service per world. Released on server stop — see {@link #releaseAll()}. */
     private static final Map<RandomState, GpuWorldgenService> SERVICES = new ConcurrentHashMap<>();

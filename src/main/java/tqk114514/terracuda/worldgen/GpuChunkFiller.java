@@ -7,6 +7,7 @@ import net.minecraft.world.level.block.state.BlockState;
 import net.minecraft.world.level.chunk.ChunkAccess;
 import net.minecraft.world.level.chunk.LevelChunkSection;
 import net.minecraft.world.level.levelgen.Aquifer;
+import net.minecraft.world.level.levelgen.Beardifier;
 import net.minecraft.world.level.levelgen.DensityFunction;
 import net.minecraft.world.level.levelgen.NoiseGeneratorSettings;
 import net.minecraft.world.level.levelgen.NoiseRouter;
@@ -204,10 +205,13 @@ public final class GpuChunkFiller implements AutoCloseable {
      * which is why a context belongs to one worker: two chunks through the same context at once
      * would answer each other's columns.
      */
-    public EmittedChunk applyRules(int chunkX, int chunkZ, DensityBuffers buffers, RulesContext context) {
+    public EmittedChunk applyRules(int chunkX, int chunkZ, DensityBuffers buffers, RulesContext context,
+            Beardifier beardifier) {
         int minY = this.geometry.minY();
         int height = this.geometry.height();
         long began = TIMING ? System.nanoTime() : 0L;
+        // Reused for every block the beard reaches: one mutable context, no per-block allocation.
+        BeardContext beardCtx = beardifier != null ? new BeardContext() : null;
         try {
             // The material rules read router entries through interpreters, and a flat cache inside one
             // of those needs to know which chunk's columns it is answering for.
@@ -247,7 +251,18 @@ public final class GpuChunkFiller implements AutoCloseable {
                     for (int z = 0; z < 16; z++) {
                         int blockIndex = (x * 16 + z) * height + yLocal;
                         double value = densities[blockIndex];
-                        BlockState state = rules.compute(chunkMinBlockX + x, y, chunkMinBlockZ + z, value);
+                        if (beardCtx != null) {
+                            // The beard is added at full block resolution, above the interpolator —
+                            // the same place vanilla's `add(finalDensity, Beardifier)` sits in the
+                            // DAG. Most blocks fall outside the structure's bounding box and the
+                            // compute returns zero at the cost of one isInside check.
+                            beardCtx.x = chunkMinBlockX + x;
+                            beardCtx.y = y;
+                            beardCtx.z = chunkMinBlockZ + z;
+                            value += beardifier.compute(beardCtx);
+                        }
+                        BlockState state = rules.compute(chunkMinBlockX + x, y,
+                                chunkMinBlockZ + z, value);
                         if (state == null) {
                             state = defaultBlock;
                         }
@@ -277,7 +292,7 @@ public final class GpuChunkFiller implements AutoCloseable {
      * and the tests want. Takeover does not come through here — it runs the halves as a pipeline.
      */
     public EmittedChunk blockIds(int chunkX, int chunkZ) {
-        return applyRules(chunkX, chunkZ, emitDensities(chunkX, chunkZ), this.inlineRules);
+        return applyRules(chunkX, chunkZ, emitDensities(chunkX, chunkZ), this.inlineRules, null);
     }
 
     /**
@@ -303,7 +318,8 @@ public final class GpuChunkFiller implements AutoCloseable {
      * held for the duration, the way {@code fillFromNoise} holds them around {@code doFill}: the
      * write is not atomic, and another thread may reach the chunk while it is being filled.
      */
-    public void fill(ChunkAccess chunk, DensityBuffers buffers, RulesContext context) {
+    public void fill(ChunkAccess chunk, DensityBuffers buffers, RulesContext context,
+            Beardifier beardifier) {
         int minY = this.geometry.minY();
         int height = this.geometry.height();
         int top = chunk.getSectionIndex(minY + height - 1);
@@ -316,7 +332,8 @@ public final class GpuChunkFiller implements AutoCloseable {
             held.add(section);
         }
         try {
-            EmittedChunk emitted = applyRules(chunk.getPos().x(), chunk.getPos().z(), buffers, context);
+            EmittedChunk emitted = applyRules(chunk.getPos().x(), chunk.getPos().z(), buffers,
+                    context, beardifier);
             long rulesDone = TIMING ? System.nanoTime() : 0L;
             ChunkReplay.write(chunk, emitted, this.geometry);
             if (TIMING) {
@@ -481,6 +498,34 @@ public final class GpuChunkFiller implements AutoCloseable {
                 new DensityInterpreter(this.depthProgram),
                 new DensityInterpreter(this.veinGapProgram),
                 new DensityInterpreter(this.preliminarySurfaceProgram));
+    }
+
+    /**
+     * The block coordinate context the beard compute reads, mutable and reused per block.
+     *
+     * <p>One instance per applyRules call that has a beard, zero when it does not. The interface
+     * has three int methods; a record would allocate per block, and 98,304 records per chunk near
+     * a structure is garbage the rules loop should not make.
+     */
+    private static final class BeardContext implements DensityFunction.FunctionContext {
+        int x;
+        int y;
+        int z;
+
+        @Override
+        public int blockX() {
+            return this.x;
+        }
+
+        @Override
+        public int blockY() {
+            return this.y;
+        }
+
+        @Override
+        public int blockZ() {
+            return this.z;
+        }
     }
 
     @Override

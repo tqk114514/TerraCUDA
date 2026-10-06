@@ -72,6 +72,15 @@ base {
     archivesName = mod_id
 }
 
+// JDK 24+ reads this manifest attribute and grants native access to the named module without the
+// FFM warning block -- the dev runs' startup flag cannot reach it because FML creates the mod
+// module after JVM startup (the c7bdd72 lesson), so the jar itself must carry the declaration.
+tasks.named('jar', Jar) {
+    manifest {
+        attributes 'Enable-Native-Access': 'ALL'
+    }
+}
+
 java.toolchain.languageVersion = JavaLanguageVersion.of(25)
 
 // The GPU path is switched on from the command line. Both spellings of each are accepted because

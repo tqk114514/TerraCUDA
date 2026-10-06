@@ -83,7 +83,8 @@ public abstract class ChunkStepMixin {
                     .thenCompose(future -> future);
         }
 
-        if (radius == 1 && step.targetStatus() == net.minecraft.world.level.chunk.status.ChunkStatus.FEATURES) {
+        if (radius == 1 && step.targetStatus() == net.minecraft.world.level.chunk.status.ChunkStatus.FEATURES
+                && TerracudaConfig.featuresOffload()) {
             if (FeaturesGate.tryAcquire(chunk.getPos())) {
                 if (REPORTED_FEATURES.compareAndSet(false, true)) {
                     TerraCUDA.LOGGER.info("TerraCUDA: moving FEATURES off the serial dispatcher "

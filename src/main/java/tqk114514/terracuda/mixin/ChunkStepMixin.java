@@ -55,6 +55,28 @@ public abstract class ChunkStepMixin {
     private static final AtomicBoolean REPORTED_RADIUS_ZERO = new AtomicBoolean();
     private static final AtomicBoolean REPORTED_FEATURES = new AtomicBoolean();
 
+    /**
+     * The dedicated FEATURES executor, deliberately a single thread.
+     *
+     * <p>The first attempt ran FEATURES bodies in the shared {@code backgroundExecutor()} and
+     * measured 4.8 chunks/s: OreFeature's BulkSectionAccess blocks on PalettedContainer
+     * semaphores that the replay worker holds, and every blocked ForkJoinPool worker is a
+     * worker the NOISE stage body queued behind it cannot have. A dedicated thread makes the
+     * blocking irrelevant — the dispatcher is already free, the ForkJoinPool is untouched,
+     * and one thread cannot deadlock against itself on section semaphores.
+     *
+     * <p>One thread is also the right throughput: FEATURES costs ~4.3 ms a chunk, so one
+     * thread clears ~233/s, above anything the pipeline currently supplies (~155/s). A second
+     * thread would only pay its way when the rest of the pipeline runs past that, and it would
+     * reintroduce the cross-thread section locking that the write-area gate exists to prevent.
+     */
+    private static final java.util.concurrent.ExecutorService FEATURES_EXECUTOR =
+            java.util.concurrent.Executors.newSingleThreadExecutor(runnable -> {
+                Thread thread = new Thread(runnable, "TerraCUDA-features");
+                thread.setDaemon(true);
+                return thread;
+            });
+
     @WrapOperation(method = "apply",
             at = @At(value = "INVOKE", target = "Lnet/minecraft/world/level/chunk/status/ChunkStatusTask;"
                     + "doWork(Lnet/minecraft/world/level/chunk/status/WorldGenContext;"
@@ -87,11 +109,11 @@ public abstract class ChunkStepMixin {
                 && TerracudaConfig.featuresOffload()) {
             if (FeaturesGate.tryAcquire(chunk.getPos())) {
                 if (REPORTED_FEATURES.compareAndSet(false, true)) {
-                    TerraCUDA.LOGGER.info("TerraCUDA: moving FEATURES off the serial dispatcher "
-                            + "behind a write-area gate ({})", TerracudaConfig.summary());
+                    TerraCUDA.LOGGER.info("TerraCUDA: moving FEATURES to a dedicated thread "
+                            + "({})", TerracudaConfig.summary());
                 }
                 return CompletableFuture.supplyAsync(() -> original.call(task, context, step, cache, chunk),
-                                Util.backgroundExecutor())
+                                FEATURES_EXECUTOR)
                         .thenCompose(future -> future)
                         .whenComplete((result, error) -> FeaturesGate.release(chunk.getPos()));
             }

@@ -98,6 +98,8 @@ def terracudaInflight = (findProperty('terracuda.maxInFlight') ?: findProperty('
 def terracudaOffload = project.hasProperty('terracuda.offload') || project.hasProperty('offload')
 // -PrulesWorkers=N sets the rules-and-write-back worker count (default 2).
 def terracudaWorkers = (findProperty('terracuda.rulesWorkers') ?: findProperty('rulesWorkers') ?: '2').toString()
+// -PnoFeatures keeps FEATURES on the dispatcher even with the offload on (diagnostics).
+def terracudaNoFeatures = project.hasProperty('terracuda.noFeatures') || project.hasProperty('noFeatures')
 
 neoForge {
     version = project.neo_version
@@ -159,6 +161,9 @@ neoForge {
             }
             if (terracudaOffload) {
                 jvmArguments.add('-Dterracuda.offload=true')
+            }
+            if (terracudaNoFeatures) {
+                jvmArguments.add('-Dterracuda.featuresOffload=false')
             }
             if (terracudaWorkers != '2') {
                 jvmArguments.add("-Dterracuda.rulesWorkers=$terracudaWorkers")

@@ -105,17 +105,15 @@ public final class TerracudaConfig {
     }
 
     /**
-     * Moves FEATURES off the serial dispatcher behind the write-area gate. Off by default and
-     * off in practice: the first measurement deadlocked the shared ForkJoinPool — OreFeature's
-     * BulkSectionAccess blocks on PalettedContainer semaphores that the replay worker holds,
-     * starving the NOISE stage bodies queued behind them in the same pool. Activating this needs
-     * a dedicated executor and a cross-chunk section-lock audit, the engineering C2ME's
-     * {@code fixes-threading} modules represent. The gate and the ThreadingDetector bypass are
-     * already in place; the flag exists so the day they are wired to a safe executor, the
-     * switch is already here.
+     * Whether FEATURES also moves off the serial dispatcher, onto a dedicated single thread.
+     *
+     * <p>Defaults to whatever {@link #offload()} is: when the offload is on, every stage that can
+     * safely move does. Set {@code -Dterracuda.featuresOffload=false} to keep FEATURES on the
+     * dispatcher while the radius-zero stages move.
      */
     public static boolean featuresOffload() {
-        return Boolean.getBoolean(PREFIX + "featuresOffload");
+        String value = System.getProperty(PREFIX + "featuresOffload");
+        return value == null ? offload() : Boolean.parseBoolean(value);
     }
 
     public static String summary() {

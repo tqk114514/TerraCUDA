@@ -107,18 +107,20 @@ public abstract class ChunkStepMixin {
 
         if (radius == 1 && step.targetStatus() == net.minecraft.world.level.chunk.status.ChunkStatus.FEATURES
                 && TerracudaConfig.featuresOffload()) {
-            if (FeaturesGate.tryAcquire(chunk.getPos())) {
-                if (REPORTED_FEATURES.compareAndSet(false, true)) {
-                    TerraCUDA.LOGGER.info("TerraCUDA: moving FEATURES to a dedicated thread "
-                            + "({})", TerracudaConfig.summary());
-                }
-                return CompletableFuture.supplyAsync(() -> original.call(task, context, step, cache, chunk),
-                                FEATURES_EXECUTOR)
-                        .thenCompose(future -> future)
-                        .whenComplete((result, error) -> FeaturesGate.release(chunk.getPos()));
+            if (REPORTED_FEATURES.compareAndSet(false, true)) {
+                TerraCUDA.LOGGER.info("TerraCUDA: moving FEATURES to a dedicated thread "
+                        + "({})", TerracudaConfig.summary());
             }
-            // A neighbour's FEATURES holds the write area: run serially, exactly as vanilla does.
-            return original.call(task, context, step, cache, chunk);
+            // Always to the dedicated executor; never a serial fallback. The first version tried
+            // a gate: when a neighbour held the write area, the stage ran on the dispatcher —
+            // and that serial body then deadlocked against the dedicated thread's on section
+            // semaphores, each holding sections the other needed. One thread means no competing
+            // FEATURES and no circular dependency; the status system already keeps FEATURES and
+            // the replay pipeline off the same chunk. The gate infrastructure stays for the day
+            // a second thread earns its keep.
+            return CompletableFuture.supplyAsync(() -> original.call(task, context, step, cache, chunk),
+                            FEATURES_EXECUTOR)
+                    .thenCompose(future -> future);
         }
 
         return original.call(task, context, step, cache, chunk);

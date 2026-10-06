@@ -14,6 +14,7 @@ import java.util.concurrent.ExecutionException;
 import java.util.concurrent.TimeUnit;
 
 import net.minecraft.world.level.chunk.ChunkAccess;
+import net.minecraft.world.level.levelgen.Beardifier;
 import net.minecraft.world.level.levelgen.NoiseGeneratorSettings;
 import net.minecraft.world.level.levelgen.RandomState;
 
@@ -75,7 +76,8 @@ public final class GpuWorldgenService implements AutoCloseable {
 
     /** One chunk handed between the halves of the pipeline. */
     private record ReplayJob(GpuChunkFiller filler, ChunkAccess chunk,
-            GpuChunkFiller.DensityBuffers buffers, CompletableFuture<Void> done) {
+            GpuChunkFiller.DensityBuffers buffers, CompletableFuture<Void> done,
+            Beardifier beardifier) {
     }
 
     private final BlockingQueue<Job> jobs = new ArrayBlockingQueue<>(QUEUE_CAPACITY);
@@ -219,7 +221,7 @@ public final class GpuWorldgenService implements AutoCloseable {
                     continue;
                 }
                 try {
-                    job.filler().fill(job.chunk(), job.buffers(), context);
+                    job.filler().fill(job.chunk(), job.buffers(), context, job.beardifier());
                     job.done().complete(null);
                 } catch (Throwable t) {
                     job.done().completeExceptionally(t);
@@ -344,8 +346,12 @@ public final class GpuWorldgenService implements AutoCloseable {
      * written the chunk, or completes exceptionally if either half could not do its part — the
      * caller is expected to fall back to vanilla in that case, which is why this reports failure
      * rather than swallowing it.
+     *
+     * @param beardifier the structure beard for this chunk, or {@code null} when none reaches it;
+     *                   added to each block's density on the host, the way vanilla adds it in the
+     *                   density DAG above the interpolator
      */
-    public CompletableFuture<Void> fill(ChunkAccess chunk) {
+    public CompletableFuture<Void> fill(ChunkAccess chunk, Beardifier beardifier) {
         CompletableFuture<Void> done = new CompletableFuture<>();
         if (!isReady()) {
             done.completeExceptionally(new IllegalStateException(unavailableReason));
@@ -357,7 +363,7 @@ public final class GpuWorldgenService implements AutoCloseable {
                         filler.emitDensities(chunk.getPos().x(), chunk.getPos().z());
                 // A blocking hand-off: when the rules worker is REPLAY_CAPACITY chunks behind, the
                 // device thread waits here rather than running ahead in memory.
-                this.replayJobs.put(new ReplayJob(filler, chunk, buffers, done));
+                this.replayJobs.put(new ReplayJob(filler, chunk, buffers, done, beardifier));
             } catch (Throwable t) {
                 done.completeExceptionally(t);
             }

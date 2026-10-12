@@ -92,6 +92,36 @@ public final class TerracudaConfig {
     }
 
     /**
+     * Whether FEATURES must run on its dedicated single thread — {@link #featuresOffload()}, or
+     * forced on by {@link #parallelSched()}.
+     *
+     * <p>FEATURES writes its 3×3 neighbourhood, so two adjacent chunks' FEATURES stages may not
+     * overlap. On the vanilla serial dispatcher that is true by construction; on parallel
+     * advancement lanes it has to be enforced, and the single dedicated thread is the
+     * enforcement.
+     */
+    public static boolean featuresDedicated() {
+        return featuresOffload() || parallelSched() > 0;
+    }
+
+    /**
+     * How many parallel lanes run the worldgen dispatcher's per-chunk stage-advancement steps.
+     * Zero leaves the dispatcher exactly vanilla — one chunk's dependency checks and stage
+     * submissions at a time on the serial {@code ConsecutiveExecutor}.
+     *
+     * <p>A latency lever, not a throughput one: the headless benchmark's throughput is bound by
+     * its admission cap and per-chunk dwell, and the lanes measured end-to-end flat while the
+     * noise-stage p50 dropped — chunks spend fewer queue round trips between layers. See
+     * {@code docs/26.1.2区块管线深度调研.md} §7 (L2).
+     *
+     * <p>Requires {@link #offload()}: without it the stage bodies would run on the lanes, which
+     * is concurrency the {@code ThreadingDetector} bypass is not armed for. Inert otherwise.
+     */
+    public static int parallelSched() {
+        return Integer.getInteger(PREFIX + "parallelSched", 0);
+    }
+
+    /**
      * How many rules-and-write-back workers run the CPU half of a chunk. The router interpreters
      * carry per-chunk state, so each worker owns a set.
      *
@@ -107,6 +137,6 @@ public final class TerracudaConfig {
     public static String summary() {
         return "gpu=" + gpuEnabled() + ", shadow=" + shadowMode() + ", verbose=" + verbose()
                 + ", timing=" + timing() + ", offload=" + offload()
-                + ", rulesWorkers=" + rulesWorkers();
+                + ", parallelSched=" + parallelSched() + ", rulesWorkers=" + rulesWorkers();
     }
 }

@@ -97,6 +97,14 @@ def terracudaTiming = project.hasProperty('terracuda.timing') || project.hasProp
 def terracudaOffload = project.hasProperty('terracuda.offload') || project.hasProperty('offload')
 // -PnoFeatures keeps FEATURES on the dispatcher even with the offload on (diagnostics).
 def terracudaNoFeatures = project.hasProperty('terracuda.noFeatures') || project.hasProperty('noFeatures')
+// -PparallelSched=N runs the worldgen dispatcher's stage-advancement steps on N parallel lanes
+// (0 = vanilla's single lane). Bare -PparallelSched means 3 lanes; absent means off. A latency
+// lever: end-to-end measured flat at the benchmark's cap while the noise-stage p50 dropped.
+// Requires -Poffload; inert without it.
+def terracudaParallelSched = (findProperty('terracuda.parallelSched') ?: findProperty('parallelSched') ?: '').toString()
+def terracudaSchedLanes = terracudaParallelSched.isEmpty()
+        ? (project.hasProperty('parallelSched') || project.hasProperty('terracuda.parallelSched') ? '3' : '0')
+        : terracudaParallelSched
 // -PrulesWorkers=N sets the rules-and-write-back worker count (default 2).
 def terracudaWorkers = (findProperty('terracuda.rulesWorkers') ?: findProperty('rulesWorkers') ?: '2').toString()
 // -PchunkyWorking=N overrides Chunky's in-flight admission cap (chunky.maxWorkingCount, default
@@ -164,6 +172,9 @@ neoForge {
             }
             if (terracudaNoFeatures) {
                 jvmArguments.add('-Dterracuda.featuresOffload=false')
+            }
+            if (terracudaSchedLanes != '0') {
+                jvmArguments.add("-Dterracuda.parallelSched=$terracudaSchedLanes")
             }
             if (terracudaChunkyWorking != '0') {
                 jvmArguments.add("-Dchunky.maxWorkingCount=$terracudaChunkyWorking")

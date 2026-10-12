@@ -101,7 +101,7 @@ public abstract class ChunkStepMixin {
         }
 
         if (radius == 1 && step.targetStatus() == ChunkStatus.FEATURES
-                && TerracudaConfig.featuresOffload()) {
+                && TerracudaConfig.featuresDedicated()) {
             if (REPORTED_FEATURES.compareAndSet(false, true)) {
                 TerraCUDA.LOGGER.info("TerraCUDA: moving FEATURES to a dedicated thread "
                         + "({})", TerracudaConfig.summary());

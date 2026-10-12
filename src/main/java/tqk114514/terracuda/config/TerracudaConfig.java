@@ -63,6 +63,35 @@ public final class TerracudaConfig {
     }
 
     /**
+     * Moves the write-isolated generation stages off vanilla's serial stage dispatcher.
+     *
+     * <p>Only the radius-zero stages move (NOISE, SURFACE, CARVERS): each writes nothing but its
+     * own chunk, and the pyramid's own dependency semantics keep two of them off each other —
+     * a chunk in a radius-zero stage cannot have a neighbour in a stage that writes it. The
+     * stage's status bookkeeping, profiling hook and completion chain stay exactly vanilla on
+     * the dispatcher; only the body runs on the shared background executor. See
+     * {@code docs/26.1.2区块管线深度调研.md} for the safety argument and the measurements.
+     */
+    public static boolean offload() {
+        return Boolean.getBoolean(PREFIX + "offload");
+    }
+
+    /**
+     * Whether FEATURES runs on its dedicated single thread. Defaults to {@link #offload()}.
+     *
+     * <p>FEATURES writes its 3×3 neighbourhood, so two of them may never overlap — on the
+     * vanilla serial dispatcher that holds by construction, and the one dedicated thread is the
+     * replacement guarantee once the other stages have left the dispatcher. A single thread
+     * also measured faster than a gate-policed pool: the write-area gate's polling ate the
+     * parallelism it bought. {@code -Dterracuda.featuresOffload=false} keeps FEATURES on the
+     * dispatcher as a diagnostic.
+     */
+    public static boolean featuresOffload() {
+        String value = System.getProperty(PREFIX + "featuresOffload");
+        return value == null ? offload() : Boolean.parseBoolean(value);
+    }
+
+    /**
      * How many rules-and-write-back workers run the CPU half of a chunk. The router interpreters
      * carry per-chunk state, so each worker owns a set.
      *
@@ -77,6 +106,7 @@ public final class TerracudaConfig {
 
     public static String summary() {
         return "gpu=" + gpuEnabled() + ", shadow=" + shadowMode() + ", verbose=" + verbose()
-                + ", timing=" + timing() + ", rulesWorkers=" + rulesWorkers();
+                + ", timing=" + timing() + ", offload=" + offload()
+                + ", rulesWorkers=" + rulesWorkers();
     }
 }

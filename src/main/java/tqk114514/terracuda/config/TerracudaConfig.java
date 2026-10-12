@@ -63,20 +63,6 @@ public final class TerracudaConfig {
     }
 
     /**
-     * Raises vanilla's player-ticket in-flight limit above its default of four. Zero leaves vanilla
-     * alone.
-     *
-     * <p>Vanilla frees a throttle slot only when a chunk reaches entity-ticking status, so loading
-     * runs at four divided by the per-chunk dwell — the ~65 chunks/s ceiling every measurement has
-     * bounced off. Raising it admits more chunks into the loading pipeline at once, which is an
-     * experiment, not a speedup: the serial stage dispatcher and the device path have ceilings of
-     * their own, and finding which one binds next is the point. See {@code docs/性能笔记.md}.
-     */
-    public static int maxInFlight() {
-        return Integer.getInteger(PREFIX + "maxInFlight", 0);
-    }
-
-    /**
      * How many rules-and-write-back workers run the CPU half of a chunk. The router interpreters
      * carry per-chunk state, so each worker owns a set.
      *
@@ -91,7 +77,6 @@ public final class TerracudaConfig {
 
     public static String summary() {
         return "gpu=" + gpuEnabled() + ", shadow=" + shadowMode() + ", verbose=" + verbose()
-                + ", timing=" + timing() + ", maxInFlight=" + maxInFlight()
-                + ", rulesWorkers=" + rulesWorkers();
+                + ", timing=" + timing() + ", rulesWorkers=" + rulesWorkers();
     }
 }

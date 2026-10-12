@@ -1,6 +1,5 @@
 package tqk114514.terracuda.worldgen;
 
-import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 import net.minecraft.server.level.ThrottlingChunkTaskDispatcher;
@@ -37,11 +36,5 @@ class TicketThrottleTest {
         dispatcher.release(pos, () -> { }, false);
         String idle = TicketThrottle.describe();
         assertTrue(idle.isEmpty(), "an idle dispatcher is noise and must be filtered out: '" + idle + "'");
-    }
-
-    @Test
-    void limitInFlightLeavesVanillaAloneWhenUnset() {
-        assertEquals(4, TicketThrottle.limitInFlight(4),
-                "without -Dterracuda.maxInFlight the vanilla limit must pass through untouched");
     }
 }

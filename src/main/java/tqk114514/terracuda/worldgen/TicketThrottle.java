@@ -4,17 +4,16 @@ import java.util.List;
 import java.util.concurrent.CopyOnWriteArrayList;
 
 import net.minecraft.server.level.ThrottlingChunkTaskDispatcher;
-import tqk114514.terracuda.config.TerracudaConfig;
 
 /**
- * The player-ticket throttle: the one thing upstream that measurements keep pointing at.
+ * Observes the player-ticket throttle for the periodic timing report.
  *
  * <p>Vanilla admits at most {@code maxChunksInExecution} chunks — four of them — to be moving from
  * "given a player ticket" to "fully loaded" at once; the slot frees only when the chunk reaches
  * entity-ticking status, so the whole loading pipeline runs at four divided by the per-chunk dwell.
- * That arithmetic lands on ~65 chunks/s for the ~62 ms dwell we measured, which is the ceiling every
- * experiment so far has bounced off. This class is where the mod observes and, experimentally,
- * raises that limit.
+ * That arithmetic lands on ~65 chunks/s for the ~62 ms dwell we measured. The mod replaces the
+ * NOISE stage and nothing else, so it never touches that limit — it only watches it, because the
+ * throttle's in-flight window is the fastest way to tell a mod-bound slowdown from a vanilla one.
  *
  * <p>Observation is via {@link ThrottlingChunkTaskDispatcher#getDebugStatus()}, which is public and
  * {@code @VisibleForTesting}: the in-flight chunk set and the queue's sleeping flag, one line per
@@ -37,19 +36,6 @@ public final class TicketThrottle {
     /** Called from the dispatcher's constructor; the instance is itself the instrument. */
     public static void register(ThrottlingChunkTaskDispatcher dispatcher) {
         DISPATCHERS.add(dispatcher);
-    }
-
-    /**
-     * The in-flight limit to use instead of vanilla's four, or zero to leave vanilla alone.
-     *
-     * <p>Experimental by construction: raising it admits more chunks into the loading pipeline at
-     * once, which nothing downstream is guaranteed to absorb. The serial stage dispatcher, the
-     * device thread and the rules worker all have their own ceilings, and finding which one the
-     * raised throttle runs into next is the point of the experiment.
-     */
-    public static int limitInFlight(int vanilla) {
-        int configured = TerracudaConfig.maxInFlight();
-        return configured > 0 ? configured : vanilla;
     }
 
     /**

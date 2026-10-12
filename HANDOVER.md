@@ -11,16 +11,18 @@ MC 26.1.2 / NeoForge 26.1.2.114 / Java 25 / `mod_id=terracuda`。远端 `github.
 
 ## 当前数字
 
-- **同日背靠背（2026-10-12，Chunky 22,801，种子 123，机器空闲）**：vanilla **4:54**
-  （77.6 cps，噪声窗口均值 84.1/s）vs mod **4:26**（85.7 cps，94.2/s）= 端到端
-  **1.11×**。mod 噪声 p50 延迟 68–78 ms，GPU 线程服务均值 2.85 ms/区块（busy 15–25%）。
-  判读：端到端被 vanilla 串行 dispatcher 钉住（第八节的墙）；mod 的收益在噪声延迟与
-  CPU 让渡（~11 核的密度计算挪去 GPU）。历史基线 5:10（2026-10-06）方差内吻合。
+- **同日三场背靠背（2026-10-13，Chunky 22,801，种子 123，机器空闲，cap 50 声明）**：
+  vanilla **4:54**（77.6 cps）→ NOISE-only **4:26**（85.7 cps，**1.11×**）→
+  **+offload（L1+L3）2:17**（166.4 cps，**2.15×**）。offload 场 GPU busy 72%、噪声窗口
+  186.9/s——管线终于喂饱设备线程。性能笔记 §15 有全表与判读。
+- **范围结构**：`-Poffload` 是**默认关的可选性能包**（半径 0 阶段体下放 + FEATURES 专用
+  线程，性能笔记 §15 / 26.1.2 管线调研报告）；不带它的 mod 形态 = 纯 NOISE 接管。
 - **对照**：zFastNoise（26.3，同契约、同机、其自家 JMH 工具）阶段体 **1.46×**（隔离、
   单线程、float 栈上的 11.53→7.88 ms/区块）——口径不同不可直接比，见性能笔记第十四节。
 - **26.3 的现实**：float 栈把 vanilla 阶段体压到单线程 ~11.5 ms，GPU 卸载的价值空间
-  比 26.1 小一个量级——26.3 适配的立项依据要先重测。
-- 第十至十二节里的 2:55→2:44 测于带调度层实验的构建，**不是本 mod 的形态，不要引用**。
+  比 26.1 小一个量级——26.3 适配的立项依据要先重测。调度层工作（L1/L3 及后续 L2）
+  跨版本保值（管线类在 26.3 全部存活）。
+- 性能笔记十~十二节的历史数字测于带额外实验的构建，引用前先读 §13/§15 的范围说明。
 
 ## 必读文件
 
@@ -41,16 +43,17 @@ MC 26.1.2 / NeoForge 26.1.2.114 / Java 25 / `mod_id=terracuda`。远端 `github.
 - beardifier 宿主侧逐方块加 beard
 - invokeExact：热路径 FFM 调用 + Enable-Native-Access manifest
 - `applyRules`/`writeChunk` 方法拆分 + replay 队列 16（方法留下，拆线程实测更慢不留）
+- **L1+L3 调度层扩展（`-Poffload`，默认关）**：半径 0 阶段体下放 + FEATURES 专用线程
+  ——平移自实验线并收窄判据（半径 0），激活时各打一行日志作为证据
 
 ## 下一步（按性价比序）
 
-1. **NOISE 内部延迟**：设备 2.9 ms + rules 4.8 ms + 写回 2.1 ms。吞吐被 dispatcher 顶住，
-   但玩家侧延迟（噪声 p50 68–78 ms，大头是队列等待）仍有空间；改一处测一处，别信推断。
-2. **26.3 立项重估**：float 栈让 vanilla 阶段体只剩 ~11.5 ms（第十四节实测），GPU 卸载的
-   价值要先重测再决定投入。对反编译源码核实，不凭 yarn 名猜；`PooledSampleBuffer`/
-   `NoiseSampler.fill` 是 26.3 的干净注入点（zFastNoise 走的就是它，MPL-2.0 只参考不抄）。
-3. 26.3 的填充半场是 CPU 侧甜点（zFastNoise 证明了 1.46× 空间）——若做 26.3 适配，
-   "GPU 密度 + 填充半场优化"可叠加。
+1. **L2 平移**（`ChunkTaskDispatcherMixin`，`-PparallelSched`）：延迟杠杆（先例 p50
+   108→67–86 ms、端到端持平），独立开关独立验收；需要恢复 `featuresDedicated()` 强制条款。
+2. **逐层 schedule→complete 时间戳仪表**：L4（tick 中段泵/FULL 批处理）的立项前置——
+   先有归因再动刀。
+3. 26.3 适配重估：`PooledSampleBuffer`/`NoiseSampler.fill` 是干净注入点（zFastNoise 走的
+   就是它，MPL-2.0 只参考不抄）；调度层资产跨版本保值，GPU 密度价值需重测。
 
 ## 关键命令
 
@@ -62,7 +65,7 @@ MC 26.1.2 / NeoForge 26.1.2.114 / Java 25 / `mod_id=terracuda`。远端 `github.
 # 前提：run/server.properties 开 RCON(enable-rcon=true, rcon.password=terracuda)，level-seed=123
 #       run/mods 装 Chunky，run/eula.txt eula=true
 Remove-Item -Recurse -Force run/world, run/chunky -ErrorAction SilentlyContinue
-./gradlew runServer -Ptakeover -Ptiming   # 后台启动
+./gradlew runServer -Ptakeover -Ptiming -Poffload   # 后台启动；offload 是可选性能包，验收要跑两种形态
 .\benchmark\chunky-rcon.ps1 -Command "chunky shape square"
 .\benchmark\chunky-rcon.ps1 -Command "chunky center 0 0"
 .\benchmark\chunky-rcon.ps1 -Command "chunky radius 1200"
@@ -76,6 +79,8 @@ Remove-Item -Recurse -Force run/world, run/chunky -ErrorAction SilentlyContinue
 
 # 其他开关
 ./gradlew runServer -PrulesWorkers=3  # 改 worker 数（诊断用）
+./gradlew runServer -Ptakeover -Ptiming -PnoFeatures  # offload 开着但 FEATURES 留在 dispatcher（诊断用）
+./gradlew runServer -Ptakeover -Ptiming -PchunkyWorking=100  # 覆盖 Chunky 在飞上限（跨研究比较必须声明 cap）
 # 逐线程 busy% 采样（哪条线程是墙）：.\benchmark\thread-sampler.ps1 -Samples 4 -IntervalSeconds 10
 # 跑分前查后台负载（victoria3/ffmpeg 教训）——外部污染是废数字的根源
 ```

@@ -63,7 +63,16 @@ public final class GpuWorldgenService implements AutoCloseable {
      * overload into a vanilla fallback; this one is inside the pipeline, where waiting is the
      * intended behaviour.
      */
-    private static final int REPLAY_CAPACITY = 4;
+    /**
+     * Chunks between the device thread and the rules workers.
+     *
+     * <p>Sized by the coupling loss it prevents, not by memory: the device thread and the rules
+     * workers are rate-matched (both ~286/s at full throughput), and a small queue makes matched
+     * stages alternately starve and flood each other — the measurement at capacity 4 showed both
+     * sides at 63% busy, the 37% gap being pure queue-coupling loss. Sixteen absorbs the jitter,
+     * and the density buffer pool self-limits to the chunks actually in flight (~19 sets × 2.3 MB).
+     */
+    private static final int REPLAY_CAPACITY = 16;
 
     /** One service per world. Released on server stop — see {@link #releaseAll()}. */
     private static final Map<RandomState, GpuWorldgenService> SERVICES = new ConcurrentHashMap<>();
@@ -74,7 +83,7 @@ public final class GpuWorldgenService implements AutoCloseable {
         void run(GpuChunkFiller filler);
     }
 
-    /** One chunk handed between the halves of the pipeline. */
+    /** One chunk handed from the device thread to a rules worker. */
     private record ReplayJob(GpuChunkFiller filler, ChunkAccess chunk,
             GpuChunkFiller.DensityBuffers buffers, CompletableFuture<Void> done,
             Beardifier beardifier) {
@@ -201,27 +210,30 @@ public final class GpuWorldgenService implements AutoCloseable {
     }
 
     /**
-     * One rules worker's loop: applies the material rules and writes chunks through the context it
-     * owns, one chunk at a time.
+     * One rules worker's loop: computes the material rules for a chunk, writes it, and completes
+     * the future — both halves on this thread.
      *
-     * <p>There are several workers now, and the reason there can be is the context: the router
-     * interpreters carry per-chunk state (the flat-cache gate answers for the chunk the rules are
-     * asking about), so the single-threadedness the loop needed lives per context, not per service.
-     * One worker drained the ~7 ms chunk at ~145 chunks/s and the multi-stream device thread ran
-     * out of work to hand it; {@link TerracudaConfig#rulesWorkers()} more of them clear the device
-     * thread and run into the serial dispatcher's remaining stages instead.
+     * <p>A split variant (separate rules and write threads, with a queue between them) measured
+     * slower end-to-end than this combined loop when it was tried: the queue handoff and the
+     * thread switch cost more than the ~2 ms of device-thread handoff wait the split was designed
+     * to save. On this machine (12 logical / 6 physical cores) the combined worker is the right
+     * shape; the split methods ({@code applyRules} and {@code writeChunk}) stay because they are
+     * clearer than the monolithic {@code fill} was, and because the write no longer holds
+     * sections during the rules computation, which is a real improvement even at the same
+     * throughput.
      */
     private void runReplay(GpuChunkFiller.RulesContext context) {
         try {
-            // Drains before exiting: a handed-over chunk whose future never completes would hang the
-            // stage that is waiting on it, and the fallback only fires on failure, not on silence.
             while (!this.closed || !this.replayJobs.isEmpty()) {
                 ReplayJob job = this.replayJobs.poll(200, TimeUnit.MILLISECONDS);
                 if (job == null) {
                     continue;
                 }
                 try {
-                    job.filler().fill(job.chunk(), job.buffers(), context, job.beardifier());
+                    EmittedChunk emitted = job.filler().applyRules(
+                            job.chunk().getPos().x(), job.chunk().getPos().z(),
+                            job.buffers(), context, job.beardifier());
+                    job.filler().writeChunk(job.chunk(), emitted);
                     job.done().complete(null);
                 } catch (Throwable t) {
                     job.done().completeExceptionally(t);

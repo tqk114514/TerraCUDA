@@ -274,21 +274,8 @@ public final class GpuChunkFiller implements AutoCloseable {
             double[] veinToggleValues = buffers.veinToggle();
             double[] veinRidgedValues = buffers.veinRidged();
 
-            MaterialRules.RouterNoises noises = new MaterialRules.RouterNoises(
-                    MaterialRules.entry(context.barrierNoise, context.barrierNoise.program(), chunkX, chunkZ),
-                    MaterialRules.entry(context.floodedness, context.floodedness.program(), chunkX, chunkZ),
-                    MaterialRules.entry(context.spread, context.spread.program(), chunkX, chunkZ),
-                    MaterialRules.entry(context.lava, context.lava.program(), chunkX, chunkZ),
-                    MaterialRules.entry(context.erosion, context.erosion.program(), chunkX, chunkZ),
-                    MaterialRules.entry(context.depth, context.depth.program(), chunkX, chunkZ),
-                    MaterialRules.entry(context.veinGap, context.veinGap.program(), chunkX, chunkZ),
-                    (x, y, z) -> veinValue(veinToggleValues, "veinToggle", x, y, z, chunkX, chunkZ, minY, height),
-                    (x, y, z) -> veinValue(veinRidgedValues, "veinRidged", x, y, z, chunkX, chunkZ, minY, height));
-
-            MaterialRules rules = MaterialRules.forChunk(noises, surfaceLevels(context), fluidPicker(),
-                    VanillaRandomExport.export(this.randomState.aquiferRandom()),
-                    VanillaRandomExport.export(this.randomState.oreRandom()), chunkX, chunkZ, this.geometry,
-                    this.settings.isAquifersEnabled(), this.settings.oreVeinsEnabled());
+            MaterialRules rules = materialRulesFor(chunkX, chunkZ, context,
+                    veinToggleValues, veinRidgedValues);
 
             BlockState defaultBlock = this.settings.defaultBlock();
             int chunkMinBlockX = chunkX * 16;
@@ -363,6 +350,36 @@ public final class GpuChunkFiller implements AutoCloseable {
     }
 
     /**
+     * One chunk's material rules, wired the way {@code applyRules} wires them: the router
+     * entries through their per-chunk flat-cache tables, the vein values from the buffers the
+     * device already produced, and the positional randoms exported from the world's seed.
+     *
+     * <p>Extracted so the device half of G2a can build the very same instance for its grid
+     * tables -- the CPU reference and the GPU tables must come from one wiring, or a difference
+     * in the wiring would masquerade as a parity failure.
+     */
+    MaterialRules materialRulesFor(int chunkX, int chunkZ, RulesContext context,
+            double[] veinToggleValues, double[] veinRidgedValues) {
+        int minY = this.geometry.minY();
+        int height = this.geometry.height();
+        MaterialRules.RouterNoises noises = new MaterialRules.RouterNoises(
+                MaterialRules.entry(context.barrierNoise, context.barrierNoise.program(), chunkX, chunkZ),
+                MaterialRules.entry(context.floodedness, context.floodedness.program(), chunkX, chunkZ),
+                MaterialRules.entry(context.spread, context.spread.program(), chunkX, chunkZ),
+                MaterialRules.entry(context.lava, context.lava.program(), chunkX, chunkZ),
+                MaterialRules.entry(context.erosion, context.erosion.program(), chunkX, chunkZ),
+                MaterialRules.entry(context.depth, context.depth.program(), chunkX, chunkZ),
+                MaterialRules.entry(context.veinGap, context.veinGap.program(), chunkX, chunkZ),
+                (x, y, z) -> veinValue(veinToggleValues, "veinToggle", x, y, z, chunkX, chunkZ, minY, height),
+                (x, y, z) -> veinValue(veinRidgedValues, "veinRidged", x, y, z, chunkX, chunkZ, minY, height));
+
+        return MaterialRules.forChunk(noises, surfaceLevels(context), fluidPicker(),
+                VanillaRandomExport.export(this.randomState.aquiferRandom()),
+                VanillaRandomExport.export(this.randomState.oreRandom()), chunkX, chunkZ, this.geometry,
+                this.settings.isAquifersEnabled(), this.settings.oreVeinsEnabled());
+    }
+
+    /**
      * The write-back half of the rules pipeline, on its own thread: turns one chunk's computed
      * block states into written blocks, holding the sections for the duration the way
      * {@code fillFromNoise} holds them around {@code doFill}.
@@ -410,7 +427,8 @@ public final class GpuChunkFiller implements AutoCloseable {
         return buffers;
     }
 
-    private void releaseBuffers(DensityBuffers buffers) {
+/** Returns one borrowed buffer set to the pool; G2a's parity test also uses it directly. */
+    void releaseBuffers(DensityBuffers buffers) {
         this.bufferPool.offer(buffers);
     }
 

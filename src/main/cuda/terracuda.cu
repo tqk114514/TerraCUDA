@@ -845,3 +845,381 @@ extern "C" __global__ void terracuda_xoroshiro_float_points(
     TcXoroshiro state = tcXoroshiro(positionalSeed ^ seedLo, seedHi);
     results[index] = tcXoroshiroNextFloat(&state);
 }
+
+// ============================================================================================
+// The material rules' per-block decision (G2a)
+// ============================================================================================
+
+// The decisions the per-block kernel hands back; the host maps them to block states.
+#define TC_DECIDE_DEFAULT 0
+#define TC_DECIDE_WATER 1
+#define TC_DECIDE_LAVA 2
+#define TC_DECIDE_COPPER_ORE 3
+#define TC_DECIDE_RAW_COPPER 4
+#define TC_DECIDE_GRANITE 5
+#define TC_DECIDE_DEEPSLATE_IRON_ORE 6
+#define TC_DECIDE_RAW_IRON 7
+#define TC_DECIDE_TUFF 8
+#define TC_DECIDE_AIR 9
+
+// similarity(10*10, 12*12): the threshold below which two cells are too far apart to flow.
+#define TC_FLOWING_UPDATE_SIMILARITY (1.0 - (144 - 100) / 25.0)
+
+
+/** Java's Math.floorDiv for a positive divisor: the aquifer anchors floor their grid Y. */
+__device__ __forceinline__ int tcFloorDiv(int value, int divisor) {
+    int quotient = value / divisor;
+    if (value % divisor != 0 && value < 0) {
+        quotient--;
+    }
+    return quotient;
+}
+
+/** BlockPos unpacking, reproduced exactly: 26-bit x and z, 12-bit y, all sign-extended. */
+__device__ __forceinline__ int tcUnpackX(long long packed) {
+    return (int) (packed >> 38);
+}
+
+__device__ __forceinline__ int tcUnpackY(long long packed) {
+    return (int) (packed << 52 >> 52);
+}
+
+__device__ __forceinline__ int tcUnpackZ(long long packed) {
+    return (int) (packed << 26 >> 38);
+}
+
+/** One program evaluation at a block position: a plain forward sweep, no markers involved. */
+__device__ __forceinline__ double tcEvaluatePlain(const char* blob, const long long* offsets,
+                                                   int instructionCount, int root,
+                                                   int blockX, int blockY, int blockZ,
+                                                   double* scratch) {
+    TcProgram program;
+    program.blob = blob;
+    program.offsets = offsets;
+    program.root = root;
+    program.instructionCount = instructionCount;
+    program.blockX = blockX;
+    program.blockY = blockY;
+    program.blockZ = blockZ;
+    for (int pc = 0; pc < instructionCount; pc++) {
+        scratch[pc] = tcCompute(program, scratch, pc);
+    }
+    return scratch[root];
+}
+
+// A router entry read the way vanilla reads it: a flat-cache wrapper answers from the chunk's
+// five-by-five quart table, and only a miss outside those columns falls through to the exact
+// program. One chunk's blocks always fall inside its own columns, but the miss path is ported
+// anyway -- the vein-gap entry could be wrapped on some world the same way erosion is.
+__device__ __forceinline__ double tcRouterEntry(const char* blob, const long long* offsets,
+                                                int instructionCount, int root,
+                                                const double* flatTable, int firstQuartX,
+                                                int firstQuartZ, int blockX, int blockY,
+                                                int blockZ, double* scratch) {
+    if (flatTable == 0) {
+        return tcEvaluatePlain(blob, offsets, instructionCount, root, blockX, blockY, blockZ,
+                scratch);
+    }
+    int quartX = (blockX >> 2) - firstQuartX;
+    int quartZ = (blockZ >> 2) - firstQuartZ;
+    if (quartX >= 0 && quartZ >= 0 && quartX < 5 && quartZ < 5) {
+        return flatTable[quartX + quartZ * 5];
+    }
+    return tcEvaluatePlain(blob, offsets, instructionCount, root, blockX, blockY, blockZ,
+            scratch);
+}
+
+// Aquifer's calculatePressure between two cells, verbatim. The barrier noise is evaluated at
+// most once per block: the first pressure that needs it computes it through the memo the
+// caller owns, and the rest reuse the value -- the same single-evaluation MaterialRules does
+// with its NaN scratch slot.
+__device__ __forceinline__ double tcCalculatePressure(int posY, int level1, int type1,
+                                                       int level2, int type2, int posX,
+                                                       int posZ, const char* barrierBlob,
+                                                       const long long* barrierOffsets,
+                                                       int barrierCount, int barrierRoot,
+                                                       const double* barrierFlatTable,
+                                                       int firstQuartX, int firstQuartZ,
+                                                       double* scratch, bool* barrierComputed,
+                                                       double* barrierValue) {
+    int at1 = posY < level1 ? type1 : TC_DECIDE_AIR;
+    int at2 = posY < level2 ? type2 : TC_DECIDE_AIR;
+    bool oppositeFluids = (at1 == TC_DECIDE_LAVA && at2 == TC_DECIDE_WATER)
+            || (at1 == TC_DECIDE_WATER && at2 == TC_DECIDE_LAVA);
+    if (oppositeFluids) {
+        return 2.0;
+    }
+
+    int fluidYDiff = level1 < level2 ? level2 - level1 : level1 - level2;
+    if (fluidYDiff == 0) {
+        return 0.0;
+    }
+
+    double averageFluidY = 0.5 * (level1 + level2);
+    double howFarAboveAverage = posY + 0.5 - averageFluidY;
+    double baseValue = fluidYDiff / 2.0;
+    double distanceFromBarrierEdge = baseValue - fabs(howFarAboveAverage);
+    double gradient;
+    if (howFarAboveAverage > 0.0) {
+        double centerPoint = distanceFromBarrierEdge;
+        gradient = centerPoint > 0.0 ? centerPoint / 1.5 : centerPoint / 2.5;
+    } else {
+        double centerPoint = 3.0 + distanceFromBarrierEdge;
+        gradient = centerPoint > 0.0 ? centerPoint / 3.0 : centerPoint / 10.0;
+    }
+
+    double noiseValue = 0.0;
+    if (gradient >= -2.0 && gradient <= 2.0) {
+        if (!(*barrierComputed)) {
+            *barrierValue = tcRouterEntry(barrierBlob, barrierOffsets, barrierCount, barrierRoot,
+                    barrierFlatTable, firstQuartX, firstQuartZ, posX, posY, posZ, scratch);
+            *barrierComputed = true;
+        }
+        noiseValue = *barrierValue;
+    }
+    return 2.0 * (noiseValue + gradient);
+}
+
+// The aquifer's per-block half, the veinifier's whole body, and the default behind them: a
+// verbatim port of MaterialRules.compute. The grid cells' locations and fluid statuses arrive
+// from the host (G2a's shape); the barrier and vein-gap noises evaluate on the device through
+// their lowered programs, or read the chunk's five-by-five table when the entry is wrapped.
+extern "C" __global__ void terracuda_material_decide(
+        const double* __restrict__ density,     // count, the beard already folded in
+        const double* __restrict__ veinToggle,  // count, or null with veins off
+        const double* __restrict__ veinRidged,  // count, or null with veins off
+        const long long* __restrict__ cellLocations,  // gridTotal packed positions
+        const int* __restrict__ cellLevels,     // gridTotal
+        const int* __restrict__ cellTypes,      // gridTotal, TC_DECIDE_WATER or TC_DECIDE_LAVA
+        int minGridX, int minGridY, int minGridZ,
+        int gridSizeX, int gridSizeY, int gridSizeZ,
+        int skipSamplingAboveY,
+        int seaLevel,
+        const char* __restrict__ barrierBlob, const long long* __restrict__ barrierOffsets,
+        int barrierCount, int barrierRoot,
+        const double* __restrict__ barrierFlatTable,  // null unless the entry is flat wrapped
+        const char* __restrict__ veinGapBlob, const long long* __restrict__ veinGapOffsets,
+        int veinGapCount, int veinGapRoot,
+        const double* __restrict__ veinGapFlatTable,   // as above, for the vein-gap entry
+        long long oreSeedLo, long long oreSeedHi,
+        int firstQuartX, int firstQuartZ,
+        double* __restrict__ scratch,          // count * programScratch doubles
+        int programScratch,
+        int* __restrict__ decisions,           // count
+        int* __restrict__ fluidFlags,          // count, the aquifer's fluid-tick request
+        int chunkMinBlockX, int minY, int chunkMinBlockZ, int height,
+        int aquifersEnabled, int oreVeinsEnabled,
+        int count) {
+    int index = blockIdx.x * blockDim.x + threadIdx.x;
+    if (index >= count) {
+        return;
+    }
+
+    int xLocal, zLocal, yLocal;
+    tcBlockLocal(index, 16, height, &xLocal, &zLocal, &yLocal);
+    int posX = chunkMinBlockX + xLocal;
+    int posY = minY + yLocal;
+    int posZ = chunkMinBlockZ + zLocal;
+    double value = density[index];
+    double* myScratch = scratch + (long long) index * programScratch;
+
+    int decision = TC_DECIDE_DEFAULT;
+    int fluidFlag = 0;
+
+    // The filler's global fluid picker is a pure function of y: below both levels it is lava,
+    // otherwise the sea. Each use derives its own pair the way computeFluid(x, y, z) would.
+    if (aquifersEnabled && value <= 0.0) {
+        bool lavaPick = posY < min(-54, seaLevel);
+        int globalLevel = lavaPick ? -54 : seaLevel;
+        int globalType = lavaPick ? TC_DECIDE_LAVA : TC_DECIDE_WATER;
+        int globalAtY = posY < globalLevel ? globalType : TC_DECIDE_AIR;
+
+        if (posY > skipSamplingAboveY) {
+            decision = globalAtY;
+        } else if (globalAtY == TC_DECIDE_LAVA) {
+            decision = TC_DECIDE_LAVA;
+        } else {
+            int xAnchor = (posX - 5) >> 4;
+            int yAnchor = tcFloorDiv(posY + 1, 12);
+            int zAnchor = (posZ - 5) >> 4;
+            int distanceSqr1 = 0x7FFFFFFF;
+            int distanceSqr2 = 0x7FFFFFFF;
+            int distanceSqr3 = 0x7FFFFFFF;
+            int distanceSqr4 = 0x7FFFFFFF;
+            int closestIndex1 = 0;
+            int closestIndex2 = 0;
+            int closestIndex3 = 0;
+            int closestIndex4 = 0;
+
+            for (int x1 = 0; x1 <= 1; x1++) {
+                for (int y1 = -1; y1 <= 1; y1++) {
+                    for (int z1 = 0; z1 <= 1; z1++) {
+                        int cellX = xAnchor + x1 - minGridX;
+                        int cellY = yAnchor + y1 - minGridY;
+                        int cellZ = zAnchor + z1 - minGridZ;
+                        int idx = (cellY * gridSizeZ + cellZ) * gridSizeX + cellX;
+
+                        long long location = cellLocations[idx];
+                        int dx = tcUnpackX(location) - posX;
+                        int dy = tcUnpackY(location) - posY;
+                        int dz = tcUnpackZ(location) - posZ;
+                        int newDistance = dx * dx + dy * dy + dz * dz;
+                        // The >= chain is verbatim: on a tie the later cell takes the earlier
+                        // slot, and that ordering is terrain.
+                        if (distanceSqr1 >= newDistance) {
+                            closestIndex4 = closestIndex3;
+                            closestIndex3 = closestIndex2;
+                            closestIndex2 = closestIndex1;
+                            closestIndex1 = idx;
+                            distanceSqr4 = distanceSqr3;
+                            distanceSqr3 = distanceSqr2;
+                            distanceSqr2 = distanceSqr1;
+                            distanceSqr1 = newDistance;
+                        } else if (distanceSqr2 >= newDistance) {
+                            closestIndex4 = closestIndex3;
+                            closestIndex3 = closestIndex2;
+                            closestIndex2 = idx;
+                            distanceSqr4 = distanceSqr3;
+                            distanceSqr3 = distanceSqr2;
+                            distanceSqr2 = newDistance;
+                        } else if (distanceSqr3 >= newDistance) {
+                            closestIndex4 = closestIndex3;
+                            closestIndex3 = idx;
+                            distanceSqr4 = distanceSqr3;
+                            distanceSqr3 = newDistance;
+                        } else if (distanceSqr4 >= newDistance) {
+                            closestIndex4 = idx;
+                            distanceSqr4 = newDistance;
+                        }
+                    }
+                }
+            }
+
+            int level1 = cellLevels[closestIndex1];
+            int type1 = cellTypes[closestIndex1];
+            int level2 = cellLevels[closestIndex2];
+            int type2 = cellTypes[closestIndex2];
+            int level3 = cellLevels[closestIndex3];
+            int type3 = cellTypes[closestIndex3];
+            double similarity12 = 1.0 - (double) (distanceSqr2 - distanceSqr1) / 25.0;
+            int at1 = posY < level1 ? type1 : TC_DECIDE_AIR;
+
+            if (similarity12 <= 0.0) {
+                // Beyond the blend band: the nearest cell's fluid, with the flowing-update
+                // similarity deciding whether the tick is worth scheduling.
+                if (similarity12 >= TC_FLOWING_UPDATE_SIMILARITY
+                        && !(level1 == level2 && type1 == type2)) {
+                    fluidFlag = 1;
+                }
+                decision = at1;
+            } else if (at1 == TC_DECIDE_WATER) {
+                // The water-over-lava check reads the picker one block below.
+                bool lavaBelow = (posY - 1) < min(-54, seaLevel) && (posY - 1) < -54;
+                if (lavaBelow) {
+                    fluidFlag = 1;
+                    decision = at1;
+                }
+            }
+
+            if (decision == TC_DECIDE_DEFAULT && similarity12 > 0.0
+                    && (at1 != TC_DECIDE_WATER || !((posY - 1) < min(-54, seaLevel) && (posY - 1) < -54))) {
+                // The barrier band: three pressures, the barrier evaluated once, and the
+                // decline that hands the block to the veinifier or the default.
+                bool barrierComputed = false;
+                double barrierValue = 0.0;
+
+                double barrier12 = similarity12 * tcCalculatePressure(posY, level1, type1,
+                        level2, type2, posX, posZ, barrierBlob, barrierOffsets, barrierCount,
+                        barrierRoot, barrierFlatTable, firstQuartX, firstQuartZ, myScratch,
+                        &barrierComputed, &barrierValue);
+                bool declined = value + barrier12 > 0.0;
+                double similarity13 = 1.0 - (double) (distanceSqr3 - distanceSqr1) / 25.0;
+                if (!declined && similarity13 > 0.0) {
+                    double barrier13 = similarity12 * similarity13 * tcCalculatePressure(posY,
+                            level1, type1, level3, type3, posX, posZ, barrierBlob,
+                            barrierOffsets, barrierCount, barrierRoot, barrierFlatTable,
+                            firstQuartX, firstQuartZ, myScratch, &barrierComputed, &barrierValue);
+                    declined = value + barrier13 > 0.0;
+                }
+                double similarity23 = 1.0 - (double) (distanceSqr3 - distanceSqr2) / 25.0;
+                if (!declined && similarity23 > 0.0) {
+                    double barrier23 = similarity12 * similarity23 * tcCalculatePressure(posY,
+                            level2, type2, level3, type3, posX, posZ, barrierBlob,
+                            barrierOffsets, barrierCount, barrierRoot, barrierFlatTable,
+                            firstQuartX, firstQuartZ, myScratch, &barrierComputed, &barrierValue);
+                    declined = value + barrier23 > 0.0;
+                }
+
+                if (!declined) {
+                    // Nothing declined: the nearest cell's fluid, and the flow bookkeeping in
+                    // the original's order.
+                    bool mayFlow12 = !(level1 == level2 && type1 == type2);
+                    bool mayFlow23 = similarity23 >= TC_FLOWING_UPDATE_SIMILARITY
+                            && !(level2 == level3 && type2 == type3);
+                    bool mayFlow13 = similarity13 >= TC_FLOWING_UPDATE_SIMILARITY
+                            && !(level1 == level3 && type1 == type3);
+                    if (!mayFlow12 && !mayFlow23 && !mayFlow13) {
+                        int level4 = cellLevels[closestIndex4];
+                        int type4 = cellTypes[closestIndex4];
+                        fluidFlag = similarity13 >= TC_FLOWING_UPDATE_SIMILARITY
+                                && (1.0 - (double) (distanceSqr4 - distanceSqr1) / 25.0)
+                                           >= TC_FLOWING_UPDATE_SIMILARITY
+                                && !(level1 == level4 && type1 == type4) ? 1 : 0;
+                    } else {
+                        fluidFlag = 1;
+                    }
+                    decision = at1;
+                }
+            }
+        }
+    } else if (!aquifersEnabled && value <= 0.0) {
+        // The disabled aquifer: the global picker and nothing else.
+        bool lavaPick = posY < min(-54, seaLevel);
+        int globalLevel = lavaPick ? -54 : seaLevel;
+        decision = posY < globalLevel
+                ? (lavaPick ? TC_DECIDE_LAVA : TC_DECIDE_WATER)
+                : TC_DECIDE_AIR;
+    }
+
+    // The veinifier, on whatever the aquifer declined. The float literals widen exactly the way
+    // the Java comparisons do; the draw order is the veinifier's own.
+    if (oreVeinsEnabled && decision == TC_DECIDE_DEFAULT) {
+        double veininess = veinToggle[index];
+        bool copper = veininess > 0.0;
+        double ridged = fabs(veininess);
+        int typeMaxY = copper ? 50 : -8;
+        int typeMinY = copper ? 0 : -60;
+        int distanceFromTop = typeMaxY - posY;
+        int distanceFromBottom = posY - typeMinY;
+        if (distanceFromBottom >= 0 && distanceFromTop >= 0) {
+            int distanceFromEdge = min(distanceFromTop, distanceFromBottom);
+            double edgeRoundoff = tcClampedMap((double) distanceFromEdge, 0.0, 20.0, -0.2, 0.0);
+            if (ridged + edgeRoundoff >= (double) 0.4f) {
+                TcXoroshiro random = tcXoroshiro(tcGetSeed(posX, posY, posZ) ^ oreSeedLo, oreSeedHi);
+                if (tcXoroshiroNextFloat(&random) <= 0.7f && veinRidged[index] < 0.0) {
+                    double richness = tcClampedMap(ridged, (double) 0.4f, (double) 0.6f,
+                            (double) 0.1f, (double) 0.3f);
+                    bool richEnough = tcXoroshiroNextFloat(&random) < richness;
+                    if (richEnough) {
+                        double gap = tcRouterEntry(veinGapBlob, veinGapOffsets, veinGapCount,
+                                veinGapRoot, veinGapFlatTable, firstQuartX, firstQuartZ, posX,
+                                posY, posZ, myScratch);
+                        if (gap > (double) -0.3f) {
+                            bool rawOre = tcXoroshiroNextFloat(&random) < 0.02f;
+                            decision = copper
+                                    ? (rawOre ? TC_DECIDE_RAW_COPPER : TC_DECIDE_COPPER_ORE)
+                                    : (rawOre ? TC_DECIDE_RAW_IRON : TC_DECIDE_DEEPSLATE_IRON_ORE);
+                        } else {
+                            decision = copper ? TC_DECIDE_GRANITE : TC_DECIDE_TUFF;
+                        }
+                    } else {
+                        decision = copper ? TC_DECIDE_GRANITE : TC_DECIDE_TUFF;
+                    }
+                }
+            }
+        }
+    }
+
+    decisions[index] = decision;
+    fluidFlags[index] = fluidFlag;
+}

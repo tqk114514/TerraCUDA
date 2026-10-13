@@ -272,6 +272,77 @@ public final class MaterialRules {
         return this.shouldScheduleFluidUpdate;
     }
 
+    /**
+     * The whole grid, exported eagerly: every cell's packed location and fluid status, the bounds
+     * they live at, and the sampling cutoff. This is what the device half of G2a consumes — the
+     * CPU stops at the cells the lazy path would visit and hands the tables over instead.
+     *
+     * <p>The statuses are the same objects the lazy lookups would produce: computing them eagerly
+     * only runs {@code computeFluid} on cells the per-block search might never have asked about.
+     * Types are exported as decision ids ({@code 1} water, {@code 2} lava) because the only fluid
+     * states an aquifer cell can hold are the two the picker offers.
+     */
+    public GridTables exportGrid() {
+        long[] locations = new long[this.aquiferLocationCache.length];
+        int[] levels = new int[this.aquiferCache.length];
+        int[] types = new int[this.aquiferCache.length];
+        for (int index = 0; index < locations.length; index++) {
+            if (this.aquiferLocationCache[index] == Long.MAX_VALUE) {
+                this.aquiferLocationCache[index] = this.locationAt(index);
+            }
+            locations[index] = this.aquiferLocationCache[index];
+            Aquifer.FluidStatus status = getAquiferStatus(index);
+            levels[index] = status.fluidLevel();
+            types[index] = status.fluidType() == LAVA ? DECISION_LAVA : DECISION_WATER;
+        }
+        return new GridTables(this.minGridX, this.minGridY, this.minGridZ,
+                this.gridSizeX, this.gridSizeY, this.gridSizeZ, locations, levels, types,
+                this.skipSamplingAboveY);
+    }
+
+    /** The location of one grid cell, exactly as the per-block path derives it lazily. */
+    private long locationAt(int index) {
+        int gridX = this.minGridX + index % this.gridSizeX;
+        int remaining = index / this.gridSizeX;
+        int gridZ = this.minGridZ + remaining % this.gridSizeZ;
+        int gridY = this.minGridY + remaining / this.gridSizeZ;
+        XoroshiroRandom random = this.aquiferRandom.at(gridX, gridY, gridZ);
+        return pack(fromGridX(gridX, random.nextInt(10)),
+                fromGridY(gridY, random.nextInt(9)),
+                fromGridZ(gridZ, random.nextInt(10)));
+    }
+
+    /**
+     * The chunk's five-by-five flat-cache table for a wrapped entry, or {@code null} when the
+     * entry is read exactly. The device half of G2a reads the same table the CPU entry builds.
+     */
+    public static double[] flatCacheTableOrNull(DensityInterpreter interpreter,
+            DensityProgram program, int chunkX, int chunkZ) {
+        if (!rootIsFlatCache(program)) {
+            return null;
+        }
+        int firstQuartX = chunkX * 16 >> 2;
+        int firstQuartZ = chunkZ * 16 >> 2;
+        double[] table = new double[FLAT_CACHE_SIZE * FLAT_CACHE_SIZE];
+        for (int x = 0; x < FLAT_CACHE_SIZE; x++) {
+            for (int z = 0; z < FLAT_CACHE_SIZE; z++) {
+                table[x + z * FLAT_CACHE_SIZE] =
+                        interpreter.evaluate((firstQuartX + x) << 2, 0, (firstQuartZ + z) << 2);
+            }
+        }
+        return table;
+    }
+
+    /** The grid tables the device half of the material rules consumes. */
+    public record GridTables(int minGridX, int minGridY, int minGridZ,
+            int gridSizeX, int gridSizeY, int gridSizeZ,
+            long[] locations, int[] levels, int[] types, int skipSamplingAboveY) {
+    }
+
+    /** The decision ids the device kernel and the host share; see MaterialDeciderGpu. */
+    public static final int DECISION_WATER = 1;
+    public static final int DECISION_LAVA = 2;
+
     // ------------------------------------------------------------------------------------------
     // Aquifer
     // ------------------------------------------------------------------------------------------

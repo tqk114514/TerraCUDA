@@ -53,9 +53,11 @@ MC 26.1.2 / NeoForge 26.1.2.114 / Java 25 / `mod_id=terracuda`。远端 `github.
 ## 下一步（按性价比序）
 
 1. **G2：规则与 aquifer 上 GPU**（第二代设计的主杠杆，§19 后成为唯一剩下的结构杠杆）：
-   MaterialRules 树走 DensityCompiler 的既有 lowering 路线进设备管线，replay worker 退化
-   为纯写回——把设备+replay 两段熔成一段设备阶段，消灭接力本身。cap 下的延迟重排
-   （L2、G1 批处理）已三次实测为死路，只有砍停留总量的结构杠杆有效。
+   **归因已完成（§20 + 设计文档 §6）**——applyRules 的 4.8 ms = 噪声采样 ~42% +
+   逐块邻域算术 ~53% + beard 12%，M3 的"分支表驱动"否决与画像不符。三阶段落地：
+   **G2a** 逐块决策内核（C 层，输入表先由 CPU 供）证明 GPU 形态与 parity →
+   **G2b** 格点/barrier 程序上设备（A/B 层，消灭 CPU 供表）→ **G2c** 输出改方块 id、
+   relay 退化为纯写回。每步 92 测试 + 逐位三链 + 同日基准独立验收。
 2. **客户端场景**（未测）：节流器 4÷dwell 的世界；`-Ptiming` 逐层仪表直接可用，
    需要手动玩家操作。
 3. 已封案：FEATURES 杠杆（§17）、L4 无头（§16）、L2 lane（§15）、G1 批处理-屏障

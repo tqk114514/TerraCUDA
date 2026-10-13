@@ -52,12 +52,13 @@ MC 26.1.2 / NeoForge 26.1.2.114 / Java 25 / `mod_id=terracuda`。远端 `github.
 
 ## 下一步（按性价比序）
 
-1. **26.3 适配重估**（§17 判决后的真正分岔）：offload 形态无头管线已贴近结构上限——
-   剩余停留全是队列/正确性约束（noise svc 105–146、features queue ~74、light ~31）。
-   float 栈把整本账缩小一个量级（§14），`PooledSampleBuffer`/`NoiseSampler.fill` 是干净
-   注入点（zFastNoise 走的就是它，MPL-2.0 只参考不抄）。
+1. **26.3 移植决策**（评估已完成：[`docs/26.3噪声栈移植评估.md`](docs/26.3噪声栈移植评估.md)
+   + 性能笔记 §18）：值得做、按"26.1 基本盘"优先级排。若立项：首周 parity 原语 float 化
+   （测试架构全复用、无深水区），随后平移调度层先测 26.3 vanilla 的 dwell 归因——
+   dispatcher 墙若仍在（大概率），26.3 首发卖点与 26.1 相同：offload 包。净空间 ~7-9 ms/
+   区块，是 26.1 时代的三分之一；zFastNoise 占 populate 半场（MPL，只参考不抄），互补不冲突。
 2. **客户端场景**（未测）：节流器 4÷dwell 的世界，队列结构完全不同——L2 与浅队列的
-   假设在那里才有意义；`-Ptiming` 的逐层仪表直接可用。
+   假设在那里才有意义；`-Ptiming` 的逐层仪表直接可用。需要手动玩家操作。
 3. 已封案不再追：FEATURES 杠杆（§17：svc 4.5 ms 矿石放置 + 波串行 queue 70 ms，
    正确性约束）；L4 无头（§16：FULL 塌缩到 4.5 ms）。
    `-PreplayCapacity=8` 是延迟调优档（noise p50 −28%、端到端持平，§17），默认 16 保守。

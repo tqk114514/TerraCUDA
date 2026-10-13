@@ -52,12 +52,12 @@ MC 26.1.2 / NeoForge 26.1.2.114 / Java 25 / `mod_id=terracuda`。远端 `github.
 
 ## 下一步（按性价比序）
 
-1. **G2：规则与 aquifer 上 GPU**（第二代设计的主杠杆，§19 后成为唯一剩下的结构杠杆）：
-   **归因已完成（§20 + 设计文档 §6）**——applyRules 的 4.8 ms = 噪声采样 ~42% +
-   逐块邻域算术 ~53% + beard 12%，M3 的"分支表驱动"否决与画像不符。三阶段落地：
-   **G2a** 逐块决策内核（C 层，输入表先由 CPU 供）证明 GPU 形态与 parity →
-   **G2b** 格点/barrier 程序上设备（A/B 层，消灭 CPU 供表）→ **G2c** 输出改方块 id、
-   relay 退化为纯写回。每步 92 测试 + 逐位三链 + 同日基准独立验收。
+1. **G2：规则与 aquifer 上 GPU**（唯一剩下的结构杠杆）。**G2a 已落地**（§21，
+   `b3a8b7f`）：`terracuda_material_decide` 内核 + `MaterialDeciderGpu` 管道，
+   6 区块 589,824 块对 CPU 全路径逐位一致（含 AIR 语义陷阱的修正），94 测试全绿。
+   剩余：**G2b** 格点半场的噪声上设备（`exportGrid` 的流体状态计算——floodedness/
+   spread/lava + erosion/depth flat 表 + K0 地表水位——消灭 CPU 供表）→ **G2c** 输出翻
+   方块 id、relay 退化纯写回（砍停留总量的那刀）。每步 94 测试 + 逐位验收 + 同日基准。
 2. **客户端场景**（未测）：节流器 4÷dwell 的世界；`-Ptiming` 逐层仪表直接可用，
    需要手动玩家操作。
 3. 已封案：FEATURES 杠杆（§17）、L4 无头（§16）、L2 lane（§15）、G1 批处理-屏障

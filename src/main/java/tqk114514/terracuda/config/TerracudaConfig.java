@@ -122,6 +122,16 @@ public final class TerracudaConfig {
     }
 
     /**
+     * How many chunks may sit between the device thread and the rules workers. The default of
+     * sixteen was measured against the queue-coupling loss at the ~145 chunks/s era; every
+     * queued chunk also pays its depth in latency, so a higher pipeline rate may prefer a
+     * shallower queue. {@code -PreplayCapacity=N} overrides for the scan.
+     */
+    public static int replayCapacity() {
+        return Integer.getInteger(PREFIX + "replayCapacity", 16);
+    }
+
+    /**
      * How many rules-and-write-back workers run the CPU half of a chunk. The router interpreters
      * carry per-chunk state, so each worker owns a set.
      *

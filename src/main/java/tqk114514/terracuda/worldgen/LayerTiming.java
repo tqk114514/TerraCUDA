@@ -88,6 +88,24 @@ public final class LayerTiming {
         }
     }
 
+    /** Queue wait at the offload executor: submit to run start, from the wrapped body. */
+    public static void recordQueue(ChunkStatus status, long nanos) {
+        Bucket bucket = bucket(status);
+        synchronized (bucket) {
+            bucket.queues.add(nanos);
+        }
+        capOrReport();
+    }
+
+    /** Offloaded body service: run start to the stage's own future completing. */
+    public static void recordService(ChunkStatus status, long nanos) {
+        Bucket bucket = bucket(status);
+        synchronized (bucket) {
+            bucket.services.add(nanos);
+        }
+        capOrReport();
+    }
+
     public static void recordDwell(long nanos) {
         synchronized (DWELLS) {
             DWELLS.add(nanos);
@@ -112,7 +130,8 @@ public final class LayerTiming {
             synchronized (BUCKETS) {
                 for (Bucket bucket : BUCKETS.values()) {
                     synchronized (bucket) {
-                        live += bucket.walls.size() + bucket.requeues.size();
+                        live += bucket.walls.size() + bucket.requeues.size()
+                                + bucket.queues.size() + bucket.services.size();
                     }
                 }
             }
@@ -159,9 +178,13 @@ public final class LayerTiming {
                         drained.steps = entry.getValue().steps;
                         drained.walls = entry.getValue().walls;
                         drained.requeues = entry.getValue().requeues;
+                        drained.queues = entry.getValue().queues;
+                        drained.services = entry.getValue().services;
                         entry.getValue().steps = 0;
                         entry.getValue().walls = new ArrayList<>();
                         entry.getValue().requeues = new ArrayList<>();
+                        entry.getValue().queues = new ArrayList<>();
+                        entry.getValue().services = new ArrayList<>();
                     }
                     if (drained.steps > 0 || !drained.walls.isEmpty()) {
                         snapshot.put(entry.getKey(), drained);
@@ -175,11 +198,13 @@ public final class LayerTiming {
 
             for (Map.Entry<ChunkStatus, Bucket> entry : snapshot.entrySet()) {
                 Bucket bucket = entry.getValue();
-                StringBuilder message = new StringBuilder(160)
+                StringBuilder message = new StringBuilder(192)
                         .append("TerraCUDA: layer ").append(entry.getKey().getName())
                         .append(" steps ").append(bucket.steps);
                 describe(message, " wall ", bucket.walls);
                 describe(message, " requeue ", bucket.requeues);
+                describe(message, " queue ", bucket.queues);
+                describe(message, " svc ", bucket.services);
                 if (droppedSamples > 0) {
                     message.append(" [").append(droppedSamples).append(" capped windows]");
                     droppedSamples = 0;
@@ -223,5 +248,7 @@ public final class LayerTiming {
         private long steps;
         private List<Long> walls = new ArrayList<>();
         private List<Long> requeues = new ArrayList<>();
+        private List<Long> queues = new ArrayList<>();
+        private List<Long> services = new ArrayList<>();
     }
 }

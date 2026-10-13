@@ -111,6 +111,8 @@ def terracudaWorkers = (findProperty('terracuda.rulesWorkers') ?: findProperty('
 // 50). Headless throughput is in-flight / per-chunk dwell, so a benchmark's number is only
 // comparable against another at the same declared cap.
 def terracudaChunkyWorking = (findProperty('terracuda.chunkyWorking') ?: findProperty('chunkyWorking') ?: '0').toString()
+// -PreplayCapacity=N overrides the device-thread-to-rules-workers queue depth (default 16).
+def terracudaReplayCapacity = (findProperty('terracuda.replayCapacity') ?: findProperty('replayCapacity') ?: '0').toString()
 
 neoForge {
     version = project.neo_version
@@ -178,6 +180,9 @@ neoForge {
             }
             if (terracudaChunkyWorking != '0') {
                 jvmArguments.add("-Dchunky.maxWorkingCount=$terracudaChunkyWorking")
+            }
+            if (terracudaReplayCapacity != '0') {
+                jvmArguments.add("-Dterracuda.replayCapacity=$terracudaReplayCapacity")
             }
             if (terracudaWorkers != '2') {
                 jvmArguments.add("-Dterracuda.rulesWorkers=$terracudaWorkers")

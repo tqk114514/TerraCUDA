@@ -18,10 +18,12 @@ import net.minecraft.world.level.chunk.status.ChunkStep;
 import net.minecraft.world.level.chunk.status.WorldGenContext;
 
 import org.spongepowered.asm.mixin.Mixin;
+import org.spongepowered.asm.mixin.Unique;
 import org.spongepowered.asm.mixin.injection.At;
 
 import tqk114514.terracuda.TerraCUDA;
 import tqk114514.terracuda.config.TerracudaConfig;
+import tqk114514.terracuda.worldgen.LayerTiming;
 
 /**
  * Moves the write-isolated generation stages off the serial stage dispatcher, behind
@@ -93,11 +95,8 @@ public abstract class ChunkStepMixin {
                 TerraCUDA.LOGGER.info("TerraCUDA: moving radius-0 stages (NOISE, SURFACE, CARVERS) "
                         + "off the serial dispatcher ({})", TerracudaConfig.summary());
             }
-            // supplyAsync wraps doWork's own future in another future; thenCompose flattens the two
-            // so the caller still sees the stage's completion, exactly as it would synchronously.
-            return CompletableFuture.supplyAsync(() -> original.call(task, context, step, cache, chunk),
-                            Util.backgroundExecutor())
-                    .thenCompose(future -> future);
+            return this.terracuda$offload(task, context, step, cache, chunk, original,
+                    Util.backgroundExecutor());
         }
 
         if (radius == 1 && step.targetStatus() == ChunkStatus.FEATURES
@@ -106,11 +105,41 @@ public abstract class ChunkStepMixin {
                 TerraCUDA.LOGGER.info("TerraCUDA: moving FEATURES to a dedicated thread "
                         + "({})", TerracudaConfig.summary());
             }
-            return CompletableFuture.supplyAsync(() -> original.call(task, context, step, cache, chunk),
-                            FEATURES_EXECUTOR)
-                    .thenCompose(future -> future);
+            return this.terracuda$offload(task, context, step, cache, chunk, original,
+                    FEATURES_EXECUTOR);
         }
 
         return original.call(task, context, step, cache, chunk);
+    }
+
+    /**
+     * Submits the body to the executor; when timing is on, splits the offloaded time into the
+     * queue wait (submit to run start) and the service (run start to the stage's own future
+     * completing — for a synchronous body that is the body itself; for one that escapes
+     * internally, like NOISE, it includes that inner wait exactly as the lane sees it).
+     */
+    @Unique
+    private CompletableFuture<ChunkAccess> terracuda$offload(ChunkStatusTask task,
+            WorldGenContext context, ChunkStep step, StaticCache2D<GenerationChunkHolder> cache,
+            ChunkAccess chunk, Operation<CompletableFuture<ChunkAccess>> original,
+            java.util.concurrent.Executor executor) {
+        if (!LayerTiming.enabled()) {
+            return CompletableFuture.supplyAsync(() -> original.call(task, context, step, cache, chunk), executor)
+                    .thenCompose(future -> future);
+        }
+        ChunkStatus status = step.targetStatus();
+        long queuedAt = System.nanoTime();
+        return CompletableFuture.supplyAsync(() -> {
+            long startAt = System.nanoTime();
+            LayerTiming.recordQueue(status, startAt - queuedAt);
+            CompletableFuture<ChunkAccess> body = original.call(task, context, step, cache, chunk);
+            if (body.isDone()) {
+                LayerTiming.recordService(status, System.nanoTime() - startAt);
+            } else {
+                body.whenComplete((result, throwable) ->
+                        LayerTiming.recordService(status, System.nanoTime() - startAt));
+            }
+            return body;
+        }, executor).thenCompose(future -> future);
     }
 }

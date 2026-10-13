@@ -71,8 +71,11 @@ public final class GpuWorldgenService implements AutoCloseable {
      * stages alternately starve and flood each other — the measurement at capacity 4 showed both
      * sides at 63% busy, the 37% gap being pure queue-coupling loss. Sixteen absorbs the jitter,
      * and the density buffer pool self-limits to the chunks actually in flight (~19 sets × 2.3 MB).
+     * Every queued chunk also waits its queue-depth in latency, so at a higher pipeline rate a
+     * shallower queue trades that latency for coupling risk — {@code -Dterracuda.replayCapacity}
+     * overrides for the scan that says which side of the trade the current rate wants.
      */
-    private static final int REPLAY_CAPACITY = 16;
+    private static final int REPLAY_CAPACITY = tqk114514.terracuda.config.TerracudaConfig.replayCapacity();
 
     /** One service per world. Released on server stop — see {@link #releaseAll()}. */
     private static final Map<RandomState, GpuWorldgenService> SERVICES = new ConcurrentHashMap<>();

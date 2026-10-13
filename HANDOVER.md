@@ -52,13 +52,15 @@ MC 26.1.2 / NeoForge 26.1.2.114 / Java 25 / `mod_id=terracuda`。远端 `github.
 
 ## 下一步（按性价比序）
 
-1. **FEATURES 层的 85 ms**（§16 靶心，offload 态每区块停留的大头）：第二线程需要写区
-   gate（旧实测轮询吃掉收益，需更便宜的仲裁）；或直接 profile `applyBiomeDecoration`
-   砍服务时间。改一处测一处。
-2. **L4 已被 §16 否决**（无头）：offload 形态下 FULL 层只剩 4.5 ms，无收益空间；
-   vanilla 侧的 FULL 积压在 offload 开启时自然消失。客户端场景另说（未测）。
-3. 26.3 适配重估：`PooledSampleBuffer`/`NoiseSampler.fill` 是干净注入点（zFastNoise 走的
-   就是它，MPL-2.0 只参考不抄）；调度层资产跨版本保值，GPU 密度价值需重测。
+1. **26.3 适配重估**（§17 判决后的真正分岔）：offload 形态无头管线已贴近结构上限——
+   剩余停留全是队列/正确性约束（noise svc 105–146、features queue ~74、light ~31）。
+   float 栈把整本账缩小一个量级（§14），`PooledSampleBuffer`/`NoiseSampler.fill` 是干净
+   注入点（zFastNoise 走的就是它，MPL-2.0 只参考不抄）。
+2. **客户端场景**（未测）：节流器 4÷dwell 的世界，队列结构完全不同——L2 与浅队列的
+   假设在那里才有意义；`-Ptiming` 的逐层仪表直接可用。
+3. 已封案不再追：FEATURES 杠杆（§17：svc 4.5 ms 矿石放置 + 波串行 queue 70 ms，
+   正确性约束）；L4 无头（§16：FULL 塌缩到 4.5 ms）。
+   `-PreplayCapacity=8` 是延迟调优档（noise p50 −28%、端到端持平，§17），默认 16 保守。
 
 ## 关键命令
 
@@ -85,6 +87,7 @@ Remove-Item -Recurse -Force run/world, run/chunky -ErrorAction SilentlyContinue
 # 其他开关
 ./gradlew runServer -PrulesWorkers=3  # 改 worker 数（诊断用）
 ./gradlew runServer -Ptakeover -Ptiming -PnoFeatures  # offload 开着但 FEATURES 留在 dispatcher（诊断用）
+./gradlew runServer -Ptakeover -Ptiming -PreplayCapacity=8   # 延迟调优档（noise p50 −28%，§17；也可叠 -Poffload）
 ./gradlew runServer -Ptakeover -Ptiming -PchunkyWorking=100  # 覆盖 Chunky 在飞上限（跨研究比较必须声明 cap）
 # 逐线程 busy% 采样（哪条线程是墙）：.\benchmark\thread-sampler.ps1 -Samples 4 -IntervalSeconds 10
 # 跑分前查后台负载（victoria3/ffmpeg 教训）——外部污染是废数字的根源

@@ -283,20 +283,18 @@ public final class MaterialRules {
      * states an aquifer cell can hold are the two the picker offers.
      */
     public GridTables exportGrid() {
-        long[] locations = new long[this.aquiferLocationCache.length];
         int[] levels = new int[this.aquiferCache.length];
         int[] types = new int[this.aquiferCache.length];
-        for (int index = 0; index < locations.length; index++) {
+        for (int index = 0; index < levels.length; index++) {
             if (this.aquiferLocationCache[index] == Long.MAX_VALUE) {
                 this.aquiferLocationCache[index] = this.locationAt(index);
             }
-            locations[index] = this.aquiferLocationCache[index];
             Aquifer.FluidStatus status = getAquiferStatus(index);
             levels[index] = status.fluidLevel();
             types[index] = status.fluidType() == LAVA ? DECISION_LAVA : DECISION_WATER;
         }
         return new GridTables(this.minGridX, this.minGridY, this.minGridZ,
-                this.gridSizeX, this.gridSizeY, this.gridSizeZ, locations, levels, types,
+                this.gridSizeX, this.gridSizeY, this.gridSizeZ, levels, types,
                 this.skipSamplingAboveY);
     }
 
@@ -336,7 +334,7 @@ public final class MaterialRules {
     /** The grid tables the device half of the material rules consumes. */
     public record GridTables(int minGridX, int minGridY, int minGridZ,
             int gridSizeX, int gridSizeY, int gridSizeZ,
-            long[] locations, int[] levels, int[] types, int skipSamplingAboveY) {
+            int[] levels, int[] types, int skipSamplingAboveY) {
     }
 
     /** The decision ids the device kernel and the host share; see MaterialDeciderGpu. */

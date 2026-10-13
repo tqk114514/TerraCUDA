@@ -39,6 +39,8 @@ public final class MaterialDeciderGpu implements AutoCloseable {
     private final int seaLevel;
     private final long oreSeedLo;
     private final long oreSeedHi;
+    private final long aquiferSeedLo;
+    private final long aquiferSeedHi;
     private final boolean aquifersEnabled;
     private final boolean oreVeinsEnabled;
 
@@ -61,7 +63,6 @@ public final class MaterialDeciderGpu implements AutoCloseable {
     private final CudaContext.DeviceBuffer density;
     private final CudaContext.DeviceBuffer veinToggle;
     private final CudaContext.DeviceBuffer veinRidged;
-    private final CudaContext.DeviceBuffer cellLocations;
     private final CudaContext.DeviceBuffer cellLevels;
     private final CudaContext.DeviceBuffer cellTypes;
     private final CudaContext.DeviceBuffer barrierFlat;
@@ -74,7 +75,6 @@ public final class MaterialDeciderGpu implements AutoCloseable {
     private final MemorySegment hostDensity;
     private final MemorySegment hostVeinToggle;
     private final MemorySegment hostVeinRidged;
-    private final MemorySegment hostCellLocations;
     private final MemorySegment hostCellLevels;
     private final MemorySegment hostCellTypes;
     private final MemorySegment hostDecisions;
@@ -84,7 +84,8 @@ public final class MaterialDeciderGpu implements AutoCloseable {
     private boolean closed;
 
     public MaterialDeciderGpu(CudaContext context, NoiseSettings geometry, int seaLevel,
-            long oreSeedLo, long oreSeedHi, boolean aquifersEnabled, boolean oreVeinsEnabled,
+            long oreSeedLo, long oreSeedHi, long aquiferSeedLo, long aquiferSeedHi,
+            boolean aquifersEnabled, boolean oreVeinsEnabled,
             DensityInterpreter barrierInterpreter, DensityProgram barrierProgram,
             DensityInterpreter veinGapInterpreter, DensityProgram veinGapProgram) {
         this.context = context;
@@ -93,6 +94,8 @@ public final class MaterialDeciderGpu implements AutoCloseable {
         this.seaLevel = seaLevel;
         this.oreSeedLo = oreSeedLo;
         this.oreSeedHi = oreSeedHi;
+        this.aquiferSeedLo = aquiferSeedLo;
+        this.aquiferSeedHi = aquiferSeedHi;
         this.aquifersEnabled = aquifersEnabled;
         this.oreVeinsEnabled = oreVeinsEnabled;
         this.barrierInterpreter = barrierInterpreter;
@@ -117,8 +120,6 @@ public final class MaterialDeciderGpu implements AutoCloseable {
         this.density = context.allocate((long) this.count * Double.BYTES);
         this.veinToggle = context.allocate((long) this.count * Double.BYTES);
         this.veinRidged = context.allocate((long) this.count * Double.BYTES);
-        this.cellLocations = context.allocate(
-                (long) MAX_GRID_XZ * MAX_GRID_Y * MAX_GRID_XZ * Long.BYTES);
         this.cellLevels = context.allocate((long) MAX_GRID_XZ * MAX_GRID_Y * MAX_GRID_XZ * 4L);
         this.cellTypes = context.allocate((long) MAX_GRID_XZ * MAX_GRID_Y * MAX_GRID_XZ * 4L);
         this.barrierFlat = context.allocate(25L * Double.BYTES);
@@ -130,8 +131,6 @@ public final class MaterialDeciderGpu implements AutoCloseable {
         this.hostDensity = this.hostArena.allocate((long) this.count * Double.BYTES);
         this.hostVeinToggle = this.hostArena.allocate((long) this.count * Double.BYTES);
         this.hostVeinRidged = this.hostArena.allocate((long) this.count * Double.BYTES);
-        this.hostCellLocations = this.hostArena.allocate(
-                (long) MAX_GRID_XZ * MAX_GRID_Y * MAX_GRID_XZ * Long.BYTES);
         this.hostCellLevels = this.hostArena.allocate(
                 (long) MAX_GRID_XZ * MAX_GRID_Y * MAX_GRID_XZ * 4L);
         this.hostCellTypes = this.hostArena.allocate(
@@ -157,8 +156,8 @@ public final class MaterialDeciderGpu implements AutoCloseable {
             throw new IllegalStateException("the decider is closed");
         }
         MaterialRules.GridTables tables = rules.exportGrid();
-        if (tables.locations().length > MAX_GRID_XZ * MAX_GRID_Y * MAX_GRID_XZ) {
-            throw new IllegalStateException("grid of " + tables.locations().length
+        if (tables.levels().length > MAX_GRID_XZ * MAX_GRID_Y * MAX_GRID_XZ) {
+            throw new IllegalStateException("grid of " + tables.levels().length
                     + " cells exceeds the decider's " + MAX_GRID_XZ * MAX_GRID_Y * MAX_GRID_XZ);
         }
 
@@ -171,9 +170,6 @@ public final class MaterialDeciderGpu implements AutoCloseable {
             this.context.copyToDevice(this.hostVeinRidged, this.veinRidged);
         }
 
-        MemorySegment.copy(tables.locations(), 0, this.hostCellLocations,
-                ValueLayout.JAVA_LONG, 0, tables.locations().length);
-        this.context.copyToDevice(this.hostCellLocations, this.cellLocations);
         copyInts(this.hostCellLevels, tables.levels());
         this.context.copyToDevice(this.hostCellLevels, this.cellLevels);
         copyInts(this.hostCellTypes, tables.types());
@@ -199,11 +195,10 @@ public final class MaterialDeciderGpu implements AutoCloseable {
         long barrierFlatAddress = barrierTable != null ? this.barrierFlat.address() : 0L;
         long veinGapFlatAddress = veinGapTable != null ? this.veinGapFlat.address() : 0L;
 
-        try (KernelArguments arguments = new KernelArguments(39)) {
+        try (KernelArguments arguments = new KernelArguments(40)) {
             arguments.addDevicePointer(this.density.address())
                     .addDevicePointer(this.oreVeinsEnabled ? this.veinToggle.address() : 0L)
                     .addDevicePointer(this.oreVeinsEnabled ? this.veinRidged.address() : 0L)
-                    .addDevicePointer(this.cellLocations.address())
                     .addDevicePointer(this.cellLevels.address())
                     .addDevicePointer(this.cellTypes.address())
                     .addInt(tables.minGridX()).addInt(tables.minGridY()).addInt(tables.minGridZ())
@@ -219,6 +214,7 @@ public final class MaterialDeciderGpu implements AutoCloseable {
                     .addInt(this.veinGapCount).addInt(this.veinGapRoot)
                     .addDevicePointer(veinGapFlatAddress)
                     .addLong(this.oreSeedLo).addLong(this.oreSeedHi)
+                    .addLong(this.aquiferSeedLo).addLong(this.aquiferSeedHi)
                     .addInt(firstQuartX).addInt(firstQuartZ)
                     .addDevicePointer(this.scratch.address())
                     .addInt(this.programScratch)
@@ -302,8 +298,7 @@ public final class MaterialDeciderGpu implements AutoCloseable {
             return;
         }
         for (CudaContext.DeviceBuffer buffer : new CudaContext.DeviceBuffer[] {
-                this.density, this.veinToggle, this.veinRidged, this.cellLocations,
-                this.cellLevels, this.cellTypes, this.barrierFlat, this.veinGapFlat,
+                this.density, this.veinToggle, this.veinRidged, this.cellLevels, this.cellTypes, this.barrierFlat, this.veinGapFlat,
                 this.scratch, this.decisions, this.fluidFlags, this.barrierBlob,
                 this.barrierOffsets, this.veinGapBlob, this.veinGapOffsets}) {
             this.context.free(buffer);

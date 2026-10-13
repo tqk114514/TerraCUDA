@@ -829,6 +829,26 @@ __device__ __forceinline__ float tcXoroshiroNextFloat(TcXoroshiro* state) {
     return (float) (bits >> 40) * 5.9604645E-8f;
 }
 
+// XoroshiroRandom.nextInt(bound): vanilla's unbiased sampling. The draw is widened to
+// unsigned, multiplied by the bound in 64 bits, and rejected from the low 32 bits until it
+// lands outside the biased tail -- the loop is the point, and the modulo of the two's
+// complement negation is computed exactly as Integer.remainderUnsigned does.
+__device__ __forceinline__ int tcXoroshiroNextInt(TcXoroshiro* state, int bound) {
+    unsigned long long randomBits = (unsigned int) (int) tcXoroshiroNextLong(state);
+    unsigned long long multiplied = randomBits * (unsigned long long) (unsigned) bound;
+    unsigned long long fractional = multiplied & 4294967295ULL;
+    if (fractional < (unsigned long long) (unsigned) bound) {
+        unsigned long long unbiasedStart =
+                (unsigned long long) (unsigned) (~bound + 1) % (unsigned long long) (unsigned) bound;
+        while (fractional < unbiasedStart) {
+            randomBits = (unsigned int) (int) tcXoroshiroNextLong(state);
+            multiplied = randomBits * (unsigned long long) (unsigned) bound;
+            fractional = multiplied & 4294967295ULL;
+        }
+    }
+    return (int) (multiplied >> 32);
+}
+
 // The first float draw of the positional source at each point: what the ore veinifier opens
 // with, and what the G2a parity test pins the whole chain against.
 extern "C" __global__ void terracuda_xoroshiro_float_points(
@@ -988,7 +1008,6 @@ extern "C" __global__ void terracuda_material_decide(
         const double* __restrict__ density,     // count, the beard already folded in
         const double* __restrict__ veinToggle,  // count, or null with veins off
         const double* __restrict__ veinRidged,  // count, or null with veins off
-        const long long* __restrict__ cellLocations,  // gridTotal packed positions
         const int* __restrict__ cellLevels,     // gridTotal
         const int* __restrict__ cellTypes,      // gridTotal, TC_DECIDE_WATER or TC_DECIDE_LAVA
         int minGridX, int minGridY, int minGridZ,
@@ -1002,6 +1021,7 @@ extern "C" __global__ void terracuda_material_decide(
         int veinGapCount, int veinGapRoot,
         const double* __restrict__ veinGapFlatTable,   // as above, for the vein-gap entry
         long long oreSeedLo, long long oreSeedHi,
+        long long aquiferSeedLo, long long aquiferSeedHi,
         int firstQuartX, int firstQuartZ,
         double* __restrict__ scratch,          // count * programScratch doubles
         int programScratch,
@@ -1054,12 +1074,29 @@ extern "C" __global__ void terracuda_material_decide(
             for (int x1 = 0; x1 <= 1; x1++) {
                 for (int y1 = -1; y1 <= 1; y1++) {
                     for (int z1 = 0; z1 <= 1; z1++) {
-                        int cellX = xAnchor + x1 - minGridX;
-                        int cellY = yAnchor + y1 - minGridY;
-                        int cellZ = zAnchor + z1 - minGridZ;
+                        int spacedGridX = xAnchor + x1;
+                        int spacedGridY = yAnchor + y1;
+                        int spacedGridZ = zAnchor + z1;
+                        int cellX = spacedGridX - minGridX;
+                        int cellY = spacedGridY - minGridY;
+                        int cellZ = spacedGridZ - minGridZ;
                         int idx = (cellY * gridSizeZ + cellZ) * gridSizeX + cellX;
 
-                        long long location = cellLocations[idx];
+                        // The cell's location is a pure function of its grid
+                        // position, so it is recomputed where it is read instead of uploaded:
+                        // the aquifer's positional source, three bounded draws, the pack.
+                        TcXoroshiro cellRandom = tcXoroshiro(
+                                tcGetSeed(spacedGridX, spacedGridY, spacedGridZ) ^ aquiferSeedLo,
+                                aquiferSeedHi);
+                        int cellOffsetX = tcXoroshiroNextInt(&cellRandom, 10);
+                        int cellOffsetY = tcXoroshiroNextInt(&cellRandom, 9);
+                        int cellOffsetZ = tcXoroshiroNextInt(&cellRandom, 10);
+                        int cellBlockX = (spacedGridX << 4) + cellOffsetX;
+                        int cellBlockY = spacedGridY * 12 + cellOffsetY;
+                        int cellBlockZ = (spacedGridZ << 4) + cellOffsetZ;
+                        long long location = (((long long) cellBlockX & 0x3FFFFFFLL) << 38)
+                                | (((long long) cellBlockZ & 0x3FFFFFFLL) << 12)
+                                | ((long long) cellBlockY & 0xFFFLL);
                         int dx = tcUnpackX(location) - posX;
                         int dy = tcUnpackY(location) - posY;
                         int dz = tcUnpackZ(location) - posZ;
@@ -1222,4 +1259,32 @@ extern "C" __global__ void terracuda_material_decide(
 
     decisions[index] = decision;
     fluidFlags[index] = fluidFlag;
+}
+
+// The aquifer grid's location chain at each cell: the three bounded draws, in the argument
+// order MaterialRules draws them, packed the way it packs them. G2b's location supply is this
+// chain computed where it is read, so the parity test drives it against the CPU reference.
+extern "C" __global__ void terracuda_xoroshiro_grid_locations(
+        long long seedLo, long long seedHi,
+        const int* __restrict__ points,   // 3 * count grid cells
+        long long* __restrict__ results,  // count packed locations
+        int count) {
+    int index = blockIdx.x * blockDim.x + threadIdx.x;
+    if (index >= count) {
+        return;
+    }
+    long long positionalSeed = tcGetSeed(points[3 * index], points[3 * index + 1],
+            points[3 * index + 2]);
+    TcXoroshiro state = tcXoroshiro(positionalSeed ^ seedLo, seedHi);
+    int x = tcXoroshiroNextInt(&state, 10);
+    int y = tcXoroshiroNextInt(&state, 9);
+    int z = tcXoroshiroNextInt(&state, 10);
+    // fromGridX/fromGridY/fromGridZ: the packed location holds the cell's block position,
+    // not the raw draws -- the y scaling is what keeps the ranking three-dimensional.
+    int blockX = (points[3 * index] << 4) + x;
+    int blockY = points[3 * index + 1] * 12 + y;
+    int blockZ = (points[3 * index + 2] << 4) + z;
+    results[index] = (((long long) blockX & 0x3FFFFFFLL) << 38)
+            | (((long long) blockZ & 0x3FFFFFFLL) << 12)
+            | ((long long) blockY & 0xFFFLL);
 }

@@ -133,4 +133,91 @@ class XoroshiroGpuTest {
         }
         return coordinates;
     }
+
+    /**
+     * G2b's supply chain: the aquifer grid's packed location per cell -- the three bounded draws
+     * in MaterialRules' argument order, packed in MaterialRules' layout -- must match the CPU
+     * reference exactly, under the rejection-sampling bounds that exercise the unbiased tail.
+     */
+    @Test
+    void theGridLocationChainMatchesTheCpuReferenceBitForBit() {
+        CudaEnvironment environment = CudaEnvironment.detect();
+        assumeTrue(environment.available(), "no CUDA device on this machine");
+        Optional<CudaDriver> loaded = CudaDriver.tryLoad();
+        assumeTrue(loaded.isPresent(), "no CUDA driver library on this machine");
+
+        try (CudaDriver driver = loaded.get()) {
+            driver.init();
+            CudaDeviceInfo device = environment.firstDevice().orElseThrow();
+            try (CudaContext context = CudaContext.create(driver, device.index())) {
+                CudaKernels.loadModule(context, device);
+
+                int[] points = points();
+                long[][] pairs = {
+                    {0x9E3779B97F4A7C15L, 0x6A09E667F3BCC909L},
+                    {-4523168431819676477L, 123456789L},
+                    {0L, 0L},
+                    {VanillaMath.getSeed(0, 0, 0), 0L},
+                };
+
+                try (Arena arena = Arena.ofConfined()) {
+                    MemorySegment pointsSegment = arena.allocateFrom(ValueLayout.JAVA_INT, points);
+                    MemorySegment resultsSegment =
+                            arena.allocate((long) POINT_COUNT * Long.BYTES);
+                    CudaContext.DeviceBuffer devicePoints =
+                            context.allocate((long) points.length * Integer.BYTES);
+                    CudaContext.DeviceBuffer deviceResults =
+                            context.allocate((long) POINT_COUNT * Long.BYTES);
+                    context.copyToDevice(pointsSegment, devicePoints);
+
+                    for (long[] pair : pairs) {
+                        try (KernelArguments arguments = new KernelArguments(5)) {
+                            arguments.addLong(pair[0]).addLong(pair[1])
+                                    .addDevicePointer(devicePoints.address())
+                                    .addDevicePointer(deviceResults.address())
+                                    .addInt(POINT_COUNT);
+                            int grid = (POINT_COUNT + 127) / 128;
+                            context.launch("terracuda_xoroshiro_grid_locations", grid, 1, 1,
+                                    128, 1, 1, arguments);
+                        }
+                        context.synchronize();
+                        context.copyFromDevice(deviceResults, resultsSegment);
+
+                        int mismatches = 0;
+                        String[] first = new String[1];
+                        PositionalRandomFactory factory = new PositionalRandomFactory(pair[0], pair[1]);
+                        for (int i = 0; i < POINT_COUNT; i++) {
+                            var random = factory.at(points[3 * i], points[3 * i + 1], points[3 * i + 2]);
+                            int x = random.nextInt(10);
+                            int y = random.nextInt(9);
+                            int z = random.nextInt(10);
+                            // fromGridX/Y/Z: the pack holds block coordinates, not raw draws.
+                            long expected = ((long) ((points[3 * i] << 4) + x) & 0x3FFFFFFL) << 38
+                                    | ((long) ((points[3 * i + 2] << 4) + z) & 0x3FFFFFFL) << 12
+                                    | (long) (points[3 * i + 1] * 12 + y) & 0xFFFL;
+                            long actual = resultsSegment.get(ValueLayout.JAVA_LONG,
+                                    (long) i * Long.BYTES);
+                            if (expected != actual) {
+                                if (first[0] == null) {
+                                    first[0] = "(" + points[3 * i] + ", " + points[3 * i + 1]
+                                            + ", " + points[3 * i + 2] + ") seeds (" + pair[0]
+                                            + ", " + pair[1] + "): cpu " + expected
+                                            + " vs gpu " + actual;
+                                }
+                                mismatches++;
+                            }
+                        }
+                        int total = mismatches;
+                        long lo = pair[0];
+                        long hi = pair[1];
+                        assertEquals(0, total, () -> total + " of " + POINT_COUNT
+                                + " locations differ for seeds (" + lo + ", " + hi
+                                + "); first mismatch: " + first[0]);
+                    }
+                    context.free(devicePoints);
+                    context.free(deviceResults);
+                }
+            }
+        }
+    }
 }

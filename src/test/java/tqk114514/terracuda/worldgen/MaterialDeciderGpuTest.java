@@ -49,9 +49,11 @@ class MaterialDeciderGpuTest {
                 GpuChunkFiller.RulesContext rulesContext = filler.createRulesContext();
 
                 var oreRandom = VanillaRandomExport.export(randomState.oreRandom());
+                var aquiferRandom = VanillaRandomExport.export(randomState.aquiferRandom());
                 try (MaterialDeciderGpu decider = new MaterialDeciderGpu(context,
                         OverworldFixture.noiseSettings(), settings.seaLevel(),
                         oreRandom.seedLo(), oreRandom.seedHi(),
+                        aquiferRandom.seedLo(), aquiferRandom.seedHi(),
                         settings.isAquifersEnabled(), settings.oreVeinsEnabled(),
                         rulesContext.barrierNoise, rulesContext.barrierNoise.program(),
                         rulesContext.veinGap, rulesContext.veinGap.program())) {

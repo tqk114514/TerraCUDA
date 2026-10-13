@@ -197,6 +197,57 @@ public final class GpuChunkFiller implements AutoCloseable {
     }
 
     /**
+     * The wave form of {@link #emitDensities}: every chunk's device half in one submission set.
+     *
+     * <p>The generation dispatcher's layer sweep submits its chunks back to back, so the device
+     * thread sees them as a burst; queuing the burst as one wave replaces per-chunk corner
+     * launches and stream synchronisations with one of each per program. The three programs
+     * still submit their waves back to back and overlap on their own streams, exactly as the
+     * per-chunk form does — the wave changes the fan-in, not the overlap.
+     *
+     * <p>On failure the whole wave reports through its callers' futures and every chunk falls
+     * back to vanilla, the same containment the single form has.
+     */
+    public DensityBuffers[] emitDensitiesWave(int[] chunkXs, int[] chunkZs) {
+        int waveSize = chunkXs.length;
+        int count = 16 * 16 * this.geometry.height();
+        DensityBuffers[] buffers = new DensityBuffers[waveSize];
+        double[][] densityOuts = new double[waveSize][];
+        double[][] veinToggleOuts = this.oreVeinsEnabled ? new double[waveSize][] : null;
+        double[][] veinRidgedOuts = this.oreVeinsEnabled ? new double[waveSize][] : null;
+        for (int i = 0; i < waveSize; i++) {
+            buffers[i] = acquireBuffers(count);
+            densityOuts[i] = buffers[i].density();
+            if (this.oreVeinsEnabled) {
+                veinToggleOuts[i] = buffers[i].veinToggle();
+                veinRidgedOuts[i] = buffers[i].veinRidged();
+            }
+        }
+
+        long began = TIMING ? System.nanoTime() : 0L;
+        this.densityEvaluator.submitWave(this.geometry, chunkXs, chunkZs,
+                CornerInterpolation.LERP3, densityOuts);
+        if (this.oreVeinsEnabled) {
+            this.veinToggleEvaluator.submitWave(this.geometry, chunkXs, chunkZs,
+                    CornerInterpolation.INCREMENTAL, veinToggleOuts);
+            this.veinRidgedEvaluator.submitWave(this.geometry, chunkXs, chunkZs,
+                    CornerInterpolation.INCREMENTAL, veinRidgedOuts);
+        }
+        long densityAt = TIMING ? System.nanoTime() : 0L;
+        this.densityEvaluator.awaitWave();
+        if (this.oreVeinsEnabled) {
+            this.veinToggleEvaluator.awaitWave();
+            this.veinRidgedEvaluator.awaitWave();
+        }
+        long veinsAt = TIMING ? System.nanoTime() : 0L;
+        if (TIMING) {
+            this.densityNanos += densityAt - began;
+            this.veinNanos += veinsAt - densityAt;
+        }
+        return buffers;
+    }
+
+    /**
      * The CPU half of one chunk: the material rules over values the device already produced, plus
      * the fluid-update bitmap {@code doFill} maintains.
      *

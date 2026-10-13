@@ -53,16 +53,22 @@ public final class DensityEvaluatorGpu implements AutoCloseable {
     private final CudaContext.DeviceBuffer offsets;
     private final CudaContext.DeviceBuffer blockBlob;
     private final CudaContext.DeviceBuffer blockOffsets;
-    private final CudaContext.DeviceBuffer points;
-    private final CudaContext.DeviceBuffer scratch;
-    private final CudaContext.DeviceBuffer results;
+    private CudaContext.DeviceBuffer points;
+    private CudaContext.DeviceBuffer scratch;
+    private CudaContext.DeviceBuffer results;
     private CudaContext.DeviceBuffer roots;
     private CudaContext.DeviceBuffer markerBases;
     private CudaContext.DeviceBuffer markerSlots;
     private CudaContext.DeviceBuffer blockScratch;
     private CudaContext.DeviceBuffer blockResults;
-    private int[] combinedPoints;
-    private int[] combinedRoots;
+    /**
+     * The wave's host-side points and roots, reused across calls. A wave's points alone are
+     * hundreds of kilobytes — a fresh allocation of that size pays for its own page faults every
+     * call, which measured at more than the copy itself; the same lesson the single-chunk form's
+     * staging learned. Grown on demand to the steady-state wave size and kept there.
+     */
+    private int[] wavePoints;
+    private int[] waveRoots;
     /** Outlives a single call, so the staging segments can be reused instead of re-faulted. */
     private final Arena hostArena = Arena.ofShared();
     private MemorySegment hostPoints;
@@ -70,7 +76,7 @@ public final class DensityEvaluatorGpu implements AutoCloseable {
     private MemorySegment hostDoubles;
     private final int instructionCount;
     private final int root;
-    private final int capacity;
+    private int capacity;
 
     /**
      * This evaluator's private stream. Work queued on it runs in submission order — the corner
@@ -80,10 +86,11 @@ public final class DensityEvaluatorGpu implements AutoCloseable {
      */
     private final CudaContext.DeviceStream stream;
 
-    /** What {@link #submitChunk} queued and {@link #awaitChunk} will collect. */
-    private double[] pendingOut;
-    private MemorySegment pendingHost;
-    private int pendingCount;
+    /** What {@link #submitWave} queued and {@link #awaitWave} will collect. */
+    private double[][] waveOuts;
+    private MemorySegment waveHost;
+    private int waveCount;
+    private int waveSize;
 
     private boolean closed;
 
@@ -240,8 +247,7 @@ public final class DensityEvaluatorGpu implements AutoCloseable {
         }
         int count = blockCoordinates.length / 3;
         if (count > this.capacity) {
-            throw new IllegalArgumentException("batch of " + count + " points exceeds the "
-                    + this.capacity + "-point capacity");
+            growTo(count);
         }
         if (roots != null && roots.length != count) {
             throw new IllegalArgumentException("expected " + count + " roots, got " + roots.length);
@@ -305,6 +311,30 @@ public final class DensityEvaluatorGpu implements AutoCloseable {
     }
 
     /**
+     * Grows the per-point device buffers to hold at least {@code points} in one launch.
+     *
+     * <p>A wave submits several chunks' corner grids as a single launch, so the one-chunk budget the
+     * evaluator was built with is a floor, not a ceiling. Growth is safe when it happens: each
+     * evaluator's buffers are touched only by its own stream, its own stream is drained between
+     * waves (the filler awaits every wave before the next), and growing one evaluator's buffers
+     * cannot disturb another's in-flight kernels — the three programs run on separate streams.
+     */
+    private void growTo(int points) {
+        int grown = Math.max(points, this.capacity * 2);
+        this.context.free(this.points);
+        this.points = this.context.allocate(3L * grown * Integer.BYTES);
+        if (this.roots != null) {
+            this.context.free(this.roots);
+            this.roots = this.context.allocate((long) grown * Integer.BYTES);
+        }
+        this.context.free(this.scratch);
+        this.scratch = this.context.allocate((long) grown * this.instructionCount * Double.BYTES);
+        this.context.free(this.results);
+        this.results = this.context.allocate((long) grown * Double.BYTES);
+        this.capacity = grown;
+    }
+
+    /**
      * The value of the program at every block of one chunk — marker tables, blend and the DAG above
      * them, all on the device.
      *
@@ -351,6 +381,38 @@ public final class DensityEvaluatorGpu implements AutoCloseable {
      * @param order {@link tqk114514.terracuda.density.CornerInterpolation#LERP3} or {@code INCREMENTAL}
      */
     public void submitChunk(NoiseSettings settings, int chunkX, int chunkZ, int order, double[] out) {
+        submitWave(settings, new int[] {chunkX}, new int[] {chunkZ}, order, new double[][] {out});
+    }
+
+    /**
+     * Queues a whole wave of chunks' device half — corner tables, block passes, and the copies
+     * back — and returns without waiting.
+     *
+     * <p>The wave is the ripple's own shape: a layer sweep submits its chunks back to back, and
+     * queueing them as one batch changes the cost structure. The corner pass goes out as a
+     * single launch for the whole wave — its fixed cost measured at ~0.7 ms against a kernel
+     * that costs ~0.9 ms per chunk no matter how many ride along — and the stream is
+     * synchronised once per wave instead of once per chunk. The block pass still launches per
+     * chunk, because its origin is a kernel scalar, but each launch reads its own slice of the
+     * batched corner tables through a shifted pointer; the shared block scratch and results
+     * turn over between launches behind the stream's own ordering, which also makes the copy
+     * queued right after each launch safe.
+     *
+     * <p>The three programs of a chunk (density, vein toggle, vein ridged) queue their waves on
+     * their own streams and overlap, exactly as {@link #submitChunk} did for one chunk.
+     * Nothing may touch this evaluator's staging segments between {@code submitWave} and
+     * {@link #awaitWave()} — one caller at a time, submit-then-wait, is the contract the
+     * production path already follows.
+     *
+     * @param order {@link tqk114514.terracuda.density.CornerInterpolation#LERP3} or {@code INCREMENTAL}
+     */
+    public void submitWave(NoiseSettings settings, int[] chunkXs, int[] chunkZs, int order,
+            double[][] outs) {
+        int waveSize = chunkXs.length;
+        if (chunkZs.length != waveSize || outs.length != waveSize) {
+            throw new IllegalArgumentException("expected " + waveSize
+                    + " z coordinates and outputs, got " + chunkZs.length + " and " + outs.length);
+        }
         int[] cornerRoots = interpolatedRoots(this.image);
         int[] slots = interpolatedRoots(this.blockImage);
         if (cornerRoots.length != slots.length) {
@@ -362,54 +424,93 @@ public final class DensityEvaluatorGpu implements AutoCloseable {
         int countY = ChunkCornerTables.cornerCountY(settings);
         int perMarker = ChunkCornerTables.CORNERS_XZ * ChunkCornerTables.CORNERS_XZ * countY;
         int count = CHUNK_SIZE_XZ * CHUNK_SIZE_XZ * settings.height();
-        if (out.length != count) {
-            throw new IllegalArgumentException("expected " + count + " values, got " + out.length);
+        for (double[] out : outs) {
+            if (out.length != count) {
+                throw new IllegalArgumentException("expected " + count + " values, got "
+                        + out.length);
+            }
         }
 
         if (markerCount > 0) {
-            int[] corners = ChunkCornerTables.cornerCoordinates(settings, chunkX, chunkZ);
-            int pointsNeeded = markerCount * corners.length;
-            if (this.combinedPoints == null || this.combinedPoints.length != pointsNeeded) {
-                this.combinedPoints = new int[pointsNeeded];
-                this.combinedRoots = new int[markerCount * perMarker];
+            int[] corners = ChunkCornerTables.cornerCoordinates(settings, chunkXs[0], chunkZs[0]);
+            int pointsNeeded = waveSize * markerCount * corners.length;
+            int rootsNeeded = waveSize * markerCount * perMarker;
+            if (this.wavePoints == null || this.wavePoints.length != pointsNeeded) {
+                this.wavePoints = new int[pointsNeeded];
+                this.waveRoots = new int[rootsNeeded];
             }
-            for (int m = 0; m < markerCount; m++) {
-                System.arraycopy(corners, 0, this.combinedPoints, m * corners.length, corners.length);
-                java.util.Arrays.fill(this.combinedRoots, m * perMarker, (m + 1) * perMarker,
-                        cornerRoots[m]);
+            int at = 0;
+            for (int chunk = 0; chunk < waveSize; chunk++) {
+                if (chunk > 0) {
+                    corners = ChunkCornerTables.cornerCoordinates(settings, chunkXs[chunk],
+                            chunkZs[chunk]);
+                }
+                for (int m = 0; m < markerCount; m++) {
+                    System.arraycopy(corners, 0, this.wavePoints, at, corners.length);
+                    at += corners.length;
+                    java.util.Arrays.fill(this.waveRoots, (chunk * markerCount + m) * perMarker,
+                            (chunk * markerCount + m + 1) * perMarker, cornerRoots[m]);
+                }
             }
-            launch(this.combinedPoints, this.root, this.combinedRoots);
+            launch(this.wavePoints, this.root, this.waveRoots);
         }
 
         int blockInstructions = this.blockImage.instructionCount();
-        if (this.blockScratch == null) {
-            this.markerBases = this.context.allocate((long) Math.max(1, markerCount) * Integer.BYTES);
-            this.markerSlots = this.context.allocate((long) Math.max(1, markerCount) * Integer.BYTES);
-            this.blockResults = this.context.allocate((long) count * Double.BYTES);
-            this.blockScratch = this.context.allocate((long) count * blockInstructions * Double.BYTES);
+        ensureBlockBuffers(markerCount, perMarker, count, blockInstructions, slots);
 
-            // Bases and slots never change — where a marker's corner grid starts in the results and
-            // which instruction its blend lands in are properties of the program, not the chunk. They
-            // were uploaded per chunk inside a confined arena, which also meant the arena had to
-            // outlive nothing; now it really doesn't.
-            try (Arena arena = Arena.ofConfined()) {
-                int[] bases = new int[markerCount];
-                for (int m = 0; m < markerCount; m++) {
-                    bases[m] = m * perMarker;
-                }
-                this.context.copyToDevice(arena.allocateFrom(ValueLayout.JAVA_INT, bases),
-                        this.markerBases);
-                this.context.copyToDevice(arena.allocateFrom(ValueLayout.JAVA_INT, slots),
-                        this.markerSlots);
-            }
+        MemorySegment host = hostDoubles(count * waveSize);
+        for (int chunk = 0; chunk < waveSize; chunk++) {
+            long cornerTable = this.results.address()
+                    + (long) chunk * markerCount * perMarker * Double.BYTES;
+            launchBlocks(settings, chunkXs[chunk], chunkZs[chunk], order, cornerTable,
+                    markerCount, countY, blockInstructions);
+            this.context.copyFromDeviceAsync(this.blockResults,
+                    host.asSlice((long) chunk * count * Double.BYTES, (long) count * Double.BYTES),
+                    this.stream);
         }
 
+        this.waveOuts = outs;
+        this.waveHost = host;
+        this.waveCount = count;
+        this.waveSize = waveSize;
+    }
+
+    /**
+     * The per-chunk-sized block-pass buffers, allocated once: only the wave's corner tables
+     * vary, and the bases and slots they index with are properties of the program, not the chunk.
+     */
+    private void ensureBlockBuffers(int markerCount, int perMarker, int count, int blockInstructions,
+            int[] slots) {
+        if (this.blockScratch != null) {
+            return;
+        }
+        this.markerBases = this.context.allocate((long) Math.max(1, markerCount) * Integer.BYTES);
+        this.markerSlots = this.context.allocate((long) Math.max(1, markerCount) * Integer.BYTES);
+        this.blockResults = this.context.allocate((long) count * Double.BYTES);
+        this.blockScratch = this.context.allocate((long) count * blockInstructions * Double.BYTES);
+
+        try (Arena arena = Arena.ofConfined()) {
+            int[] bases = new int[markerCount];
+            for (int m = 0; m < markerCount; m++) {
+                bases[m] = m * perMarker;
+            }
+            this.context.copyToDevice(arena.allocateFrom(ValueLayout.JAVA_INT, bases),
+                    this.markerBases);
+            this.context.copyToDevice(arena.allocateFrom(ValueLayout.JAVA_INT, slots),
+                    this.markerSlots);
+        }
+    }
+
+    /** One chunk's block pass, reading its slice of the batched corner tables at {@code cornerTable}. */
+    private void launchBlocks(NoiseSettings settings, int chunkX, int chunkZ, int order,
+            long cornerTable, int markerCount, int countY, int blockInstructions) {
+        int count = CHUNK_SIZE_XZ * CHUNK_SIZE_XZ * settings.height();
         try (KernelArguments arguments = new KernelArguments(20)) {
             arguments.addDevicePointer(this.blockBlob.address())
                     .addDevicePointer(this.blockOffsets.address())
                     .addInt(blockInstructions)
                     .addInt(this.blockImage.root())
-                    .addDevicePointer(this.results.address())
+                    .addDevicePointer(cornerTable)
                     .addDevicePointer(this.markerBases.address())
                     .addDevicePointer(this.markerSlots.address())
                     .addInt(markerCount)
@@ -429,15 +530,6 @@ public final class DensityEvaluatorGpu implements AutoCloseable {
             this.context.launch(BLOCKS_KERNEL_NAME, grid, 1, 1, BLOCK_SIZE, 1, 1, arguments,
                     this.stream);
         }
-
-        // The staging segment is reused across calls: a fresh native allocation of this size pays
-        // for its own page faults every time, which measured at more than the copy itself.
-        MemorySegment host = hostDoubles(count);
-        this.context.copyFromDeviceAsync(this.blockResults, host.asSlice(0, (long) count * Double.BYTES),
-                this.stream);
-        this.pendingOut = out;
-        this.pendingHost = host;
-        this.pendingCount = count;
     }
 
     /**
@@ -447,9 +539,28 @@ public final class DensityEvaluatorGpu implements AutoCloseable {
      * not affect this one's results — the copy back already queued behind this stream's own kernels.
      */
     public void awaitChunk() {
+        awaitWave();
+    }
+
+    /**
+     * Waits for the wave's work and fills every array the wave was given.
+     *
+     * <p>One stream synchronisation per wave, not per chunk: the copies were already queued
+     * behind their kernels, so the wait lands on whichever chunk finishes last and the rest
+     * come home with it. Safe to interleave with waiting on other evaluators' waves — each
+     * wave's copies are queued behind its own stream's kernels.
+     */
+    public void awaitWave() {
         this.context.synchronizeStream(this.stream);
-        MemorySegment.copy(this.pendingHost, ValueLayout.JAVA_DOUBLE, 0L, this.pendingOut, 0,
-                this.pendingCount);
+        for (int chunk = 0; chunk < this.waveSize; chunk++) {
+            // The segment-to-array copy's offset is in bytes, not elements — the wave's slices
+            // are count doubles apart, so the byte distance is what lands each chunk in its
+            // own array. (Element offsets here were the wave's one real bug: chunk 1 read
+            // from inside chunk 0's slice and the values came out close-but-different.)
+            MemorySegment.copy(this.waveHost, ValueLayout.JAVA_DOUBLE,
+                    (long) chunk * this.waveCount * Double.BYTES, this.waveOuts[chunk], 0,
+                    this.waveCount);
+        }
     }
 
     /** The image instruction each interpolated marker wraps, in the image's own marker order. */

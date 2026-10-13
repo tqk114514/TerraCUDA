@@ -7,6 +7,7 @@ import static org.junit.jupiter.api.Assumptions.assumeTrue;
 
 import java.util.Optional;
 import net.minecraft.world.level.levelgen.RandomState;
+import net.minecraft.world.level.levelgen.NoiseSettings;
 import org.junit.jupiter.api.Test;
 import tqk114514.terracuda.TestParity;
 import tqk114514.terracuda.cuda.CudaContext;
@@ -143,10 +144,15 @@ class DensityEvaluatorGpuTest {
         }
     }
 
+    /**
+     * Waves grow the point buffers rather than fail: the one-chunk budget the evaluator was built
+     * with is a floor, because a wave's corner pass carries several chunks in one launch.
+     */
     @Test
-    void anOversizedBatchIsRejected() {
+    void anOversizedBatchGrowsToFit() {
         DensityProgram program =
                 DensityCompiler.lower(OverworldFixture.randomState().router().finalDensity());
+        DensityInterpreter reference = new DensityInterpreter(program);
 
         CudaEnvironment environment = CudaEnvironment.detect();
         assumeTrue(environment.available(), "no CUDA device on this machine");
@@ -159,8 +165,84 @@ class DensityEvaluatorGpuTest {
             try (CudaContext context = CudaContext.create(driver, device.index())) {
                 CudaKernels.loadModule(context, device);
                 try (DensityEvaluatorGpu gpu = new DensityEvaluatorGpu(context, program, 4)) {
-                    assertThrows(IllegalArgumentException.class, () -> gpu.evaluate(new int[3 * 5]));
+                    // Not a whole number of xyz triples stays a hard error.
                     assertThrows(IllegalArgumentException.class, () -> gpu.evaluate(new int[4]));
+
+                    int count = 5;
+                    int[] coordinates = blockCoordinates(count);
+                    double[] actual = gpu.evaluate(coordinates);
+                    assertTrue(gpu.capacity() >= count, "the buffers should have grown past 4, capacity is " + gpu.capacity());
+                    for (int i = 0; i < count; i++) {
+                        TestParity.assertDoubleIdentical(
+                                reference.evaluate(coordinates[3 * i], coordinates[3 * i + 1],
+                                        coordinates[3 * i + 2]), actual[i], "grown batch point " + i);
+                    }
+                }
+            }
+        }
+    }
+
+    /**
+     * G1's contract: the wave form is bit-identical to the per-chunk form. Eight chunks — enough to
+     * force the corner launch past its one-chunk budget and exercise the growth — go out as one
+     * submission set, and every value must come home exactly as the solo pass produced it.
+     */
+    @Test
+    void theWaveFormMatchesThePerChunkFormBitForBit() {
+        RandomState randomState = OverworldFixture.randomState();
+        DensityProgram program = DensityCompiler.lower(randomState.router().finalDensity());
+        NoiseSettings settings = OverworldFixture.noiseSettings();
+
+        CudaEnvironment environment = CudaEnvironment.detect();
+        assumeTrue(environment.available(), "no CUDA device on this machine");
+        Optional<CudaDriver> loaded = CudaDriver.tryLoad();
+        assumeTrue(loaded.isPresent(), "no CUDA driver library on this machine");
+
+        try (CudaDriver driver = loaded.get()) {
+            driver.init();
+            CudaDeviceInfo device = environment.firstDevice().orElseThrow();
+            try (CudaContext context = CudaContext.create(driver, device.index())) {
+                CudaKernels.loadModule(context, device);
+                try (DensityEvaluatorGpu gpu = DensityEvaluatorGpu.forProgram(context, program,
+                        settings)) {
+                    int[] xs = {0, 1, 2, 3, -1, -2, 5, 7};
+                    int[] zs = {0, -1, 2, -3, 4, -5, 6, -7};
+                    int waveSize = xs.length;
+                    double[][] solo = new double[waveSize][];
+                    for (int i = 0; i < waveSize; i++) {
+                        solo[i] = gpu.blocksForChunk(settings, xs[i], zs[i],
+                                tqk114514.terracuda.density.CornerInterpolation.LERP3);
+                    }
+
+                    int count = 16 * 16 * settings.height();
+                    double[][] wave = new double[waveSize][];
+                    for (int i = 0; i < waveSize; i++) {
+                        wave[i] = new double[count];
+                    }
+                    gpu.submitWave(settings, xs, zs,
+                            tqk114514.terracuda.density.CornerInterpolation.LERP3, wave);
+                    gpu.awaitWave();
+
+                    int mismatches = 0;
+                    String[] first = new String[1];
+                    for (int i = 0; i < waveSize; i++) {
+                        for (int j = 0; j < count; j++) {
+                            if (Double.doubleToRawLongBits(solo[i][j])
+                                    != Double.doubleToRawLongBits(wave[i][j])) {
+                                if (first[0] == null) {
+                                    first[0] = "chunk (" + xs[i] + ", " + zs[i] + ") value " + j
+                                            + ": solo " + solo[i][j] + " ("
+                                            + Double.doubleToRawLongBits(solo[i][j]) + ") vs wave "
+                                            + wave[i][j] + " (" + Double.doubleToRawLongBits(wave[i][j])
+                                            + ")";
+                                }
+                                mismatches++;
+                            }
+                        }
+                    }
+                    int total = mismatches;
+                    assertEquals(0, total, () -> total + " of " + waveSize * count
+                            + " values differ; first mismatch: " + first[0]);
                 }
             }
         }

@@ -92,7 +92,23 @@ public final class GpuWorldgenService implements AutoCloseable {
             Beardifier beardifier) {
     }
 
+    /** One chunk waiting for its device half; a wave is these, drained together. */
+    private record FillJob(ChunkAccess chunk, Beardifier beardifier, CompletableFuture<Void> done) {
+    }
+
+    /**
+     * The most chunks one device submission set will carry.
+     *
+     * <p>Sized by the ripple's wave, not by memory: a layer sweep delivers its neighbourhood at
+     * once and the queue behind it holds the rest, so a wave that overshoots simply splits. The
+     * batched corner launch grows this evaluator's point buffers on demand, and the pinned host
+     * staging grows with it — both settle at the steady-state wave size and stay there.
+     */
+    private static final int MAX_WAVE = 16;
+
     private final BlockingQueue<Job> jobs = new ArrayBlockingQueue<>(QUEUE_CAPACITY);
+    /** Fill jobs get their own queue: the wave drains them as a batch, everything else runs solo. */
+    private final BlockingQueue<FillJob> fillJobs = new ArrayBlockingQueue<>(QUEUE_CAPACITY);
     private final BlockingQueue<ReplayJob> replayJobs = new ArrayBlockingQueue<>(REPLAY_CAPACITY);
     private final CountDownLatch initialised = new CountDownLatch(1);
     private final Thread thread;
@@ -118,6 +134,8 @@ public final class GpuWorldgenService implements AutoCloseable {
     private long windowStartNanos;
     /** Per-job service times of the current window, kept for percentiles rather than a mean alone. */
     private final long[] serviceNanos = new long[TIMING_EVERY];
+    /** Waves this window, for the batch-mode acceptance: whether waves form at all, and how big. */
+    private long wavesInWindow;
 
     private CudaContext context;
     private GpuChunkFiller filler;
@@ -185,21 +203,32 @@ public final class GpuWorldgenService implements AutoCloseable {
         }
         try {
             while (!this.closed) {
-                Job job = this.jobs.poll(200, TimeUnit.MILLISECONDS);
-                if (job != null) {
-                    long began = TIMING ? System.nanoTime() : 0L;
-                    job.run(this.filler);
-                    if (TIMING) {
-                        long took = System.nanoTime() - began;
-                        this.busyNanos += took;
-                        this.serviceNanos[(int) (this.timedJobs % TIMING_EVERY)] = took;
-                        if (this.timedJobs == 0L) {
-                            this.windowStartNanos = began;
-                        }
-                        if (++this.timedJobs % TIMING_EVERY == 0) {
-                            reportTiming();
-                        }
+                FillJob head = this.fillJobs.poll();
+                if (head == null) {
+                    Job job = this.jobs.poll(200, TimeUnit.MILLISECONDS);
+                    if (job != null) {
+                        runTimed(1, () -> job.run(this.filler));
                     }
+                    continue;
+                }
+                if (TerracudaConfig.batch()) {
+                    // The wave: everything already waiting rides in one submission set. Only
+                    // immediately-available siblings join — the ripple delivers a layer's chunks
+                    // microseconds apart, so draining without waiting keeps the latency floor
+                    // where the per-chunk form had it.
+                    List<FillJob> wave = new ArrayList<>();
+                    wave.add(head);
+                    while (wave.size() < MAX_WAVE) {
+                        FillJob next = this.fillJobs.poll();
+                        if (next == null) {
+                            break;
+                        }
+                        wave.add(next);
+                    }
+                    runTimed(wave.size(), () -> emitWave(wave));
+                    this.wavesInWindow++;
+                } else {
+                    runTimed(1, () -> emitSingle(head));
                 }
             }
         } catch (InterruptedException e) {
@@ -247,6 +276,81 @@ public final class GpuWorldgenService implements AutoCloseable {
         }
     }
 
+    /** Device-thread work; the queue's blocking hand-off may interrupt it, and the loop catches that. */
+    private interface DeviceWork {
+        void run() throws InterruptedException;
+    }
+
+    /**
+     * Runs one unit of device-thread work and accounts it under the timing window.
+     *
+     * <p>A wave is timed as its chunks: the window's per-chunk service is the wave's wall divided
+     * across the chunks it carried, so the rate and the percentiles keep their meaning when the
+     * fan-in changes.
+     */
+    private void runTimed(int chunks, DeviceWork body) throws InterruptedException {
+        long began = TIMING ? System.nanoTime() : 0L;
+        body.run();
+        if (TIMING) {
+            long took = System.nanoTime() - began;
+            this.busyNanos += took;
+            if (this.timedJobs == 0L) {
+                this.windowStartNanos = began;
+            }
+            for (int i = 0; i < chunks; i++) {
+                this.serviceNanos[(int) (this.timedJobs % TIMING_EVERY)] = took / chunks;
+                if (++this.timedJobs % TIMING_EVERY == 0) {
+                    reportTiming();
+                }
+            }
+        }
+    }
+
+    /** The per-chunk form: emit one chunk's densities and hand its buffers to a rules worker. */
+    private void emitSingle(FillJob job) throws InterruptedException {
+        GpuChunkFiller.DensityBuffers buffers;
+        try {
+            buffers = this.filler.emitDensities(job.chunk().getPos().x(), job.chunk().getPos().z());
+        } catch (Throwable t) {
+            job.done().completeExceptionally(t);
+            return;
+        }
+        // A blocking hand-off: when the rules workers are REPLAY_CAPACITY chunks behind, the
+        // device thread waits here rather than running ahead in memory.
+        this.replayJobs.put(new ReplayJob(this.filler, job.chunk(), buffers, job.done(),
+                job.beardifier()));
+    }
+
+    /**
+     * The wave form: every waiting chunk's densities in one submission set, then the hand-offs.
+     *
+     * <p>A failure in the device half fails the whole wave through its futures and every chunk
+     * falls back to vanilla — the same containment the single form has, at wave granularity.
+     */
+    private void emitWave(List<FillJob> wave) throws InterruptedException {
+        int size = wave.size();
+        int[] xs = new int[size];
+        int[] zs = new int[size];
+        for (int i = 0; i < size; i++) {
+            xs[i] = wave.get(i).chunk().getPos().x();
+            zs[i] = wave.get(i).chunk().getPos().z();
+        }
+        GpuChunkFiller.DensityBuffers[] buffers;
+        try {
+            buffers = this.filler.emitDensitiesWave(xs, zs);
+        } catch (Throwable t) {
+            for (FillJob job : wave) {
+                job.done().completeExceptionally(t);
+            }
+            return;
+        }
+        for (int i = 0; i < size; i++) {
+            FillJob job = wave.get(i);
+            this.replayJobs.put(new ReplayJob(this.filler, job.chunk(), buffers[i], job.done(),
+                    job.beardifier()));
+        }
+    }
+
     /**
      * Logs what the GPU thread did over the last {@value #TIMING_EVERY} jobs, then starts a new
      * window.
@@ -283,6 +387,12 @@ public final class GpuWorldgenService implements AutoCloseable {
                     .append(")");
         }
         long emitted = this.filler == null ? 0 : this.filler.emittedChunks();
+        if (this.wavesInWindow > 0) {
+            message.append(" [").append(this.wavesInWindow).append(" waves, avg ")
+                    .append(String.format("%.1f", (double) this.timedJobs / this.wavesInWindow))
+                    .append(" chunks]");
+            this.wavesInWindow = 0;
+        }
         if (emitted > 0) {
             // Where the time goes: the density program and the two vein programs are queued on the
             // device thread and overlap on their own streams, the rules loop and the write-back run
@@ -372,18 +482,7 @@ public final class GpuWorldgenService implements AutoCloseable {
             done.completeExceptionally(new IllegalStateException(unavailableReason));
             return done;
         }
-        Job job = filler -> {
-            try {
-                GpuChunkFiller.DensityBuffers buffers =
-                        filler.emitDensities(chunk.getPos().x(), chunk.getPos().z());
-                // A blocking hand-off: when the rules worker is REPLAY_CAPACITY chunks behind, the
-                // device thread waits here rather than running ahead in memory.
-                this.replayJobs.put(new ReplayJob(filler, chunk, buffers, done, beardifier));
-            } catch (Throwable t) {
-                done.completeExceptionally(t);
-            }
-        };
-        if (!this.jobs.offer(job)) {
+        if (!this.fillJobs.offer(new FillJob(chunk, beardifier, done))) {
             // The device is behind. Blocking here would stall the dispatcher, and falling back to
             // vanilla is both correct and parallel, so the caller gets to choose.
             done.completeExceptionally(new IllegalStateException("the GPU queue is full"));

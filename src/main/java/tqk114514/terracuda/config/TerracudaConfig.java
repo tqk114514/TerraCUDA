@@ -132,6 +132,20 @@ public final class TerracudaConfig {
     }
 
     /**
+     * Whether the device thread drains the generation ripple's chunks as waves: everything
+     * already waiting rides in one submission set — one corner launch per program instead of
+     * one per chunk, and one stream synchronisation per program per wave.
+     *
+     * <p>The ripple delivers a layer's neighbourhood at once, so the queue behind the device
+     * thread is bursty; the wave is the shape of the burst. Bit-identical to the per-chunk form
+     * by construction — the same kernels read the same inputs, only the launch geometry and
+     * the waits change. See {@code docs/第二代管线设计.md} (G1).
+     */
+    public static boolean batch() {
+        return Boolean.getBoolean(PREFIX + "batch");
+    }
+
+    /**
      * How many rules-and-write-back workers run the CPU half of a chunk. The router interpreters
      * carry per-chunk state, so each worker owns a set.
      *
@@ -147,6 +161,7 @@ public final class TerracudaConfig {
     public static String summary() {
         return "gpu=" + gpuEnabled() + ", shadow=" + shadowMode() + ", verbose=" + verbose()
                 + ", timing=" + timing() + ", offload=" + offload()
-                + ", parallelSched=" + parallelSched() + ", rulesWorkers=" + rulesWorkers();
+                + ", parallelSched=" + parallelSched() + ", batch=" + batch()
+                + ", rulesWorkers=" + rulesWorkers();
     }
 }

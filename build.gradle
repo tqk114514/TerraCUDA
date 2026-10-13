@@ -113,6 +113,9 @@ def terracudaWorkers = (findProperty('terracuda.rulesWorkers') ?: findProperty('
 def terracudaChunkyWorking = (findProperty('terracuda.chunkyWorking') ?: findProperty('chunkyWorking') ?: '0').toString()
 // -PreplayCapacity=N overrides the device-thread-to-rules-workers queue depth (default 16).
 def terracudaReplayCapacity = (findProperty('terracuda.replayCapacity') ?: findProperty('replayCapacity') ?: '0').toString()
+// -Pbatch drains the generation ripple's chunks as waves: one corner launch and one stream sync
+// per program per wave instead of per chunk. The second-generation pipeline's G1 lever.
+def terracudaBatch = project.hasProperty('terracuda.batch') || project.hasProperty('batch')
 
 neoForge {
     version = project.neo_version
@@ -183,6 +186,9 @@ neoForge {
             }
             if (terracudaReplayCapacity != '0') {
                 jvmArguments.add("-Dterracuda.replayCapacity=$terracudaReplayCapacity")
+            }
+            if (terracudaBatch) {
+                jvmArguments.add('-Dterracuda.batch=true')
             }
             if (terracudaWorkers != '2') {
                 jvmArguments.add("-Dterracuda.rulesWorkers=$terracudaWorkers")

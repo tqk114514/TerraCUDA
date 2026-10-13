@@ -773,3 +773,75 @@ extern "C" __global__ void terracuda_density_blocks(
     }
     results[index] = values[program.root];
 }
+
+// ============================================================================================
+// Xoroshiro128++ — the positional draws the material rules need (G2a)
+// ============================================================================================
+
+// Mirrors tqk114514.terracuda.random.Xoroshiro128PlusPlus: two longs of state, vanilla's
+// golden/silver substitution on an all-zero state, and the ++ scrambler. No floating point
+// anywhere in the generator itself.
+struct TcXoroshiro {
+    unsigned long long seedLo;
+    unsigned long long seedHi;
+};
+
+__device__ __forceinline__ TcXoroshiro tcXoroshiro(long long seedLo, long long seedHi) {
+    TcXoroshiro state;
+    state.seedLo = (unsigned long long) seedLo;
+    state.seedHi = (unsigned long long) seedHi;
+    if ((state.seedLo | state.seedHi) == 0ULL) {
+        // RandomSupport.GOLDEN_RATIO_64 and SILVER_RATIO_64. Vanilla substitutes these for an
+        // all-zero state instead of rejecting it, and the substitution is observable output
+        // whenever a positional derivation lands on zero, so it is part of the port.
+        state.seedLo = 0x9E3779B97F4A7C15ULL;
+        state.seedHi = 0x6A09E667F3BCC909ULL;
+    }
+    return state;
+}
+
+__device__ __forceinline__ long long tcXoroshiroNextLong(TcXoroshiro* state) {
+    unsigned long long s0 = state->seedLo;
+    unsigned long long s1 = state->seedHi;
+    long long result = (long long) (((s0 + s1) << 17) | ((s0 + s1) >> 47)) + (long long) s0;
+    s1 ^= s0;
+    state->seedLo = (((s0 << 49) | (s0 >> 15)) ^ s1 ^ (s1 << 21));
+    state->seedHi = ((s1 << 28) | (s1 >> 36));
+    return result;
+}
+
+// Mth.getSeed. The x product is a 32-bit int multiply in Java -- it wraps in 32 bits and only
+// the widened result joins the long arithmetic -- so it is wrapped in unsigned 32 bits here and
+// reinterpreted, which is the same two's-complement value, then sign-extended like the Java
+// widening does. The rest is 64-bit throughout.
+__device__ __forceinline__ long long tcGetSeed(int x, int y, int z) {
+    int xProduct = (int) ((unsigned) x * 3129871u);
+    long long seed = (long long) xProduct ^ ((long long) z) * 116129781LL ^ (long long) y;
+    seed = seed * seed * 42317861LL + seed * 11LL;
+    return seed >> 16;
+}
+
+// XoroshiroRandom.nextFloat: the top 24 bits widened to float with round-to-nearest, then a
+// float multiply -- the same long-to-float conversion and float arithmetic Java's bytecode
+// performs, not the double shortcut that would move the last bits.
+__device__ __forceinline__ float tcXoroshiroNextFloat(TcXoroshiro* state) {
+    unsigned long long bits = (unsigned long long) tcXoroshiroNextLong(state);
+    return (float) (bits >> 40) * 5.9604645E-8f;
+}
+
+// The first float draw of the positional source at each point: what the ore veinifier opens
+// with, and what the G2a parity test pins the whole chain against.
+extern "C" __global__ void terracuda_xoroshiro_float_points(
+        long long seedLo, long long seedHi,
+        const int* __restrict__ points,   // 3 * count positions
+        float* __restrict__ results,      // count first draws
+        int count) {
+    int index = blockIdx.x * blockDim.x + threadIdx.x;
+    if (index >= count) {
+        return;
+    }
+    long long positionalSeed = tcGetSeed(points[3 * index], points[3 * index + 1],
+            points[3 * index + 2]);
+    TcXoroshiro state = tcXoroshiro(positionalSeed ^ seedLo, seedHi);
+    results[index] = tcXoroshiroNextFloat(&state);
+}

@@ -47,12 +47,17 @@ MC 26.1.2 / NeoForge 26.1.2.114 / Java 25 / `mod_id=terracuda`。远端 `github.
   ——平移自实验线并收窄判据（半径 0），激活时各打一行日志作为证据
 - **L2 调度 lane（`-PparallelSched`，默认关）**：阶段推进步骤上 N 条 lane——平移并验收，
   **无头协议下负结果**（端到端持平、噪声 p50 变差，§15 L2 节），保留作客户端场景的未测假设
+- **逐层归因仪表（`-Ptiming` 门控，对任何形态生效）**：`LayerTiming` 三把尺——每层
+  wall（首步→排空）、requeue（停泊续体往返）、task dwell；§16 有 vanilla/offload 两态解剖表
 
 ## 下一步（按性价比序）
 
-1. **逐层 schedule→complete 时间戳仪表**：L4（tick 中段泵/FULL 批处理）的立项前置——
-   先有归因再动刀；也是检验"客户端场景 L2 是否受益"的仪器。
-2. 26.3 适配重估：`PooledSampleBuffer`/`NoiseSampler.fill` 是干净注入点（zFastNoise 走的
+1. **FEATURES 层的 85 ms**（§16 靶心，offload 态每区块停留的大头）：第二线程需要写区
+   gate（旧实测轮询吃掉收益，需更便宜的仲裁）；或直接 profile `applyBiomeDecoration`
+   砍服务时间。改一处测一处。
+2. **L4 已被 §16 否决**（无头）：offload 形态下 FULL 层只剩 4.5 ms，无收益空间；
+   vanilla 侧的 FULL 积压在 offload 开启时自然消失。客户端场景另说（未测）。
+3. 26.3 适配重估：`PooledSampleBuffer`/`NoiseSampler.fill` 是干净注入点（zFastNoise 走的
    就是它，MPL-2.0 只参考不抄）；调度层资产跨版本保值，GPU 密度价值需重测。
 
 ## 关键命令

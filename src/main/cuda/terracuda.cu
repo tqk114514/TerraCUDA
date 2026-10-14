@@ -927,23 +927,37 @@ __device__ __forceinline__ double tcEvaluatePlain(const char* blob, const long l
     return scratch[root];
 }
 
-// A router entry read the way vanilla reads it: a flat-cache wrapper answers from the chunk's
-// five-by-five quart table, and only a miss outside those columns falls through to the exact
-// program. One chunk's blocks always fall inside its own columns, but the miss path is ported
-// anyway -- the vein-gap entry could be wrapped on some world the same way erosion is.
-__device__ __forceinline__ double tcRouterEntry(const char* blob, const long long* offsets,
-                                                int instructionCount, int root,
-                                                const double* flatTable, int firstQuartX,
-                                                int firstQuartZ, int blockX, int blockY,
-                                                int blockZ, double* scratch) {
-    if (flatTable == 0) {
+// The material grid's arithmetic helpers -- the clamped pair already exists for the spline
+// code, but the plain lerp, inverse lerp and clamp are this half's own.
+__device__ __forceinline__ double tcClamp(double value, double min, double max) {
+    return value < min ? min : value > max ? max : value;
+}
+
+__device__ __forceinline__ double tcLerp(double alpha, double start, double end) {
+    return start + alpha * (end - start);
+}
+
+__device__ __forceinline__ double tcInverseLerp(double value, double min, double max) {
+    return (value - min) / (max - min);
+}
+
+// A router entry read with flat-cache semantics: wrapped entries answer from the chunk's quart
+// columns (a table whose every entry is the program at y=0, so the entry is evaluated where it
+// stands), and only a miss outside those columns falls back to the exact position -- the same
+// branch MaterialRules.entry makes. Unwrapped entries are exact everywhere.
+__device__ __forceinline__ double tcGridEntry(const char* blob, const long long* offsets,
+                                             int instructionCount, int root, int wrapped,
+                                             int firstQuartX, int firstQuartZ, int blockX,
+                                             int blockY, int blockZ, double* scratch) {
+    if (!wrapped) {
         return tcEvaluatePlain(blob, offsets, instructionCount, root, blockX, blockY, blockZ,
                 scratch);
     }
     int quartX = (blockX >> 2) - firstQuartX;
     int quartZ = (blockZ >> 2) - firstQuartZ;
     if (quartX >= 0 && quartZ >= 0 && quartX < 5 && quartZ < 5) {
-        return flatTable[quartX + quartZ * 5];
+        return tcEvaluatePlain(blob, offsets, instructionCount, root,
+                (firstQuartX + quartX) << 2, 0, (firstQuartZ + quartZ) << 2, scratch);
     }
     return tcEvaluatePlain(blob, offsets, instructionCount, root, blockX, blockY, blockZ,
             scratch);
@@ -958,9 +972,9 @@ __device__ __forceinline__ double tcCalculatePressure(int posY, int level1, int 
                                                        int posZ, const char* barrierBlob,
                                                        const long long* barrierOffsets,
                                                        int barrierCount, int barrierRoot,
-                                                       const double* barrierFlatTable,
-                                                       int firstQuartX, int firstQuartZ,
-                                                       double* scratch, bool* barrierComputed,
+                                                       int barrierWrapped, int firstQuartX,
+                                                       int firstQuartZ, double* scratch,
+                                                       bool* barrierComputed,
                                                        double* barrierValue) {
     int at1 = posY < level1 ? type1 : TC_DECIDE_AIR;
     int at2 = posY < level2 ? type2 : TC_DECIDE_AIR;
@@ -991,8 +1005,8 @@ __device__ __forceinline__ double tcCalculatePressure(int posY, int level1, int 
     double noiseValue = 0.0;
     if (gradient >= -2.0 && gradient <= 2.0) {
         if (!(*barrierComputed)) {
-            *barrierValue = tcRouterEntry(barrierBlob, barrierOffsets, barrierCount, barrierRoot,
-                    barrierFlatTable, firstQuartX, firstQuartZ, posX, posY, posZ, scratch);
+            *barrierValue = tcGridEntry(barrierBlob, barrierOffsets, barrierCount, barrierRoot,
+                    barrierWrapped, firstQuartX, firstQuartZ, posX, posY, posZ, scratch);
             *barrierComputed = true;
         }
         noiseValue = *barrierValue;
@@ -1015,11 +1029,9 @@ extern "C" __global__ void terracuda_material_decide(
         int skipSamplingAboveY,
         int seaLevel,
         const char* __restrict__ barrierBlob, const long long* __restrict__ barrierOffsets,
-        int barrierCount, int barrierRoot,
-        const double* __restrict__ barrierFlatTable,  // null unless the entry is flat wrapped
+        int barrierCount, int barrierRoot, int barrierWrapped,
         const char* __restrict__ veinGapBlob, const long long* __restrict__ veinGapOffsets,
-        int veinGapCount, int veinGapRoot,
-        const double* __restrict__ veinGapFlatTable,   // as above, for the vein-gap entry
+        int veinGapCount, int veinGapRoot, int veinGapWrapped,
         long long oreSeedLo, long long oreSeedHi,
         long long aquiferSeedLo, long long aquiferSeedHi,
         int firstQuartX, int firstQuartZ,
@@ -1167,14 +1179,14 @@ extern "C" __global__ void terracuda_material_decide(
 
                 double barrier12 = similarity12 * tcCalculatePressure(posY, level1, type1,
                         level2, type2, posX, posZ, barrierBlob, barrierOffsets, barrierCount,
-                        barrierRoot, barrierFlatTable, firstQuartX, firstQuartZ, myScratch,
+                        barrierRoot, barrierWrapped, firstQuartX, firstQuartZ, myScratch,
                         &barrierComputed, &barrierValue);
                 bool declined = value + barrier12 > 0.0;
                 double similarity13 = 1.0 - (double) (distanceSqr3 - distanceSqr1) / 25.0;
                 if (!declined && similarity13 > 0.0) {
                     double barrier13 = similarity12 * similarity13 * tcCalculatePressure(posY,
                             level1, type1, level3, type3, posX, posZ, barrierBlob,
-                            barrierOffsets, barrierCount, barrierRoot, barrierFlatTable,
+                            barrierOffsets, barrierCount, barrierRoot, barrierWrapped,
                             firstQuartX, firstQuartZ, myScratch, &barrierComputed, &barrierValue);
                     declined = value + barrier13 > 0.0;
                 }
@@ -1182,7 +1194,7 @@ extern "C" __global__ void terracuda_material_decide(
                 if (!declined && similarity23 > 0.0) {
                     double barrier23 = similarity12 * similarity23 * tcCalculatePressure(posY,
                             level2, type2, level3, type3, posX, posZ, barrierBlob,
-                            barrierOffsets, barrierCount, barrierRoot, barrierFlatTable,
+                            barrierOffsets, barrierCount, barrierRoot, barrierWrapped,
                             firstQuartX, firstQuartZ, myScratch, &barrierComputed, &barrierValue);
                     declined = value + barrier23 > 0.0;
                 }
@@ -1238,8 +1250,8 @@ extern "C" __global__ void terracuda_material_decide(
                             (double) 0.1f, (double) 0.3f);
                     bool richEnough = tcXoroshiroNextFloat(&random) < richness;
                     if (richEnough) {
-                        double gap = tcRouterEntry(veinGapBlob, veinGapOffsets, veinGapCount,
-                                veinGapRoot, veinGapFlatTable, firstQuartX, firstQuartZ, posX,
+                        double gap = tcGridEntry(veinGapBlob, veinGapOffsets, veinGapCount,
+                                veinGapRoot, veinGapWrapped, firstQuartX, firstQuartZ, posX,
                                 posY, posZ, myScratch);
                         if (gap > (double) -0.3f) {
                             bool rawOre = tcXoroshiroNextFloat(&random) < 0.02f;
@@ -1287,4 +1299,207 @@ extern "C" __global__ void terracuda_xoroshiro_grid_locations(
     results[index] = (((long long) blockX & 0x3FFFFFFLL) << 38)
             | (((long long) blockZ & 0x3FFFFFFLL) << 12)
             | ((long long) blockY & 0xFFFLL);
+}
+
+// ============================================================================================
+// The material rules' grid half (G2b): one thread per aquifer cell, fluid status on device
+// ============================================================================================
+
+// The material grid's arithmetic helpers -- the clamped pair already exists for the spline
+// code, but the plain lerp, inverse lerp and clamp are this half's own.
+// Vanilla's thirteen sampling offsets, in chunk-scale pairs: the aquifer's fluid status reads
+// the preliminary surface around the cell, and this is the neighbourhood it reads.
+__device__ __forceinline__ int tcSurfaceOffsetX(int index) {
+    const int xs[13] = {0, -2, -1, 0, 1, -3, -2, -1, 1, -2, -1, 0, 1};
+    return xs[index];
+}
+
+__device__ __forceinline__ int tcSurfaceOffsetZ(int index) {
+    const int zs[13] = {0, -1, -1, -1, -1, 0, 0, 0, 0, 1, 1, 1, 1};
+    return zs[index];
+}
+
+// One grid cell's fluid status, a verbatim port of MaterialRules.computeFluid, plus -- on the
+// first thread only -- the sampling cutoff the constructor derives from the highest preliminary
+// surface under the grid. The K0 program answers a column's level in one evaluation: the
+// find-top-surface walk was lowered into it.
+extern "C" __global__ void terracuda_material_grid(
+        int minGridX, int minGridY, int minGridZ,
+        int gridSizeX, int gridSizeY, int gridSizeZ,
+        int seaLevel, long long aquiferSeedLo, long long aquiferSeedHi,
+        int firstQuartX, int firstQuartZ,
+        const char* __restrict__ k0Blob, const long long* __restrict__ k0Offsets,
+        int k0Count, int k0Root,
+        const char* __restrict__ floodednessBlob, const long long* __restrict__ floodednessOffsets,
+        int floodednessCount, int floodednessRoot, int floodednessWrapped,
+        const char* __restrict__ spreadBlob, const long long* __restrict__ spreadOffsets,
+        int spreadCount, int spreadRoot, int spreadWrapped,
+        const char* __restrict__ lavaBlob, const long long* __restrict__ lavaOffsets,
+        int lavaCount, int lavaRoot, int lavaWrapped,
+        const char* __restrict__ erosionBlob, const long long* __restrict__ erosionOffsets,
+        int erosionCount, int erosionRoot, int erosionWrapped,
+        const char* __restrict__ depthBlob, const long long* __restrict__ depthOffsets,
+        int depthCount, int depthRoot, int depthWrapped,
+        double* __restrict__ scratch,          // gridTotal * gridScratch doubles
+        int gridScratch,
+        int* __restrict__ cellLevels,          // gridTotal
+        int* __restrict__ cellTypes,           // gridTotal, TC_DECIDE_WATER or TC_DECIDE_LAVA
+        int* __restrict__ skipOut,              // one int, written by thread 0
+        int gridTotal) {
+    int index = blockIdx.x * blockDim.x + threadIdx.x;
+    if (index >= gridTotal) {
+        return;
+    }
+    int cellX = index % gridSizeX;
+    int remaining = index / gridSizeX;
+    int cellZ = remaining % gridSizeZ;
+    int cellY = remaining / gridSizeZ;
+    int gridX = minGridX + cellX;
+    int gridY = minGridY + cellY;
+    int gridZ = minGridZ + cellZ;
+    double* myScratch = scratch + (long long) index * gridScratch;
+
+    // The cell's location: the same chain the decide kernel recomputes per block.
+    TcXoroshiro cellRandom = tcXoroshiro(
+            tcGetSeed(gridX, gridY, gridZ) ^ aquiferSeedLo, aquiferSeedHi);
+    int cellBlockX = (gridX << 4) + tcXoroshiroNextInt(&cellRandom, 10);
+    int cellBlockY = gridY * 12 + tcXoroshiroNextInt(&cellRandom, 9);
+    int cellBlockZ = (gridZ << 4) + tcXoroshiroNextInt(&cellRandom, 10);
+
+    // The global picker's status at the cell: below both levels it is lava, otherwise the sea.
+    bool lavaPick = cellBlockY < min(-54, seaLevel);
+    int globalLevel = lavaPick ? -54 : seaLevel;
+    int globalType = lavaPick ? TC_DECIDE_LAVA : TC_DECIDE_WATER;
+
+    int topOfAquiferCell = cellBlockY + 12;
+    int bottomOfAquiferCell = cellBlockY - 12;
+    int lowestPreliminarySurface = 0x7FFFFFFF;
+    bool surfaceAtCenterIsUnderGlobalFluidLevel = false;
+    int fluidSurfaceLevel = -32512;  // WAY_BELOW_MIN_Y when nothing floods
+    int fluidType = globalType;
+
+    bool earlyGlobal = false;
+    for (int offset = 0; offset < 13; offset++) {
+        int sampleX = cellBlockX + (tcSurfaceOffsetX(offset) << 4);
+        int sampleZ = cellBlockZ + (tcSurfaceOffsetZ(offset) << 4);
+        // The column quantises to quart positions before it is asked.
+        int quartX = (sampleX >> 2) << 2;
+        int quartZ = (sampleZ >> 2) << 2;
+        double levelValue = tcEvaluatePlain(k0Blob, k0Offsets, k0Count, k0Root,
+                quartX, 0, quartZ, myScratch);
+        int preliminarySurfaceLevel = (int) floor(levelValue);
+        int adjustedSurfaceLevel = preliminarySurfaceLevel + 8;
+        bool start = offset == 0;
+        if (start && bottomOfAquiferCell > adjustedSurfaceLevel) {
+            // The cell sits below dry ground: the picker's status at the cell, nothing else.
+            fluidSurfaceLevel = globalLevel;
+            fluidType = globalType;
+            earlyGlobal = true;
+            break;
+        }
+        bool topPokesAboveSurface = topOfAquiferCell > adjustedSurfaceLevel;
+        if (topPokesAboveSurface || start) {
+            // The picker's status at the adjusted level, a pure function of that y; at(y) is
+            // fluid only below the picker's own level.
+            bool surfaceLavaPick = adjustedSurfaceLevel < min(-54, seaLevel);
+            bool surfaceIsFluid = surfaceLavaPick ? adjustedSurfaceLevel < -54
+                                                   : adjustedSurfaceLevel < seaLevel;
+            if (surfaceIsFluid) {
+                if (start) {
+                    surfaceAtCenterIsUnderGlobalFluidLevel = true;
+                }
+                if (topPokesAboveSurface) {
+                    // The aquifer pokes out under water: the surface's status, not the cell's.
+                    fluidSurfaceLevel = surfaceLavaPick ? -54 : seaLevel;
+                    fluidType = surfaceLavaPick ? TC_DECIDE_LAVA : TC_DECIDE_WATER;
+                    earlyGlobal = true;
+                    break;
+                }
+            }
+        }
+        lowestPreliminarySurface = min(lowestPreliminarySurface, preliminarySurfaceLevel);
+    }
+
+    if (!earlyGlobal) {
+        // computeSurfaceLevel: the deep-dark shortcut, then the floodedness thresholds.
+        double partiallyFloodedness;
+        double fullyFloodedness;
+        double erosionValue = tcGridEntry(erosionBlob, erosionOffsets, erosionCount, erosionRoot,
+                erosionWrapped, firstQuartX, firstQuartZ, cellBlockX, cellBlockY, cellBlockZ,
+                myScratch);
+        double depthValue = tcGridEntry(depthBlob, depthOffsets, depthCount, depthRoot,
+                depthWrapped, firstQuartX, firstQuartZ, cellBlockX, cellBlockY, cellBlockZ,
+                myScratch);
+        if (erosionValue < (double) -0.225f && depthValue > (double) 0.9f) {
+            partiallyFloodedness = -1.0;
+            fullyFloodedness = -1.0;
+        } else {
+            int distanceBelowSurface = lowestPreliminarySurface + 8 - cellBlockY;
+            double floodednessFactor = surfaceAtCenterIsUnderGlobalFluidLevel
+                    ? tcClampedMap((double) distanceBelowSurface, 0.0, 64.0, 1.0, 0.0)
+                    : 0.0;
+            double floodednessNoise = tcClamp(tcGridEntry(floodednessBlob, floodednessOffsets,
+                    floodednessCount, floodednessRoot, floodednessWrapped, firstQuartX,
+                    firstQuartZ, cellBlockX, cellBlockY, cellBlockZ, myScratch), -1.0, 1.0);
+            double fullyFloodedThreshold = tcLerp(
+                    tcInverseLerp(floodednessFactor, 1.0, 0.0), -0.3, 0.8);
+            double partiallyFloodedThreshold = tcLerp(
+                    tcInverseLerp(floodednessFactor, 1.0, 0.0), -0.8, 0.4);
+            partiallyFloodedness = floodednessNoise - partiallyFloodedThreshold;
+            fullyFloodedness = floodednessNoise - fullyFloodedThreshold;
+        }
+
+        if (fullyFloodedness > 0.0) {
+            fluidSurfaceLevel = globalLevel;
+        } else if (partiallyFloodedness > 0.0) {
+            // computeRandomizedFluidSurfaceLevel: the spread noise at its own coarse cell.
+            int fluidLevelCellX = tcFloorDiv(cellBlockX, 16);
+            int fluidLevelCellY = tcFloorDiv(cellBlockY, 40);
+            int fluidLevelCellZ = tcFloorDiv(cellBlockZ, 16);
+            double spread = tcGridEntry(spreadBlob, spreadOffsets, spreadCount, spreadRoot,
+                    spreadWrapped, firstQuartX, firstQuartZ, fluidLevelCellX, fluidLevelCellY,
+                    fluidLevelCellZ, myScratch) * 10.0;
+            int quantized = (int) floor(spread / 3.0) * 3;
+            int targetFluidSurfaceLevel = fluidLevelCellY * 40 + 20 + quantized;
+            fluidSurfaceLevel = min(lowestPreliminarySurface, targetFluidSurfaceLevel);
+        }
+
+        // computeFluidType: the lava noise decides the deep, cold cells.
+        if (fluidSurfaceLevel <= -10 && fluidSurfaceLevel != -32512
+                && fluidType != TC_DECIDE_LAVA) {
+            double lavaNoise = tcGridEntry(lavaBlob, lavaOffsets, lavaCount, lavaRoot,
+                    lavaWrapped, firstQuartX, firstQuartZ, tcFloorDiv(cellBlockX, 64),
+                    tcFloorDiv(cellBlockY, 40), tcFloorDiv(cellBlockZ, 64), myScratch);
+            if (fabs(lavaNoise) > 0.3) {
+                fluidType = TC_DECIDE_LAVA;
+            }
+        }
+    }
+
+    cellLevels[index] = fluidSurfaceLevel;
+    cellTypes[index] = fluidType;
+
+    // Thread 0 derives the sampling cutoff the constructor used to: the highest preliminary
+    // surface under the grid, in quart steps, then the grid arithmetic on top of it.
+    if (index == 0) {
+        int maxGridX = minGridX + gridSizeX - 1;
+        int maxGridZ = minGridZ + gridSizeZ - 1;
+        int minBlockX = (minGridX << 4);
+        int minBlockZ = (minGridZ << 4);
+        int maxBlockX = (maxGridX << 4) + 9;
+        int maxBlockZ = (maxGridZ << 4) + 9;
+        int highest = 0x80000000;
+        for (int blockZ = minBlockZ; blockZ <= maxBlockZ; blockZ += 4) {
+            for (int blockX = minBlockX; blockX <= maxBlockX; blockX += 4) {
+                int quartX = (blockX >> 2) << 2;
+                int quartZ = (blockZ >> 2) << 2;
+                double levelValue = tcEvaluatePlain(k0Blob, k0Offsets, k0Count, k0Root,
+                        quartX, 0, quartZ, myScratch);
+                highest = max(highest, (int) floor(levelValue));
+            }
+        }
+        int maxAdjusted = highest + 8;
+        int skipGridY = tcFloorDiv(maxAdjusted + 12, 12) + 1;
+        skipOut[0] = skipGridY * 12 + 11 - 1;
+    }
 }

@@ -15,23 +15,32 @@ import tqk114514.terracuda.density.DensityProgram;
 import tqk114514.terracuda.density.DensityProgramImage;
 
 /**
- * G2a: the material rules' per-block decision on the device. The aquifer's neighbour search,
- * the barrier pressures and the veinifier run in one kernel over every block of a chunk, on
- * the grid tables and per-block values the CPU still supplies — the milestone shape, where
- * parity is proven before the grid half itself moves (that is G2b).
+ * G2b: the material rules' whole decision on the device. Two kernels a chunk: the grid kernel
+ * derives every aquifer cell's fluid status — the thirteen-offset preliminary-surface sampling,
+ * the floodedness thresholds, the spread and lava noises, the erosion and depth reads with
+ * their flat-cache semantics, and the sampling cutoff — and the decide kernel runs the per-block
+ * half on those tables. The CPU's supply is gone: what crosses the host-device line per chunk
+ * is the density and the two vein arrays in, and the decisions and fluid-tick flags out.
  *
- * <p>The kernel's decisions are the small enum {@code MaterialRules.DECISION_*} plus the default
- * and air ids; {@link #stateOf(int, BlockState)} maps them back to block states the way
- * {@code applyRules} consumes the CPU rule's answer.
+ * <p>The router entries arrive as lowered images uploaded once. The entries vanilla wraps in a
+ * flat cache carry the wrapping as a flag, and both kernels reproduce the wrapper's branch:
+ * the chunk's quart columns answered from the y=0 samples, the misses exactly.
  */
 public final class MaterialDeciderGpu implements AutoCloseable {
 
+    public static final String GRID_KERNEL_NAME = "terracuda_material_grid";
     public static final String KERNEL_NAME = "terracuda_material_decide";
     private static final int BLOCK_SIZE = 128;
 
-    /** Grows past any chunk's grid: the anchors span at most four cells plus two of margin. */
+    /** Grows past any chunk's grid: the anchors span at most four cells plus margin. */
     private static final int MAX_GRID_XZ = 8;
     private static final int MAX_GRID_Y = 40;
+    private static final int MAX_GRID_TOTAL = MAX_GRID_XZ * MAX_GRID_Y * MAX_GRID_XZ;
+
+    /** Aquifer's grid geometry: the anchor spacing in x/z and y, and the sampling offsets. */
+    private static final int GRID_SPACING_XZ_SHIFT = 4;
+    private static final int GRID_SPACING_Y = 12;
+    private static final int SAMPLE_OFFSET_XZ = -5;
 
     private final CudaContext context;
     private final NoiseSettings geometry;
@@ -48,46 +57,69 @@ public final class MaterialDeciderGpu implements AutoCloseable {
     private final CudaContext.DeviceBuffer barrierOffsets;
     private final int barrierCount;
     private final int barrierRoot;
-    private final DensityInterpreter barrierInterpreter;
-    private final DensityProgram barrierProgram;
-
+    private final int barrierWrapped;
     private final CudaContext.DeviceBuffer veinGapBlob;
     private final CudaContext.DeviceBuffer veinGapOffsets;
     private final int veinGapCount;
     private final int veinGapRoot;
-    private final DensityInterpreter veinGapInterpreter;
-    private final DensityProgram veinGapProgram;
+    private final int veinGapWrapped;
+    private final CudaContext.DeviceBuffer k0Blob;
+    private final CudaContext.DeviceBuffer k0Offsets;
+    private final int k0Count;
+    private final int k0Root;
+    private final CudaContext.DeviceBuffer floodednessBlob;
+    private final CudaContext.DeviceBuffer floodednessOffsets;
+    private final int floodednessCount;
+    private final int floodednessRoot;
+    private final int floodednessWrapped;
+    private final CudaContext.DeviceBuffer spreadBlob;
+    private final CudaContext.DeviceBuffer spreadOffsets;
+    private final int spreadCount;
+    private final int spreadRoot;
+    private final int spreadWrapped;
+    private final CudaContext.DeviceBuffer lavaBlob;
+    private final CudaContext.DeviceBuffer lavaOffsets;
+    private final int lavaCount;
+    private final int lavaRoot;
+    private final int lavaWrapped;
+    private final CudaContext.DeviceBuffer erosionBlob;
+    private final CudaContext.DeviceBuffer erosionOffsets;
+    private final int erosionCount;
+    private final int erosionRoot;
+    private final int erosionWrapped;
+    private final CudaContext.DeviceBuffer depthBlob;
+    private final CudaContext.DeviceBuffer depthOffsets;
+    private final int depthCount;
+    private final int depthRoot;
+    private final int depthWrapped;
 
     private final int programScratch;
+    private final int gridScratch;
 
     private final CudaContext.DeviceBuffer density;
     private final CudaContext.DeviceBuffer veinToggle;
     private final CudaContext.DeviceBuffer veinRidged;
     private final CudaContext.DeviceBuffer cellLevels;
     private final CudaContext.DeviceBuffer cellTypes;
-    private final CudaContext.DeviceBuffer barrierFlat;
-    private final CudaContext.DeviceBuffer veinGapFlat;
     private final CudaContext.DeviceBuffer scratch;
+    private final CudaContext.DeviceBuffer gridScratchBuffer;
     private final CudaContext.DeviceBuffer decisions;
     private final CudaContext.DeviceBuffer fluidFlags;
+    private final CudaContext.DeviceBuffer gridSkip;
 
     private final Arena hostArena = Arena.ofShared();
     private final MemorySegment hostDensity;
     private final MemorySegment hostVeinToggle;
     private final MemorySegment hostVeinRidged;
-    private final MemorySegment hostCellLevels;
-    private final MemorySegment hostCellTypes;
     private final MemorySegment hostDecisions;
     private final MemorySegment hostFluidFlags;
-    private final MemorySegment hostFlatTable;
+    private final MemorySegment hostSkip;
 
     private boolean closed;
 
     public MaterialDeciderGpu(CudaContext context, NoiseSettings geometry, int seaLevel,
             long oreSeedLo, long oreSeedHi, long aquiferSeedLo, long aquiferSeedHi,
-            boolean aquifersEnabled, boolean oreVeinsEnabled,
-            DensityInterpreter barrierInterpreter, DensityProgram barrierProgram,
-            DensityInterpreter veinGapInterpreter, DensityProgram veinGapProgram) {
+            boolean aquifersEnabled, boolean oreVeinsEnabled, GpuChunkFiller.RulesContext rules) {
         this.context = context;
         this.geometry = geometry;
         this.count = 16 * 16 * geometry.height();
@@ -98,102 +130,173 @@ public final class MaterialDeciderGpu implements AutoCloseable {
         this.aquiferSeedHi = aquiferSeedHi;
         this.aquifersEnabled = aquifersEnabled;
         this.oreVeinsEnabled = oreVeinsEnabled;
-        this.barrierInterpreter = barrierInterpreter;
-        this.barrierProgram = barrierProgram;
-        this.veinGapInterpreter = veinGapInterpreter;
-        this.veinGapProgram = veinGapProgram;
 
-        DensityProgramImage barrierImage = DensityProgramImage.of(barrierProgram);
-        this.barrierBlob = uploadBytes(barrierImage.blob());
-        this.barrierOffsets = uploadLongs(barrierImage.offsets());
+        this.barrierBlob = uploadBlob(rules.barrierNoise.program());
+        this.barrierOffsets = uploadOffsets(rules.barrierNoise.program());
+        DensityProgramImage barrierImage = DensityProgramImage.of(rules.barrierNoise.program());
         this.barrierCount = barrierImage.instructionCount();
         this.barrierRoot = barrierImage.root();
+        this.barrierWrapped = MaterialRules.isFlatCache(rules.barrierNoise.program()) ? 1 : 0;
 
-        DensityProgramImage veinGapImage = DensityProgramImage.of(veinGapProgram);
-        this.veinGapBlob = uploadBytes(veinGapImage.blob());
-        this.veinGapOffsets = uploadLongs(veinGapImage.offsets());
+        this.veinGapBlob = uploadBlob(rules.veinGap.program());
+        this.veinGapOffsets = uploadOffsets(rules.veinGap.program());
+        DensityProgramImage veinGapImage = DensityProgramImage.of(rules.veinGap.program());
         this.veinGapCount = veinGapImage.instructionCount();
         this.veinGapRoot = veinGapImage.root();
+        this.veinGapWrapped = MaterialRules.isFlatCache(rules.veinGap.program()) ? 1 : 0;
 
+        this.k0Blob = uploadBlob(rules.preliminarySurface.program());
+        this.k0Offsets = uploadOffsets(rules.preliminarySurface.program());
+        DensityProgramImage k0Image = DensityProgramImage.of(rules.preliminarySurface.program());
+        this.k0Count = k0Image.instructionCount();
+        this.k0Root = k0Image.root();
+
+        this.floodednessBlob = uploadBlob(rules.floodedness.program());
+        this.floodednessOffsets = uploadOffsets(rules.floodedness.program());
+        DensityProgramImage floodednessImage = DensityProgramImage.of(rules.floodedness.program());
+        this.floodednessCount = floodednessImage.instructionCount();
+        this.floodednessRoot = floodednessImage.root();
+        this.floodednessWrapped = MaterialRules.isFlatCache(rules.floodedness.program()) ? 1 : 0;
+
+        this.spreadBlob = uploadBlob(rules.spread.program());
+        this.spreadOffsets = uploadOffsets(rules.spread.program());
+        DensityProgramImage spreadImage = DensityProgramImage.of(rules.spread.program());
+        this.spreadCount = spreadImage.instructionCount();
+        this.spreadRoot = spreadImage.root();
+        this.spreadWrapped = MaterialRules.isFlatCache(rules.spread.program()) ? 1 : 0;
+
+        this.lavaBlob = uploadBlob(rules.lava.program());
+        this.lavaOffsets = uploadOffsets(rules.lava.program());
+        DensityProgramImage lavaImage = DensityProgramImage.of(rules.lava.program());
+        this.lavaCount = lavaImage.instructionCount();
+        this.lavaRoot = lavaImage.root();
+        this.lavaWrapped = MaterialRules.isFlatCache(rules.lava.program()) ? 1 : 0;
+
+        this.erosionBlob = uploadBlob(rules.erosion.program());
+        this.erosionOffsets = uploadOffsets(rules.erosion.program());
+        DensityProgramImage erosionImage = DensityProgramImage.of(rules.erosion.program());
+        this.erosionCount = erosionImage.instructionCount();
+        this.erosionRoot = erosionImage.root();
+        this.erosionWrapped = MaterialRules.isFlatCache(rules.erosion.program()) ? 1 : 0;
+
+        this.depthBlob = uploadBlob(rules.depth.program());
+        this.depthOffsets = uploadOffsets(rules.depth.program());
+        DensityProgramImage depthImage = DensityProgramImage.of(rules.depth.program());
+        this.depthCount = depthImage.instructionCount();
+        this.depthRoot = depthImage.root();
+        this.depthWrapped = MaterialRules.isFlatCache(rules.depth.program()) ? 1 : 0;
+
+        int gridProgramScratch = Math.max(Math.max(this.k0Count, this.floodednessCount),
+                Math.max(Math.max(this.spreadCount, this.lavaCount),
+                        Math.max(this.erosionCount, this.depthCount)));
+        this.gridScratch = gridProgramScratch;
         this.programScratch = Math.max(this.barrierCount, this.veinGapCount);
 
         this.density = context.allocate((long) this.count * Double.BYTES);
         this.veinToggle = context.allocate((long) this.count * Double.BYTES);
         this.veinRidged = context.allocate((long) this.count * Double.BYTES);
-        this.cellLevels = context.allocate((long) MAX_GRID_XZ * MAX_GRID_Y * MAX_GRID_XZ * 4L);
-        this.cellTypes = context.allocate((long) MAX_GRID_XZ * MAX_GRID_Y * MAX_GRID_XZ * 4L);
-        this.barrierFlat = context.allocate(25L * Double.BYTES);
-        this.veinGapFlat = context.allocate(25L * Double.BYTES);
+        this.cellLevels = context.allocate((long) MAX_GRID_TOTAL * 4L);
+        this.cellTypes = context.allocate((long) MAX_GRID_TOTAL * 4L);
         this.scratch = context.allocate((long) this.count * this.programScratch * Double.BYTES);
+        this.gridScratchBuffer =
+                context.allocate((long) MAX_GRID_TOTAL * this.gridScratch * Double.BYTES);
         this.decisions = context.allocate((long) this.count * 4L);
         this.fluidFlags = context.allocate((long) this.count * 4L);
+        this.gridSkip = context.allocate(256L);
 
         this.hostDensity = this.hostArena.allocate((long) this.count * Double.BYTES);
         this.hostVeinToggle = this.hostArena.allocate((long) this.count * Double.BYTES);
         this.hostVeinRidged = this.hostArena.allocate((long) this.count * Double.BYTES);
-        this.hostCellLevels = this.hostArena.allocate(
-                (long) MAX_GRID_XZ * MAX_GRID_Y * MAX_GRID_XZ * 4L);
-        this.hostCellTypes = this.hostArena.allocate(
-                (long) MAX_GRID_XZ * MAX_GRID_Y * MAX_GRID_XZ * 4L);
         this.hostDecisions = this.hostArena.allocate((long) this.count * 4L);
         this.hostFluidFlags = this.hostArena.allocate((long) this.count * 4L);
-        this.hostFlatTable = this.hostArena.allocate(25L * Double.BYTES);
+        this.hostSkip = this.hostArena.allocate(256L);
     }
 
     /**
-     * One chunk's decisions on the device.
+     * One chunk's decisions on the device: the grid kernel derives the cells' fluid statuses and
+     * the sampling cutoff, the decide kernel runs the per-block half on them.
      *
      * <p>The density must already carry the beard — the same value {@code applyRules} hands the
-     * CPU rules. The grid tables come from {@code rules}, which the caller builds the way
-     * {@code applyRules} does; the flat-cache tables for the barrier and vein-gap entries are
-     * derived per chunk from the same wrapping decision the CPU path makes.
+     * CPU rules. Both kernels launch on the default stream in order; the cutoff crosses back to
+     * the host between them because the decide kernel takes it as a scalar.
      *
      * @return the per-block decision ids and the aquifer's fluid-tick flags
      */
     public Decisions decide(int chunkX, int chunkZ, double[] density, double[] veinToggle,
-            double[] veinRidged, MaterialRules rules) {
+            double[] veinRidged) {
         if (this.closed) {
             throw new IllegalStateException("the decider is closed");
         }
-        MaterialRules.GridTables tables = rules.exportGrid();
-        if (tables.levels().length > MAX_GRID_XZ * MAX_GRID_Y * MAX_GRID_XZ) {
-            throw new IllegalStateException("grid of " + tables.levels().length
-                    + " cells exceeds the decider's " + MAX_GRID_XZ * MAX_GRID_Y * MAX_GRID_XZ);
+        int chunkMinBlockX = chunkX * 16;
+        int chunkMinBlockZ = chunkZ * 16;
+        int minGridX = (chunkMinBlockX + SAMPLE_OFFSET_XZ) >> GRID_SPACING_XZ_SHIFT;
+        int maxGridX = ((chunkMinBlockX + 15 + SAMPLE_OFFSET_XZ) >> GRID_SPACING_XZ_SHIFT) + 1;
+        int minGridY = Math.floorDiv(this.geometry.minY() + 1, GRID_SPACING_Y) - 1;
+        int maxGridY = Math.floorDiv(this.geometry.minY() + this.geometry.height() + 1,
+                GRID_SPACING_Y) + 1;
+        int minGridZ = (chunkMinBlockZ + SAMPLE_OFFSET_XZ) >> GRID_SPACING_XZ_SHIFT;
+        int maxGridZ = ((chunkMinBlockZ + 15 + SAMPLE_OFFSET_XZ) >> GRID_SPACING_XZ_SHIFT) + 1;
+        int gridSizeX = maxGridX - minGridX + 1;
+        int gridSizeY = maxGridY - minGridY + 1;
+        int gridSizeZ = maxGridZ - minGridZ + 1;
+        int gridTotal = gridSizeX * gridSizeY * gridSizeZ;
+        if (gridTotal > MAX_GRID_TOTAL) {
+            throw new IllegalStateException("grid of " + gridTotal
+                    + " cells exceeds the decider's " + MAX_GRID_TOTAL);
         }
 
-        copyDoubles(this.hostDensity, density);
+        MemorySegment.copy(density, 0, this.hostDensity, ValueLayout.JAVA_DOUBLE, 0,
+                density.length);
         this.context.copyToDevice(this.hostDensity, this.density);
         if (this.oreVeinsEnabled) {
-            copyDoubles(this.hostVeinToggle, veinToggle);
+            MemorySegment.copy(veinToggle, 0, this.hostVeinToggle, ValueLayout.JAVA_DOUBLE, 0,
+                    veinToggle.length);
             this.context.copyToDevice(this.hostVeinToggle, this.veinToggle);
-            copyDoubles(this.hostVeinRidged, veinRidged);
+            MemorySegment.copy(veinRidged, 0, this.hostVeinRidged, ValueLayout.JAVA_DOUBLE, 0,
+                    veinRidged.length);
             this.context.copyToDevice(this.hostVeinRidged, this.veinRidged);
         }
 
-        copyInts(this.hostCellLevels, tables.levels());
-        this.context.copyToDevice(this.hostCellLevels, this.cellLevels);
-        copyInts(this.hostCellTypes, tables.types());
-        this.context.copyToDevice(this.hostCellTypes, this.cellTypes);
+        int firstQuartX = chunkMinBlockX >> 2;
+        int firstQuartZ = chunkMinBlockZ >> 2;
 
-        // A wrapped entry reads its five-by-five table; an unwrapped one is told there is no
-        // table (a null pointer) and evaluates its program instead, so nothing uploads.
-        double[] barrierTable = MaterialRules.flatCacheTableOrNull(this.barrierInterpreter,
-                this.barrierProgram, chunkX, chunkZ);
-        if (barrierTable != null) {
-            copyDoubles(this.hostFlatTable, barrierTable);
-            this.context.copyToDevice(this.hostFlatTable, this.barrierFlat);
+        try (KernelArguments grid = new KernelArguments(46)) {
+            grid.addInt(minGridX).addInt(minGridY).addInt(minGridZ)
+                    .addInt(gridSizeX).addInt(gridSizeY).addInt(gridSizeZ)
+                    .addInt(this.seaLevel)
+                    .addLong(this.aquiferSeedLo).addLong(this.aquiferSeedHi)
+                    .addInt(firstQuartX).addInt(firstQuartZ)
+                    .addDevicePointer(this.k0Blob.address())
+                    .addDevicePointer(this.k0Offsets.address())
+                    .addInt(this.k0Count).addInt(this.k0Root)
+                    .addDevicePointer(this.floodednessBlob.address())
+                    .addDevicePointer(this.floodednessOffsets.address())
+                    .addInt(this.floodednessCount).addInt(this.floodednessRoot)
+                    .addInt(this.floodednessWrapped)
+                    .addDevicePointer(this.spreadBlob.address())
+                    .addDevicePointer(this.spreadOffsets.address())
+                    .addInt(this.spreadCount).addInt(this.spreadRoot).addInt(this.spreadWrapped)
+                    .addDevicePointer(this.lavaBlob.address())
+                    .addDevicePointer(this.lavaOffsets.address())
+                    .addInt(this.lavaCount).addInt(this.lavaRoot).addInt(this.lavaWrapped)
+                    .addDevicePointer(this.erosionBlob.address())
+                    .addDevicePointer(this.erosionOffsets.address())
+                    .addInt(this.erosionCount).addInt(this.erosionRoot)
+                    .addInt(this.erosionWrapped)
+                    .addDevicePointer(this.depthBlob.address())
+                    .addDevicePointer(this.depthOffsets.address())
+                    .addInt(this.depthCount).addInt(this.depthRoot).addInt(this.depthWrapped)
+                    .addDevicePointer(this.gridScratchBuffer.address()).addInt(this.gridScratch)
+                    .addDevicePointer(this.cellLevels.address())
+                    .addDevicePointer(this.cellTypes.address())
+                    .addDevicePointer(this.gridSkip.address())
+                    .addInt(gridTotal);
+            int gridBlocks = (gridTotal + BLOCK_SIZE - 1) / BLOCK_SIZE;
+            this.context.launch(GRID_KERNEL_NAME, gridBlocks, 1, 1, BLOCK_SIZE, 1, 1, grid);
         }
-        double[] veinGapTable = MaterialRules.flatCacheTableOrNull(this.veinGapInterpreter,
-                this.veinGapProgram, chunkX, chunkZ);
-        if (veinGapTable != null) {
-            copyDoubles(this.hostFlatTable, veinGapTable);
-            this.context.copyToDevice(this.hostFlatTable, this.veinGapFlat);
-        }
-
-        int firstQuartX = chunkX * 16 >> 2;
-        int firstQuartZ = chunkZ * 16 >> 2;
-        long barrierFlatAddress = barrierTable != null ? this.barrierFlat.address() : 0L;
-        long veinGapFlatAddress = veinGapTable != null ? this.veinGapFlat.address() : 0L;
+        this.context.synchronize();
+        this.context.copyFromDevice(this.gridSkip, this.hostSkip);
+        int skipSamplingAboveY = this.hostSkip.get(ValueLayout.JAVA_INT, 0L);
 
         try (KernelArguments arguments = new KernelArguments(40)) {
             arguments.addDevicePointer(this.density.address())
@@ -201,18 +304,18 @@ public final class MaterialDeciderGpu implements AutoCloseable {
                     .addDevicePointer(this.oreVeinsEnabled ? this.veinRidged.address() : 0L)
                     .addDevicePointer(this.cellLevels.address())
                     .addDevicePointer(this.cellTypes.address())
-                    .addInt(tables.minGridX()).addInt(tables.minGridY()).addInt(tables.minGridZ())
-                    .addInt(tables.gridSizeX()).addInt(tables.gridSizeY()).addInt(tables.gridSizeZ())
-                    .addInt(tables.skipSamplingAboveY())
+                    .addInt(minGridX).addInt(minGridY).addInt(minGridZ)
+                    .addInt(gridSizeX).addInt(gridSizeY).addInt(gridSizeZ)
+                    .addInt(skipSamplingAboveY)
                     .addInt(this.seaLevel)
                     .addDevicePointer(this.barrierBlob.address())
                     .addDevicePointer(this.barrierOffsets.address())
                     .addInt(this.barrierCount).addInt(this.barrierRoot)
-                    .addDevicePointer(barrierFlatAddress)
+                    .addInt(this.barrierWrapped)
                     .addDevicePointer(this.veinGapBlob.address())
                     .addDevicePointer(this.veinGapOffsets.address())
                     .addInt(this.veinGapCount).addInt(this.veinGapRoot)
-                    .addDevicePointer(veinGapFlatAddress)
+                    .addInt(this.veinGapWrapped)
                     .addLong(this.oreSeedLo).addLong(this.oreSeedHi)
                     .addLong(this.aquiferSeedLo).addLong(this.aquiferSeedHi)
                     .addInt(firstQuartX).addInt(firstQuartZ)
@@ -220,7 +323,7 @@ public final class MaterialDeciderGpu implements AutoCloseable {
                     .addInt(this.programScratch)
                     .addDevicePointer(this.decisions.address())
                     .addDevicePointer(this.fluidFlags.address())
-                    .addInt(chunkX * 16).addInt(this.geometry.minY()).addInt(chunkZ * 16)
+                    .addInt(chunkMinBlockX).addInt(this.geometry.minY()).addInt(chunkMinBlockZ)
                     .addInt(this.geometry.height())
                     .addInt(this.aquifersEnabled ? 1 : 0)
                     .addInt(this.oreVeinsEnabled ? 1 : 0)
@@ -237,6 +340,95 @@ public final class MaterialDeciderGpu implements AutoCloseable {
         MemorySegment.copy(this.hostDecisions, ValueLayout.JAVA_INT, 0L, states, 0, this.count);
         MemorySegment.copy(this.hostFluidFlags, ValueLayout.JAVA_INT, 0L, ticks, 0, this.count);
         return new Decisions(states, ticks);
+    }
+
+    /**
+     * The grid kernel's tables for one chunk, downloaded -- the parity tests compare them
+     * against the CPU's eager export cell by cell.
+     */
+    GridView debugGrid(int chunkX, int chunkZ) {
+        int chunkMinBlockX = chunkX * 16;
+        int chunkMinBlockZ = chunkZ * 16;
+        int minGridX = (chunkMinBlockX + SAMPLE_OFFSET_XZ) >> GRID_SPACING_XZ_SHIFT;
+        int maxGridX = ((chunkMinBlockX + 15 + SAMPLE_OFFSET_XZ) >> GRID_SPACING_XZ_SHIFT) + 1;
+        int minGridY = Math.floorDiv(this.geometry.minY() + 1, GRID_SPACING_Y) - 1;
+        int maxGridY = Math.floorDiv(this.geometry.minY() + this.geometry.height() + 1,
+                GRID_SPACING_Y) + 1;
+        int minGridZ = (chunkMinBlockZ + SAMPLE_OFFSET_XZ) >> GRID_SPACING_XZ_SHIFT;
+        int maxGridZ = ((chunkMinBlockZ + 15 + SAMPLE_OFFSET_XZ) >> GRID_SPACING_XZ_SHIFT) + 1;
+        int gridSizeX = maxGridX - minGridX + 1;
+        int gridSizeY = maxGridY - minGridY + 1;
+        int gridSizeZ = maxGridZ - minGridZ + 1;
+        int gridTotal = gridSizeX * gridSizeY * gridSizeZ;
+        int firstQuartX = chunkMinBlockX >> 2;
+        int firstQuartZ = chunkMinBlockZ >> 2;
+        try (KernelArguments grid = new KernelArguments(46)) {
+            grid.addInt(minGridX).addInt(minGridY).addInt(minGridZ)
+                    .addInt(gridSizeX).addInt(gridSizeY).addInt(gridSizeZ)
+                    .addInt(this.seaLevel)
+                    .addLong(this.aquiferSeedLo).addLong(this.aquiferSeedHi)
+                    .addInt(firstQuartX).addInt(firstQuartZ)
+                    .addDevicePointer(this.k0Blob.address())
+                    .addDevicePointer(this.k0Offsets.address())
+                    .addInt(this.k0Count).addInt(this.k0Root)
+                    .addDevicePointer(this.floodednessBlob.address())
+                    .addDevicePointer(this.floodednessOffsets.address())
+                    .addInt(this.floodednessCount).addInt(this.floodednessRoot)
+                    .addInt(this.floodednessWrapped)
+                    .addDevicePointer(this.spreadBlob.address())
+                    .addDevicePointer(this.spreadOffsets.address())
+                    .addInt(this.spreadCount).addInt(this.spreadRoot).addInt(this.spreadWrapped)
+                    .addDevicePointer(this.lavaBlob.address())
+                    .addDevicePointer(this.lavaOffsets.address())
+                    .addInt(this.lavaCount).addInt(this.lavaRoot).addInt(this.lavaWrapped)
+                    .addDevicePointer(this.erosionBlob.address())
+                    .addDevicePointer(this.erosionOffsets.address())
+                    .addInt(this.erosionCount).addInt(this.erosionRoot)
+                    .addInt(this.erosionWrapped)
+                    .addDevicePointer(this.depthBlob.address())
+                    .addDevicePointer(this.depthOffsets.address())
+                    .addInt(this.depthCount).addInt(this.depthRoot).addInt(this.depthWrapped)
+                    .addDevicePointer(this.gridScratchBuffer.address()).addInt(this.gridScratch)
+                    .addDevicePointer(this.cellLevels.address())
+                    .addDevicePointer(this.cellTypes.address())
+                    .addDevicePointer(this.gridSkip.address())
+                    .addInt(gridTotal);
+            int gridBlocks = (gridTotal + BLOCK_SIZE - 1) / BLOCK_SIZE;
+            this.context.launch(GRID_KERNEL_NAME, gridBlocks, 1, 1, BLOCK_SIZE, 1, 1, grid);
+        }
+        this.context.synchronize();
+        this.context.copyFromDevice(this.gridSkip, this.hostSkip);
+        int[] levels = new int[gridTotal];
+        int[] types = new int[gridTotal];
+        this.context.copyFromDevice(this.cellLevels,
+                this.hostArena.allocate((long) gridTotal * 4L));
+        this.context.copyFromDevice(this.cellTypes,
+                this.hostArena.allocate((long) gridTotal * 4L));
+        return new GridView(minGridX, minGridY, minGridZ, gridSizeX, gridSizeY, gridSizeZ,
+                this.hostSkip.get(ValueLayout.JAVA_INT, 0L));
+    }
+
+    /** The grid kernel's bounds and cutoff; the tables stay on the device. */
+    record GridView(int minGridX, int minGridY, int minGridZ,
+            int gridSizeX, int gridSizeY, int gridSizeZ, int skipSamplingAboveY) {
+    }
+
+    /** The device's tables for one grid, for the parity tests. */
+    record GridTables(int[] levels, int[] types) {
+    }
+
+    /** The device skip buffer, for the parity tests' trace. */
+    CudaContext.DeviceBuffer debugSkipBuffer() {
+        return this.gridSkip;
+    }
+
+    /** The device grid buffers, so the tests can download them. */
+    CudaContext.DeviceBuffer debugLevelsBuffer() {
+        return this.cellLevels;
+    }
+
+    CudaContext.DeviceBuffer debugTypesBuffer() {
+        return this.cellTypes;
     }
 
     /** Maps a kernel decision back to the block state the CPU rules would have answered with. */
@@ -256,7 +448,8 @@ public final class MaterialDeciderGpu implements AutoCloseable {
         };
     }
 
-    private CudaContext.DeviceBuffer uploadBytes(byte[] bytes) {
+    private CudaContext.DeviceBuffer uploadBlob(DensityProgram program) {
+        byte[] bytes = DensityProgramImage.of(program).blob();
         try (Arena arena = Arena.ofConfined()) {
             MemorySegment segment = arena.allocate(bytes.length);
             MemorySegment.copy(bytes, 0, segment, ValueLayout.JAVA_BYTE, 0, bytes.length);
@@ -266,21 +459,14 @@ public final class MaterialDeciderGpu implements AutoCloseable {
         }
     }
 
-    private CudaContext.DeviceBuffer uploadLongs(long[] values) {
+    private CudaContext.DeviceBuffer uploadOffsets(DensityProgram program) {
+        long[] values = DensityProgramImage.of(program).offsets();
         try (Arena arena = Arena.ofConfined()) {
             MemorySegment segment = arena.allocateFrom(ValueLayout.JAVA_LONG, values);
             CudaContext.DeviceBuffer buffer = this.context.allocate(segment.byteSize());
             this.context.copyToDevice(segment, buffer);
             return buffer;
         }
-    }
-
-    private void copyDoubles(MemorySegment target, double[] values) {
-        MemorySegment.copy(values, 0, target, ValueLayout.JAVA_DOUBLE, 0, values.length);
-    }
-
-    private static void copyInts(MemorySegment target, int[] values) {
-        MemorySegment.copy(values, 0, target, ValueLayout.JAVA_INT, 0, values.length);
     }
 
     /** The device's answer for one chunk. */
@@ -298,9 +484,13 @@ public final class MaterialDeciderGpu implements AutoCloseable {
             return;
         }
         for (CudaContext.DeviceBuffer buffer : new CudaContext.DeviceBuffer[] {
-                this.density, this.veinToggle, this.veinRidged, this.cellLevels, this.cellTypes, this.barrierFlat, this.veinGapFlat,
-                this.scratch, this.decisions, this.fluidFlags, this.barrierBlob,
-                this.barrierOffsets, this.veinGapBlob, this.veinGapOffsets}) {
+                this.density, this.veinToggle, this.veinRidged, this.cellLevels, this.cellTypes,
+                this.scratch, this.gridScratchBuffer, this.decisions, this.fluidFlags,
+                this.gridSkip, this.barrierBlob, this.barrierOffsets, this.veinGapBlob,
+                this.veinGapOffsets, this.k0Blob, this.k0Offsets, this.floodednessBlob,
+                this.floodednessOffsets, this.spreadBlob, this.spreadOffsets, this.lavaBlob,
+                this.lavaOffsets, this.erosionBlob, this.erosionOffsets, this.depthBlob,
+                this.depthOffsets}) {
             this.context.free(buffer);
         }
         this.hostArena.close();

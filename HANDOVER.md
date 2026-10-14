@@ -123,6 +123,13 @@ MIT 部分可读可参考，但一行不抄。我们对标的是 vanilla 的输�
 - busy% 含队列等待 ≠ 设备占用
 - 仪表必须能看见它声称测量的改变；新仪器先对已知量校准
 - 外部负载（victoria3、ffmpeg）污染一切端到端数字——跑分前先查
+- 带**在飞区块**退出 ≠ 预生成完成后退出：基准的 `stop` 只验证过后者；前者曾踩出
+  保存退出卡死（ServerStopping 在排空前关服务→FillJob 搁浅→排空死转，§24）。
+  设备释放在 ServerStopped（排空之后），回挪即复现
+- 客户端 regime 快测协议：`runClient -Ptakeover -Ptiming -Poffload -PdecideGpu`，
+  新世界（别复用旧存档——已生成区块污染测量），出生爆发 + 平飞各看一组
+  LayerTiming 窗口；设备线在客户端 regime 永远不是墙（2026-10-14 实测，
+  出生爆发 GPU 167cps/busy 99.9%，平飞 9%）
 - 过了 thread safety 测试 ≠ 没有 bug
 
 ## 关键教训（项目方法论）

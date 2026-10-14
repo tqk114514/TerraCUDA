@@ -163,7 +163,8 @@ public final class GpuWorldgenService implements AutoCloseable {
      *
      * <p>Without this the map only ever grows: leaving a world and loading another leaves the first
      * one's CUDA context, its device buffers — eight megabytes and up — and its daemon thread alive
-     * for the life of the process. Called from the server-stopping event.
+     * for the life of the process. Called from the server-stopped event, after the shutdown drain:
+     * a close while chunks are still in flight would strand their fill jobs and hang the drain.
      */
     public static void releaseAll() {
         List<GpuWorldgenService> services = new ArrayList<>(SERVICES.values());

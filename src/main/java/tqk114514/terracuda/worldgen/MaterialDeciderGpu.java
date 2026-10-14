@@ -28,6 +28,7 @@ import tqk114514.terracuda.density.DensityProgramImage;
  */
 public final class MaterialDeciderGpu implements AutoCloseable {
 
+    public static final String K0_TABLE_KERNEL_NAME = "terracuda_material_k0_table";
     public static final String GRID_KERNEL_NAME = "terracuda_material_grid";
     public static final String KERNEL_NAME = "terracuda_material_decide";
     private static final int BLOCK_SIZE = 128;
@@ -41,6 +42,15 @@ public final class MaterialDeciderGpu implements AutoCloseable {
     private static final int GRID_SPACING_XZ_SHIFT = 4;
     private static final int GRID_SPACING_Y = 12;
     private static final int SAMPLE_OFFSET_XZ = -5;
+
+    /**
+     * The K0 column table's worst case, from the offset tables the grid kernel bakes in: the
+     * 13-offset loop reaches three 16-block grid steps back and one forward in x (48 and 16
+     * blocks), one either way in z, on top of the anchors' 0..9 jitter. In quart indices the
+     * reach is −12..+6 (x) and −4..+6 (z) columns past the grid span's own.
+     */
+    private static final int MAX_TABLE_X = ((((MAX_GRID_XZ - 1) << 4) + 25) >> 2) + 12 + 1;
+    private static final int MAX_TABLE_Z = ((((MAX_GRID_XZ - 1) << 4) + 25) >> 2) + 4 + 1;
 
     private final CudaContext context;
     private final NoiseSettings geometry;
@@ -106,6 +116,8 @@ public final class MaterialDeciderGpu implements AutoCloseable {
     private final CudaContext.DeviceBuffer decisions;
     private final CudaContext.DeviceBuffer fluidFlags;
     private final CudaContext.DeviceBuffer gridSkip;
+    private final CudaContext.DeviceBuffer k0Table;
+    private final CudaContext.DeviceBuffer k0TableScratch;
 
     private final Arena hostArena = Arena.ofShared();
     private final MemorySegment hostDensity;
@@ -203,6 +215,9 @@ public final class MaterialDeciderGpu implements AutoCloseable {
         this.decisions = context.allocate((long) this.count * 4L);
         this.fluidFlags = context.allocate((long) this.count * 4L);
         this.gridSkip = context.allocate(256L);
+        this.k0Table = context.allocate((long) MAX_TABLE_X * MAX_TABLE_Z * Double.BYTES);
+        this.k0TableScratch = context.allocate(
+                (long) MAX_TABLE_X * MAX_TABLE_Z * this.k0Count * Double.BYTES);
 
         this.hostDensity = this.pinnedHost((long) this.count * Double.BYTES);
         this.hostVeinToggle = this.pinnedHost((long) this.count * Double.BYTES);
@@ -234,8 +249,10 @@ public final class MaterialDeciderGpu implements AutoCloseable {
      * the sampling cutoff, the decide kernel runs the per-block half on them.
      *
      * <p>The density must already carry the beard — the same value {@code applyRules} hands the
-     * CPU rules. Both kernels launch on the default stream in order; the cutoff crosses back to
-     * the host between them because the decide kernel takes it as a scalar.
+     * CPU rules. All three kernels launch on the default stream in order — the column table,
+     * then the grid kernel, then the decide kernel — and the decide kernel reads the grid
+     * kernel's cutoff straight off the device, so nothing crosses back to the host until the
+     * decisions themselves do.
      *
      * @return the per-block decision ids and the aquifer's fluid-tick flags
      */
@@ -282,15 +299,39 @@ public final class MaterialDeciderGpu implements AutoCloseable {
         int firstQuartX = chunkMinBlockX >> 2;
         int firstQuartZ = chunkMinBlockZ >> 2;
 
+        // The K0 column table's bounds: the union of every quart column the grid kernel's
+        // 13-offset loop and cutoff walk can ask for, derived once here so the kernel's lookups
+        // never miss. The kernel evaluates each column exactly once instead of the per-cell
+        // 13-offset re-evaluation the previous shape paid ~5000 times a chunk.
+        int tableBaseX = ((minGridX << 4) - 48) >> 2;
+        int tableSizeX = ((((maxGridX << 4) + 25) >> 2) - tableBaseX) + 1;
+        int tableBaseZ = ((minGridZ << 4) - 16) >> 2;
+        int tableSizeZ = ((((maxGridZ << 4) + 25) >> 2) - tableBaseZ) + 1;
+        int tableTotal = tableSizeX * tableSizeZ;
+        if (tableSizeX > MAX_TABLE_X || tableSizeZ > MAX_TABLE_Z) {
+            throw new IllegalStateException("k0 table " + tableSizeX + "x" + tableSizeZ
+                    + " exceeds the decider's " + MAX_TABLE_X + "x" + MAX_TABLE_Z);
+        }
+
+        try (KernelArguments table = new KernelArguments(10)) {
+            table.addDevicePointer(this.k0Blob.address())
+                    .addDevicePointer(this.k0Offsets.address())
+                    .addInt(this.k0Count).addInt(this.k0Root)
+                    .addInt(tableBaseX).addInt(tableBaseZ).addInt(tableSizeX).addInt(tableTotal)
+                    .addDevicePointer(this.k0Table.address())
+                    .addDevicePointer(this.k0TableScratch.address());
+            int tableBlocks = (tableTotal + BLOCK_SIZE - 1) / BLOCK_SIZE;
+            this.context.launch(K0_TABLE_KERNEL_NAME, tableBlocks, 1, 1, BLOCK_SIZE, 1, 1, table);
+        }
+
         try (KernelArguments grid = new KernelArguments(46)) {
             grid.addInt(minGridX).addInt(minGridY).addInt(minGridZ)
                     .addInt(gridSizeX).addInt(gridSizeY).addInt(gridSizeZ)
                     .addInt(this.seaLevel)
                     .addLong(this.aquiferSeedLo).addLong(this.aquiferSeedHi)
                     .addInt(firstQuartX).addInt(firstQuartZ)
-                    .addDevicePointer(this.k0Blob.address())
-                    .addDevicePointer(this.k0Offsets.address())
-                    .addInt(this.k0Count).addInt(this.k0Root)
+                    .addDevicePointer(this.k0Table.address())
+                    .addInt(tableBaseX).addInt(tableBaseZ).addInt(tableSizeX)
                     .addDevicePointer(this.floodednessBlob.address())
                     .addDevicePointer(this.floodednessOffsets.address())
                     .addInt(this.floodednessCount).addInt(this.floodednessRoot)
@@ -316,9 +357,6 @@ public final class MaterialDeciderGpu implements AutoCloseable {
             int gridBlocks = (gridTotal + BLOCK_SIZE - 1) / BLOCK_SIZE;
             this.context.launch(GRID_KERNEL_NAME, gridBlocks, 1, 1, BLOCK_SIZE, 1, 1, grid);
         }
-        this.context.synchronize();
-        this.context.copyFromDevice(this.gridSkip, this.hostSkip);
-        int skipSamplingAboveY = this.hostSkip.get(ValueLayout.JAVA_INT, 0L);
 
         try (KernelArguments arguments = new KernelArguments(40)) {
             arguments.addDevicePointer(this.density.address())
@@ -328,7 +366,7 @@ public final class MaterialDeciderGpu implements AutoCloseable {
                     .addDevicePointer(this.cellTypes.address())
                     .addInt(minGridX).addInt(minGridY).addInt(minGridZ)
                     .addInt(gridSizeX).addInt(gridSizeY).addInt(gridSizeZ)
-                    .addInt(skipSamplingAboveY)
+                    .addDevicePointer(this.gridSkip.address())
                     .addInt(this.seaLevel)
                     .addDevicePointer(this.barrierBlob.address())
                     .addDevicePointer(this.barrierOffsets.address())
@@ -386,15 +424,29 @@ public final class MaterialDeciderGpu implements AutoCloseable {
         int gridTotal = gridSizeX * gridSizeY * gridSizeZ;
         int firstQuartX = chunkMinBlockX >> 2;
         int firstQuartZ = chunkMinBlockZ >> 2;
+        int tableBaseX = ((minGridX << 4) - 48) >> 2;
+        int tableSizeX = ((((maxGridX << 4) + 25) >> 2) - tableBaseX) + 1;
+        int tableBaseZ = ((minGridZ << 4) - 16) >> 2;
+        int tableSizeZ = ((((maxGridZ << 4) + 25) >> 2) - tableBaseZ) + 1;
+        int tableTotal = tableSizeX * tableSizeZ;
+        try (KernelArguments table = new KernelArguments(10)) {
+            table.addDevicePointer(this.k0Blob.address())
+                    .addDevicePointer(this.k0Offsets.address())
+                    .addInt(this.k0Count).addInt(this.k0Root)
+                    .addInt(tableBaseX).addInt(tableBaseZ).addInt(tableSizeX).addInt(tableTotal)
+                    .addDevicePointer(this.k0Table.address())
+                    .addDevicePointer(this.k0TableScratch.address());
+            int tableBlocks = (tableTotal + BLOCK_SIZE - 1) / BLOCK_SIZE;
+            this.context.launch(K0_TABLE_KERNEL_NAME, tableBlocks, 1, 1, BLOCK_SIZE, 1, 1, table);
+        }
         try (KernelArguments grid = new KernelArguments(46)) {
             grid.addInt(minGridX).addInt(minGridY).addInt(minGridZ)
                     .addInt(gridSizeX).addInt(gridSizeY).addInt(gridSizeZ)
                     .addInt(this.seaLevel)
                     .addLong(this.aquiferSeedLo).addLong(this.aquiferSeedHi)
                     .addInt(firstQuartX).addInt(firstQuartZ)
-                    .addDevicePointer(this.k0Blob.address())
-                    .addDevicePointer(this.k0Offsets.address())
-                    .addInt(this.k0Count).addInt(this.k0Root)
+                    .addDevicePointer(this.k0Table.address())
+                    .addInt(tableBaseX).addInt(tableBaseZ).addInt(tableSizeX)
                     .addDevicePointer(this.floodednessBlob.address())
                     .addDevicePointer(this.floodednessOffsets.address())
                     .addInt(this.floodednessCount).addInt(this.floodednessRoot)
@@ -515,7 +567,7 @@ public final class MaterialDeciderGpu implements AutoCloseable {
         for (CudaContext.DeviceBuffer buffer : new CudaContext.DeviceBuffer[] {
                 this.density, this.veinToggle, this.veinRidged, this.cellLevels, this.cellTypes,
                 this.scratch, this.gridScratchBuffer, this.decisions, this.fluidFlags,
-                this.gridSkip, this.barrierBlob, this.barrierOffsets, this.veinGapBlob,
+                this.gridSkip, this.k0Table, this.k0TableScratch, this.barrierBlob, this.barrierOffsets, this.veinGapBlob,
                 this.veinGapOffsets, this.k0Blob, this.k0Offsets, this.floodednessBlob,
                 this.floodednessOffsets, this.spreadBlob, this.spreadOffsets, this.lavaBlob,
                 this.lavaOffsets, this.erosionBlob, this.erosionOffsets, this.depthBlob,

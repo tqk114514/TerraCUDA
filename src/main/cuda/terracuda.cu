@@ -1026,7 +1026,7 @@ extern "C" __global__ void terracuda_material_decide(
         const int* __restrict__ cellTypes,      // gridTotal, TC_DECIDE_WATER or TC_DECIDE_LAVA
         int minGridX, int minGridY, int minGridZ,
         int gridSizeX, int gridSizeY, int gridSizeZ,
-        int skipSamplingAboveY,
+        const int* __restrict__ skipBuffer,     // the grid kernel's cutoff, read where written
         int seaLevel,
         const char* __restrict__ barrierBlob, const long long* __restrict__ barrierOffsets,
         int barrierCount, int barrierRoot, int barrierWrapped,
@@ -1046,6 +1046,10 @@ extern "C" __global__ void terracuda_material_decide(
     if (index >= count) {
         return;
     }
+
+    // The cutoff the grid kernel derived: every thread reads the same four bytes, and the
+    // launch order on the stream guarantees the grid kernel finished writing them.
+    int skipSamplingAboveY = skipBuffer[0];
 
     int xLocal, zLocal, yLocal;
     tcBlockLocal(index, 16, height, &xLocal, &zLocal, &yLocal);
@@ -1319,17 +1323,46 @@ __device__ __forceinline__ int tcSurfaceOffsetZ(int index) {
     return zs[index];
 }
 
+// The preliminary surface's column table: every quart column the chunk's cells can sample,
+// evaluated once by terracuda_material_k0_table and read back by index. The value is the
+// same tcEvaluatePlain call the per-cell loop made -- the program is a pure function of the
+// position (no override leaves), so a table read and a direct evaluation agree bit for bit.
+__device__ __forceinline__ double tcK0Column(const double* __restrict__ table,
+                                               int baseQuartX, int baseQuartZ, int sizeX,
+                                               int quartX, int quartZ) {
+    return table[(quartX - baseQuartX) + (quartZ - baseQuartZ) * sizeX];
+}
+
 // One grid cell's fluid status, a verbatim port of MaterialRules.computeFluid, plus -- on the
 // first thread only -- the sampling cutoff the constructor derives from the highest preliminary
 // surface under the grid. The K0 program answers a column's level in one evaluation: the
 // find-top-surface walk was lowered into it.
+// The chunk's K0 columns, one thread each: the exact evaluation the per-cell loop and the
+// cutoff walk would repeat, folded into a table the grid kernel reads by index. Launched on
+// the same stream ahead of the grid kernel, so stream order makes the table visible.
+extern "C" __global__ void terracuda_material_k0_table(
+        const char* __restrict__ k0Blob, const long long* __restrict__ k0Offsets,
+        int k0Count, int k0Root,
+        int baseQuartX, int baseQuartZ, int sizeX, int tableTotal,
+        double* __restrict__ table, double* __restrict__ scratch) {
+    int index = blockIdx.x * blockDim.x + threadIdx.x;
+    if (index >= tableTotal) {
+        return;
+    }
+    int qx = index % sizeX;
+    int qz = index / sizeX;
+    table[index] = tcEvaluatePlain(k0Blob, k0Offsets, k0Count, k0Root,
+            (baseQuartX + qx) << 2, 0, (baseQuartZ + qz) << 2,
+            scratch + (long long) index * k0Count);
+}
+
 extern "C" __global__ void terracuda_material_grid(
         int minGridX, int minGridY, int minGridZ,
         int gridSizeX, int gridSizeY, int gridSizeZ,
         int seaLevel, long long aquiferSeedLo, long long aquiferSeedHi,
         int firstQuartX, int firstQuartZ,
-        const char* __restrict__ k0Blob, const long long* __restrict__ k0Offsets,
-        int k0Count, int k0Root,
+        const double* __restrict__ k0Table,
+        int k0TableBaseX, int k0TableBaseZ, int k0TableSizeX,
         const char* __restrict__ floodednessBlob, const long long* __restrict__ floodednessOffsets,
         int floodednessCount, int floodednessRoot, int floodednessWrapped,
         const char* __restrict__ spreadBlob, const long long* __restrict__ spreadOffsets,
@@ -1383,10 +1416,8 @@ extern "C" __global__ void terracuda_material_grid(
         int sampleX = cellBlockX + (tcSurfaceOffsetX(offset) << 4);
         int sampleZ = cellBlockZ + (tcSurfaceOffsetZ(offset) << 4);
         // The column quantises to quart positions before it is asked.
-        int quartX = (sampleX >> 2) << 2;
-        int quartZ = (sampleZ >> 2) << 2;
-        double levelValue = tcEvaluatePlain(k0Blob, k0Offsets, k0Count, k0Root,
-                quartX, 0, quartZ, myScratch);
+        double levelValue = tcK0Column(k0Table, k0TableBaseX, k0TableBaseZ, k0TableSizeX,
+                sampleX >> 2, sampleZ >> 2);
         int preliminarySurfaceLevel = (int) floor(levelValue);
         int adjustedSurfaceLevel = preliminarySurfaceLevel + 8;
         bool start = offset == 0;
@@ -1491,10 +1522,8 @@ extern "C" __global__ void terracuda_material_grid(
         int highest = 0x80000000;
         for (int blockZ = minBlockZ; blockZ <= maxBlockZ; blockZ += 4) {
             for (int blockX = minBlockX; blockX <= maxBlockX; blockX += 4) {
-                int quartX = (blockX >> 2) << 2;
-                int quartZ = (blockZ >> 2) << 2;
-                double levelValue = tcEvaluatePlain(k0Blob, k0Offsets, k0Count, k0Root,
-                        quartX, 0, quartZ, myScratch);
+                double levelValue = tcK0Column(k0Table, k0TableBaseX, k0TableBaseZ,
+                        k0TableSizeX, blockX >> 2, blockZ >> 2);
                 highest = max(highest, (int) floor(levelValue));
             }
         }

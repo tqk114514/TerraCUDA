@@ -55,9 +55,11 @@ MC 26.1.2 / NeoForge 26.1.2.114 / Java 25 / `mod_id=terracuda`。远端 `github.
 1. **G2：规则与 aquifer 上 GPU**（唯一剩下的结构杠杆）。**G2a 已落地**（§21，
    `b3a8b7f`）：`terracuda_material_decide` 内核 + `MaterialDeciderGpu` 管道，
    6 区块 589,824 块对 CPU 全路径逐位一致（含 AIR 语义陷阱的修正），94 测试全绿。
-   剩余：**G2b** 格点半场的噪声上设备（`exportGrid` 的流体状态计算——floodedness/
-   spread/lava + erosion/depth flat 表 + K0 地表水位——消灭 CPU 供表）→ **G2c** 输出翻
-   方块 id、relay 退化纯写回（砍停留总量的那刀）。每步 94 测试 + 逐位验收 + 同日基准。
+   **G2b 已完成**（§22，`257b5ae`）：`terracuda_material_grid` 逐格推导流体状态
+   （K0 采样/双早退/深暗捷径/floodedness/spread/lava/截断），每区块跨线只剩密度+vein 入、
+   决策+位图出；96 测试全绿（含格点表逐格验收）。
+   剩余：**G2c** 输出翻方块 id、relay worker 退化纯写回（砍停留总量的那刀），
+   然后同日基准验收吞吐账。
 2. **客户端场景**（未测）：节流器 4÷dwell 的世界；`-Ptiming` 逐层仪表直接可用，
    需要手动玩家操作。
 3. 已封案：FEATURES 杠杆（§17）、L4 无头（§16）、L2 lane（§15）、G1 批处理-屏障

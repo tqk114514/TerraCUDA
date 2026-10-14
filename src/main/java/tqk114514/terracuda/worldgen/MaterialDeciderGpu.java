@@ -204,12 +204,29 @@ public final class MaterialDeciderGpu implements AutoCloseable {
         this.fluidFlags = context.allocate((long) this.count * 4L);
         this.gridSkip = context.allocate(256L);
 
-        this.hostDensity = this.hostArena.allocate((long) this.count * Double.BYTES);
-        this.hostVeinToggle = this.hostArena.allocate((long) this.count * Double.BYTES);
-        this.hostVeinRidged = this.hostArena.allocate((long) this.count * Double.BYTES);
-        this.hostDecisions = this.hostArena.allocate((long) this.count * 4L);
-        this.hostFluidFlags = this.hostArena.allocate((long) this.count * 4L);
+        this.hostDensity = this.pinnedHost((long) this.count * Double.BYTES);
+        this.hostVeinToggle = this.pinnedHost((long) this.count * Double.BYTES);
+        this.hostVeinRidged = this.pinnedHost((long) this.count * Double.BYTES);
+        this.hostDecisions = this.pinnedHost((long) this.count * 4L);
+        this.hostFluidFlags = this.pinnedHost((long) this.count * 4L);
+        // Four bytes a chunk: the driver's staging bounce on a copy this small is noise, and the
+        // read that follows is on the critical path regardless.
         this.hostSkip = this.hostArena.allocate(256L);
+    }
+
+    /**
+     * Page-locked staging, so each per-chunk transfer is one direct DMA instead of the driver's
+     * bounce through a staging buffer — the same pageable lesson the stream work paid for in the
+     * evaluator, replayed here on the decide path.
+     *
+     * <p>The 64KB floor is what the evaluator's staging uses: it keeps each segment on its own
+     * page-aligned allocation, which is what the host register accepts. The transfers slice the
+     * exact size off the head because the copy functions take the segment's whole byte size.
+     */
+    private MemorySegment pinnedHost(long bytes) {
+        MemorySegment segment = this.hostArena.allocate(Math.max(bytes, 1L << 16));
+        this.context.pin(segment);
+        return segment;
     }
 
     /**
@@ -247,14 +264,19 @@ public final class MaterialDeciderGpu implements AutoCloseable {
 
         MemorySegment.copy(density, 0, this.hostDensity, ValueLayout.JAVA_DOUBLE, 0,
                 density.length);
-        this.context.copyToDevice(this.hostDensity, this.density);
+        this.context.copyToDevice(
+                this.hostDensity.asSlice(0L, (long) density.length * Double.BYTES), this.density);
         if (this.oreVeinsEnabled) {
             MemorySegment.copy(veinToggle, 0, this.hostVeinToggle, ValueLayout.JAVA_DOUBLE, 0,
                     veinToggle.length);
-            this.context.copyToDevice(this.hostVeinToggle, this.veinToggle);
+            this.context.copyToDevice(
+                    this.hostVeinToggle.asSlice(0L, (long) veinToggle.length * Double.BYTES),
+                    this.veinToggle);
             MemorySegment.copy(veinRidged, 0, this.hostVeinRidged, ValueLayout.JAVA_DOUBLE, 0,
                     veinRidged.length);
-            this.context.copyToDevice(this.hostVeinRidged, this.veinRidged);
+            this.context.copyToDevice(
+                    this.hostVeinRidged.asSlice(0L, (long) veinRidged.length * Double.BYTES),
+                    this.veinRidged);
         }
 
         int firstQuartX = chunkMinBlockX >> 2;
@@ -333,8 +355,10 @@ public final class MaterialDeciderGpu implements AutoCloseable {
         }
         this.context.synchronize();
 
-        this.context.copyFromDevice(this.decisions, this.hostDecisions);
-        this.context.copyFromDevice(this.fluidFlags, this.hostFluidFlags);
+        this.context.copyFromDevice(this.decisions,
+                this.hostDecisions.asSlice(0L, (long) this.count * 4L));
+        this.context.copyFromDevice(this.fluidFlags,
+                this.hostFluidFlags.asSlice(0L, (long) this.count * 4L));
         int[] states = new int[this.count];
         int[] ticks = new int[this.count];
         MemorySegment.copy(this.hostDecisions, ValueLayout.JAVA_INT, 0L, states, 0, this.count);
@@ -483,6 +507,11 @@ public final class MaterialDeciderGpu implements AutoCloseable {
             this.hostArena.close();
             return;
         }
+        this.context.unpin(this.hostDensity);
+        this.context.unpin(this.hostVeinToggle);
+        this.context.unpin(this.hostVeinRidged);
+        this.context.unpin(this.hostDecisions);
+        this.context.unpin(this.hostFluidFlags);
         for (CudaContext.DeviceBuffer buffer : new CudaContext.DeviceBuffer[] {
                 this.density, this.veinToggle, this.veinRidged, this.cellLevels, this.cellTypes,
                 this.scratch, this.gridScratchBuffer, this.decisions, this.fluidFlags,

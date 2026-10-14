@@ -8,6 +8,7 @@ import java.util.Optional;
 import net.minecraft.world.level.levelgen.RandomState;
 import org.junit.jupiter.api.Test;
 import tqk114514.terracuda.chunk.EmittedChunk;
+import tqk114514.terracuda.density.DensityProgramImage;
 import tqk114514.terracuda.cuda.CudaContext;
 import tqk114514.terracuda.cuda.CudaDeviceInfo;
 import tqk114514.terracuda.cuda.CudaDriver;
@@ -55,17 +56,13 @@ class MaterialDeciderGpuTest {
                         settings.isAquifersEnabled(), settings.oreVeinsEnabled(),
                         rulesContext)) {
 
+                    System.out.println("COUNT-DBG barrier=" + DensityProgramImage.of(rulesContext.barrierNoise.program()).instructionCount() + " veinGap=" + DensityProgramImage.of(rulesContext.veinGap.program()).instructionCount() + " k0=" + DensityProgramImage.of(rulesContext.preliminarySurface.program()).instructionCount() + " floodedness=" + DensityProgramImage.of(rulesContext.floodedness.program()).instructionCount() + " spread=" + DensityProgramImage.of(rulesContext.spread.program()).instructionCount() + " lava=" + DensityProgramImage.of(rulesContext.lava.program()).instructionCount() + " erosion=" + DensityProgramImage.of(rulesContext.erosion.program()).instructionCount() + " depth=" + DensityProgramImage.of(rulesContext.depth.program()).instructionCount());
                     int chunkX = 1;
                     int chunkZ = -1;
                     GpuChunkFiller.DensityBuffers buffers = filler.emitDensities(chunkX, chunkZ);
                     MaterialRules rules = filler.materialRulesFor(chunkX, chunkZ, rulesContext,
                             buffers.veinToggle(), buffers.veinRidged());
                     MaterialRules.GridTables expected = rules.exportGrid();
-
-
-                                + " |" + trace);
-                    }
-
                     MaterialDeciderGpu.GridView view = decider.debugGrid(chunkX, chunkZ);
                     assertEquals(expected.minGridX(), view.minGridX());
                     assertEquals(expected.gridSizeX(), view.gridSizeX());
@@ -191,6 +188,72 @@ class MaterialDeciderGpuTest {
                         assertEquals(0, total, () -> total + " of "
                                 + actual.states().length + " blocks differ in chunk (" + chunkX
                                 + ", " + chunkZ + "); first mismatch: " + first[0]);
+                    }
+                }
+            }
+        }
+    }
+
+    /**
+     * G2c's acceptance: the takeover pipeline's device path — emit, fold, decide, map — must
+     * produce the same EmittedChunk as the full CPU path, chunk for chunk. This is the
+     * production shape the benchmark will run: emitAndDecide through the filler.
+     */
+    @Test
+    void theDevicePathMatchesTheCpuPipelineBlockForBlock() {
+        CudaEnvironment environment = CudaEnvironment.detect();
+        assumeTrue(environment.available(), "no CUDA device on this machine");
+        Optional<CudaDriver> loaded = CudaDriver.tryLoad();
+        assumeTrue(loaded.isPresent(), "no CUDA driver library on this machine");
+
+        try (CudaDriver driver = loaded.get()) {
+            driver.init();
+            CudaDeviceInfo device = environment.firstDevice().orElseThrow();
+            try (CudaContext context = CudaContext.create(driver, device.index())) {
+                CudaKernels.loadModule(context, device);
+                RandomState randomState = OverworldFixture.randomState();
+                var settings = OverworldFixture.generatorSettings();
+                GpuChunkFiller filler = GpuChunkFiller.create(context, randomState, settings);
+                GpuChunkFiller.RulesContext rulesContext = filler.createRulesContext();
+                var oreRandom = VanillaRandomExport.export(randomState.oreRandom());
+                var aquiferRandom = VanillaRandomExport.export(randomState.aquiferRandom());
+                try (MaterialDeciderGpu decider = new MaterialDeciderGpu(context,
+                        OverworldFixture.noiseSettings(), settings.seaLevel(),
+                        oreRandom.seedLo(), oreRandom.seedHi(),
+                        aquiferRandom.seedLo(), aquiferRandom.seedHi(),
+                        settings.isAquifersEnabled(), settings.oreVeinsEnabled(),
+                        rulesContext)) {
+
+                    for (int[] chunk : CHUNKS) {
+                        int chunkX = chunk[0];
+                        int chunkZ = chunk[1];
+
+                        EmittedChunk expected = filler.blockIds(chunkX, chunkZ);
+                        EmittedChunk actual = filler.emitAndDecide(chunkX, chunkZ, decider, null);
+
+                        int mismatches = 0;
+                        String[] first = new String[1];
+                        for (int blockIndex = 0; blockIndex < actual.stateIds().length; blockIndex++) {
+                            var expectedState = net.minecraft.world.level.block.Block
+                                    .stateById(expected.stateIds()[blockIndex]);
+                            var actualState = net.minecraft.world.level.block.Block
+                                    .stateById(actual.stateIds()[blockIndex]);
+                            if (expectedState != actualState) {
+                                if (first[0] == null) {
+                                    first[0] = "block " + blockIndex + ": expected "
+                                            + expectedState + ", got " + actualState;
+                                }
+                                mismatches++;
+                            }
+                        }
+                        for (int w = 0; w < expected.fluidUpdates().length; w++) {
+                            if (expected.fluidUpdates()[w] != actual.fluidUpdates()[w]) {
+                                mismatches += 10_000;
+                            }
+                        }
+                        int total = mismatches;
+                        assertEquals(0, total, () -> total + " discrepancies in chunk (" + chunkX
+                                + ", " + chunkZ + "); first: " + first[0]);
                     }
                 }
             }

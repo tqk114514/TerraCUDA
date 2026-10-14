@@ -57,9 +57,10 @@ MC 26.1.2 / NeoForge 26.1.2.114 / Java 25 / `mod_id=terracuda`。远端 `github.
    6 区块 589,824 块对 CPU 全路径逐位一致（含 AIR 语义陷阱的修正），94 测试全绿。
    **G2b 已完成**（§22，`257b5ae`）：`terracuda_material_grid` 逐格推导流体状态
    （K0 采样/双早退/深暗捷径/floodedness/spread/lava/截断），每区块跨线只剩密度+vein 入、
-   决策+位图出；96 测试全绿（含格点表逐格验收）。
-   剩余：**G2c** 输出翻方块 id、relay worker 退化纯写回（砍停留总量的那刀），
-   然后同日基准验收吞吐账。
+   决策+位图出。**G2c 已落地**（§23，`-PdecideGpu`）：emitAndDecide + ReplayJob 双形态 +
+   十项 id 表映射——**功能正确（97 测试含管线级逐位）但吞吐判决为负**（13:51 vs 2:17，
+   决策内核 svc 1735ms：未 pin 上传 + 每格 K0 重复求值 + 双内核同步结构）。
+   精炼杠杆按序：pin 上传 → K0 quart 表预计算 → 融合双内核 → 密度不落主机。
 2. **客户端场景**（未测）：节流器 4÷dwell 的世界；`-Ptiming` 逐层仪表直接可用，
    需要手动玩家操作。
 3. 已封案：FEATURES 杠杆（§17）、L4 无头（§16）、L2 lane（§15）、G1 批处理-屏障

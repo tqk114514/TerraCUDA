@@ -26,6 +26,7 @@ import tqk114514.terracuda.cuda.CudaEnvironment;
 import tqk114514.terracuda.cuda.CudaException;
 import tqk114514.terracuda.cuda.CudaKernels;
 import tqk114514.terracuda.TerraCUDA;
+import tqk114514.terracuda.chunk.EmittedChunk;
 import tqk114514.terracuda.config.TerracudaConfig;
 
 /**
@@ -86,10 +87,14 @@ public final class GpuWorldgenService implements AutoCloseable {
         void run(GpuChunkFiller filler);
     }
 
-    /** One chunk handed from the device thread to a rules worker. */
+    /**
+     * One chunk handed from the device thread to a rules worker. Either the buffers and the
+     * beard (the worker applies the CPU rules, then writes) or a finished answer (the worker
+     * writes only) -- the decide-gpu pipeline's shape.
+     */
     private record ReplayJob(GpuChunkFiller filler, ChunkAccess chunk,
-            GpuChunkFiller.DensityBuffers buffers, CompletableFuture<Void> done,
-            Beardifier beardifier) {
+            GpuChunkFiller.DensityBuffers buffers, Beardifier beardifier, EmittedChunk emitted,
+            CompletableFuture<Void> done) {
     }
 
     /** One chunk waiting for its device half; a wave is these, drained together. */
@@ -139,6 +144,7 @@ public final class GpuWorldgenService implements AutoCloseable {
 
     private CudaContext context;
     private GpuChunkFiller filler;
+    private MaterialDeciderGpu decider;
 
     /**
      * The service for {@code randomState}, built on first use.
@@ -262,9 +268,15 @@ public final class GpuWorldgenService implements AutoCloseable {
                     continue;
                 }
                 try {
-                    EmittedChunk emitted = job.filler().applyRules(
-                            job.chunk().getPos().x(), job.chunk().getPos().z(),
-                            job.buffers(), context, job.beardifier());
+                    EmittedChunk emitted;
+                    if (job.emitted() != null) {
+                        // The decide-gpu pipeline: the answer was built on the device thread.
+                        emitted = job.emitted();
+                    } else {
+                        emitted = job.filler().applyRules(
+                                job.chunk().getPos().x(), job.chunk().getPos().z(),
+                                job.buffers(), context, job.beardifier());
+                    }
                     job.filler().writeChunk(job.chunk(), emitted);
                     job.done().complete(null);
                 } catch (Throwable t) {
@@ -306,8 +318,21 @@ public final class GpuWorldgenService implements AutoCloseable {
         }
     }
 
-    /** The per-chunk form: emit one chunk's densities and hand its buffers to a rules worker. */
+    /** The per-chunk form: emit one chunk's densities and hand its half to a rules worker. */
     private void emitSingle(FillJob job) throws InterruptedException {
+        if (TerracudaConfig.decideGpu()) {
+            EmittedChunk emitted;
+            try {
+                emitted = this.filler.emitAndDecide(job.chunk().getPos().x(),
+                        job.chunk().getPos().z(), this.decider, job.beardifier());
+            } catch (Throwable t) {
+                job.done().completeExceptionally(t);
+                return;
+            }
+            this.replayJobs.put(new ReplayJob(this.filler, job.chunk(), null, null, emitted,
+                    job.done()));
+            return;
+        }
         GpuChunkFiller.DensityBuffers buffers;
         try {
             buffers = this.filler.emitDensities(job.chunk().getPos().x(), job.chunk().getPos().z());
@@ -317,8 +342,8 @@ public final class GpuWorldgenService implements AutoCloseable {
         }
         // A blocking hand-off: when the rules workers are REPLAY_CAPACITY chunks behind, the
         // device thread waits here rather than running ahead in memory.
-        this.replayJobs.put(new ReplayJob(this.filler, job.chunk(), buffers, job.done(),
-                job.beardifier()));
+        this.replayJobs.put(new ReplayJob(this.filler, job.chunk(), buffers, job.beardifier(),
+                null, job.done()));
     }
 
     /**
@@ -346,8 +371,21 @@ public final class GpuWorldgenService implements AutoCloseable {
         }
         for (int i = 0; i < size; i++) {
             FillJob job = wave.get(i);
-            this.replayJobs.put(new ReplayJob(this.filler, job.chunk(), buffers[i], job.done(),
-                    job.beardifier()));
+            if (TerracudaConfig.decideGpu()) {
+                EmittedChunk emitted;
+                try {
+                    emitted = this.filler.emitAndDecide(xs[i], zs[i], this.decider,
+                            job.beardifier());
+                } catch (Throwable t) {
+                    job.done().completeExceptionally(t);
+                    continue;
+                }
+                this.replayJobs.put(new ReplayJob(this.filler, job.chunk(), null, null, emitted,
+                        job.done()));
+            } else {
+                this.replayJobs.put(new ReplayJob(this.filler, job.chunk(), buffers[i],
+                        job.beardifier(), null, job.done()));
+            }
         }
     }
 
@@ -442,6 +480,9 @@ public final class GpuWorldgenService implements AutoCloseable {
         CudaKernels.loadModule(this.context, device);
 
         this.filler = GpuChunkFiller.create(this.context, randomState, settings);
+        // One context of the decider's own: its kernels read the uploaded programs, not the
+        // workers' interpreters, and its scratch is per-chunk on the device thread.
+        GpuChunkFiller.RulesContext deciderContext = this.filler.createRulesContext();
         int workers = Math.max(1, TerracudaConfig.rulesWorkers());
         this.replayThreads = new Thread[workers];
         for (int i = 0; i < workers; i++) {
@@ -450,6 +491,13 @@ public final class GpuWorldgenService implements AutoCloseable {
             this.replayThreads[i].setDaemon(true);
             this.replayThreads[i].start();
         }
+        this.decider = new MaterialDeciderGpu(this.context,
+                settings.noiseSettings(), settings.seaLevel(),
+                VanillaRandomExport.export(randomState.oreRandom()).seedLo(),
+                VanillaRandomExport.export(randomState.oreRandom()).seedHi(),
+                VanillaRandomExport.export(randomState.aquiferRandom()).seedLo(),
+                VanillaRandomExport.export(randomState.aquiferRandom()).seedHi(),
+                settings.isAquifersEnabled(), settings.oreVeinsEnabled(), deciderContext);
         this.ready = true;
         this.unavailableReason = "";
     }
@@ -524,6 +572,13 @@ public final class GpuWorldgenService implements AutoCloseable {
     }
 
     private void closeQuietly() {
+        try {
+            if (this.decider != null) {
+                this.decider.close();
+            }
+        } catch (CudaException ignored) {
+            // Shutting down; a failure here has nowhere useful to go.
+        }
         try {
             if (this.filler != null) {
                 this.filler.close();

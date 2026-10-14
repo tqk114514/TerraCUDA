@@ -116,6 +116,9 @@ def terracudaReplayCapacity = (findProperty('terracuda.replayCapacity') ?: findP
 // -Pbatch drains the generation ripple's chunks as waves: one corner launch and one stream sync
 // per program per wave instead of per chunk. The second-generation pipeline's G1 lever.
 def terracudaBatch = project.hasProperty('terracuda.batch') || project.hasProperty('batch')
+// -PdecideGpu runs the material decision on the device: the device thread folds the beard and
+// hands the densities to the decider kernel, and the rules workers receive a finished answer.
+def terracudaDecideGpu = project.hasProperty('terracuda.decideGpu') || project.hasProperty('decideGpu')
 
 neoForge {
     version = project.neo_version
@@ -189,6 +192,9 @@ neoForge {
             }
             if (terracudaBatch) {
                 jvmArguments.add('-Dterracuda.batch=true')
+            }
+            if (terracudaDecideGpu) {
+                jvmArguments.add('-Dterracuda.decideGpu=true')
             }
             if (terracudaWorkers != '2') {
                 jvmArguments.add("-Dterracuda.rulesWorkers=$terracudaWorkers")

@@ -132,6 +132,16 @@ public final class TerracudaConfig {
     }
 
     /**
+     * Whether the material decision runs on the device: the takeover pipeline's device thread
+     * folds the beard and hands the densities to the decider kernel, and the rules workers
+     * receive a finished answer to write. The CPU's 4.8 ms of aquifer and vein arithmetic
+     * leaves the critical path. See {@code docs/第二代管线设计.md} (G2c).
+     */
+    public static boolean decideGpu() {
+        return Boolean.getBoolean(PREFIX + "decideGpu");
+    }
+
+    /**
      * Whether the device thread drains the generation ripple's chunks as waves: everything
      * already waiting rides in one submission set — one corner launch per program instead of
      * one per chunk, and one stream synchronisation per program per wave.
@@ -161,7 +171,7 @@ public final class TerracudaConfig {
     public static String summary() {
         return "gpu=" + gpuEnabled() + ", shadow=" + shadowMode() + ", verbose=" + verbose()
                 + ", timing=" + timing() + ", offload=" + offload()
-                + ", parallelSched=" + parallelSched() + ", batch=" + batch()
+                + ", parallelSched=" + parallelSched() + ", batch=" + batch() + ", decideGpu=" + decideGpu()
                 + ", rulesWorkers=" + rulesWorkers();
     }
 }

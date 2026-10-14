@@ -3,6 +3,7 @@ package tqk114514.terracuda.worldgen;
 import java.util.concurrent.LinkedBlockingQueue;
 
 import net.minecraft.world.level.block.Block;
+import net.minecraft.world.level.block.Blocks;
 import net.minecraft.world.level.block.state.BlockState;
 import net.minecraft.world.level.chunk.ChunkAccess;
 import net.minecraft.world.level.chunk.LevelChunkSection;
@@ -261,8 +262,6 @@ public final class GpuChunkFiller implements AutoCloseable {
         int minY = this.geometry.minY();
         int height = this.geometry.height();
         long began = TIMING ? System.nanoTime() : 0L;
-        // Reused for every block the beard reaches: one mutable context, no per-block allocation.
-        BeardContext beardCtx = beardifier != null ? new BeardContext() : null;
         try {
             // The material rules read router entries through interpreters, and a flat cache inside one
             // of those needs to know which chunk's columns it is answering for.
@@ -271,6 +270,7 @@ public final class GpuChunkFiller implements AutoCloseable {
             }
 
             double[] densities = buffers.density();
+            foldBeardInto(chunkX, chunkZ, densities, beardifier);
             double[] veinToggleValues = buffers.veinToggle();
             double[] veinRidgedValues = buffers.veinRidged();
 
@@ -288,19 +288,10 @@ public final class GpuChunkFiller implements AutoCloseable {
                 for (int x = 0; x < 16; x++) {
                     for (int z = 0; z < 16; z++) {
                         int blockIndex = (x * 16 + z) * height + yLocal;
-                        double value = densities[blockIndex];
-                        if (beardCtx != null) {
-                            // The beard is added at full block resolution, above the interpolator —
-                            // the same place vanilla's `add(finalDensity, Beardifier)` sits in the
-                            // DAG. Most blocks fall outside the structure's bounding box and the
-                            // compute returns zero at the cost of one isInside check.
-                            beardCtx.x = chunkMinBlockX + x;
-                            beardCtx.y = y;
-                            beardCtx.z = chunkMinBlockZ + z;
-                            value += beardifier.compute(beardCtx);
-                        }
+                        // The beard was folded in before the loop: full block resolution, above the
+                        // interpolator — the same place vanilla's add(finalDensity, Beardifier) sits.
                         BlockState state = rules.compute(chunkMinBlockX + x, y,
-                                chunkMinBlockZ + z, value);
+                                chunkMinBlockZ + z, densities[blockIndex]);
                         if (state == null) {
                             state = defaultBlock;
                         }
@@ -379,6 +370,102 @@ public final class GpuChunkFiller implements AutoCloseable {
                 this.settings.isAquifersEnabled(), this.settings.oreVeinsEnabled());
     }
 
+    /**
+     * Folds the structure beard into the density array in place: full block resolution, above
+     * the interpolator — the same place vanilla's {@code add(finalDensity, Beardifier)} sits in
+     * the DAG. Most blocks fall outside the structure's bounding box and the compute returns
+     * zero at the cost of one isInside check. Shared by the CPU rules path and the device
+     * decision path, so the two cannot drift.
+     */
+    void foldBeardInto(int chunkX, int chunkZ, double[] densities, Beardifier beardifier) {
+        if (beardifier == null) {
+            return;
+        }
+        int minY = this.geometry.minY();
+        int height = this.geometry.height();
+        int chunkMinBlockX = chunkX * 16;
+        int chunkMinBlockZ = chunkZ * 16;
+        // Reused for every block the beard reaches: one mutable context, no per-block allocation.
+        BeardContext beardCtx = new BeardContext();
+        for (int yLocal = 0; yLocal < height; yLocal++) {
+            int y = minY + yLocal;
+            for (int x = 0; x < 16; x++) {
+                for (int z = 0; z < 16; z++) {
+                    beardCtx.x = chunkMinBlockX + x;
+                    beardCtx.y = y;
+                    beardCtx.z = chunkMinBlockZ + z;
+                    densities[(x * 16 + z) * height + yLocal] += beardifier.compute(beardCtx);
+                }
+            }
+        }
+    }
+
+    /**
+     * G2c: the whole material decision on the device — densities in, block ids out. The beard
+     * folds first (on this thread), the decider consumes the arrays and answers per block, and
+     * the answer maps back through a ten-entry table whose registry ids were resolved once.
+     *
+     * <p>This is the takeover shape's replacement for {@link #applyRules}: the CPU's 4.8 ms of
+     * aquifer and vein arithmetic leaves the critical path, and what a rules worker receives is
+     * an answer to write.
+     */
+    public EmittedChunk emitAndDecide(int chunkX, int chunkZ, MaterialDeciderGpu decider,
+            Beardifier beardifier) {
+        long began = TIMING ? System.nanoTime() : 0L;
+        DensityBuffers buffers = emitDensities(chunkX, chunkZ);
+        try {
+            foldBeardInto(chunkX, chunkZ, buffers.density(), beardifier);
+            MaterialDeciderGpu.Decisions decisions = decider.decide(chunkX, chunkZ,
+                    buffers.density(), buffers.veinToggle(), buffers.veinRidged());
+
+            int height = this.geometry.height();
+            int[] idTable = decisionIdTable();
+            int[] ids = new int[16 * 16 * height];
+            long[] fluidUpdates = new long[(ids.length + 63) >>> 6];
+            int[] states = decisions.states();
+            int[] ticks = decisions.fluidTicks();
+            for (int blockIndex = 0; blockIndex < ids.length; blockIndex++) {
+                int decision = states[blockIndex];
+                ids[blockIndex] = idTable[decision];
+                if ((decision == MaterialRules.DECISION_WATER
+                        || decision == MaterialRules.DECISION_LAVA) && ticks[blockIndex] != 0) {
+                    fluidUpdates[blockIndex >>> 6] |= 1L << (blockIndex & 63);
+                }
+            }
+            return new EmittedChunk(ids, fluidUpdates);
+        } finally {
+            if (TIMING) {
+                this.rulesNanos.add(System.nanoTime() - began);
+                this.emittedChunks.increment();
+            }
+            releaseBuffers(buffers);
+        }
+    }
+
+    /** The ten decision ids resolved to registry ids once per filler. */
+    private int[] decisionIdTable() {
+        if (this.decisionIdTable == null) {
+            BlockState defaultBlock = this.settings.defaultBlock();
+            this.decisionIdTable = new int[] {
+                    Block.getId(defaultBlock),
+                    Block.getId(Blocks.WATER.defaultBlockState()),
+                    Block.getId(Blocks.LAVA.defaultBlockState()),
+                    Block.getId(Blocks.COPPER_ORE.defaultBlockState()),
+                    Block.getId(Blocks.RAW_COPPER_BLOCK.defaultBlockState()),
+                    Block.getId(Blocks.GRANITE.defaultBlockState()),
+                    Block.getId(Blocks.DEEPSLATE_IRON_ORE.defaultBlockState()),
+                    Block.getId(Blocks.RAW_IRON_BLOCK.defaultBlockState()),
+                    Block.getId(Blocks.TUFF.defaultBlockState()),
+                    Block.getId(Blocks.AIR.defaultBlockState()),
+            };
+        }
+        return this.decisionIdTable;
+    }
+
+    private int[] decisionIdTable;
+
+    /**
+     * The write-back half of the rules pipeline, on its own thread:
     /**
      * The write-back half of the rules pipeline, on its own thread: turns one chunk's computed
      * block states into written blocks, holding the sections for the duration the way

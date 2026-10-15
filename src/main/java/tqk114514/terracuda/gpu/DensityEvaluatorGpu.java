@@ -424,7 +424,12 @@ public final class DensityEvaluatorGpu implements AutoCloseable {
         int countY = ChunkCornerTables.cornerCountY(settings);
         int perMarker = ChunkCornerTables.CORNERS_XZ * ChunkCornerTables.CORNERS_XZ * countY;
         int count = CHUNK_SIZE_XZ * CHUNK_SIZE_XZ * settings.height();
+        boolean downloads = false;
         for (double[] out : outs) {
+            if (out == null) {
+                continue;
+            }
+            downloads = true;
             if (out.length != count) {
                 throw new IllegalArgumentException("expected " + count + " values, got "
                         + out.length);
@@ -458,15 +463,19 @@ public final class DensityEvaluatorGpu implements AutoCloseable {
         int blockInstructions = this.blockImage.instructionCount();
         ensureBlockBuffers(markerCount, perMarker, count, blockInstructions, slots);
 
-        MemorySegment host = hostDoubles(count * waveSize);
+        // The staging host buffer is only needed when somebody reads the values back; a
+        // device-resident wave skips the download entirely and leaves the results in place.
+        MemorySegment host = downloads ? hostDoubles(count * waveSize) : null;
         for (int chunk = 0; chunk < waveSize; chunk++) {
             long cornerTable = this.results.address()
                     + (long) chunk * markerCount * perMarker * Double.BYTES;
             launchBlocks(settings, chunkXs[chunk], chunkZs[chunk], order, cornerTable,
                     markerCount, countY, blockInstructions);
-            this.context.copyFromDeviceAsync(this.blockResults,
-                    host.asSlice((long) chunk * count * Double.BYTES, (long) count * Double.BYTES),
-                    this.stream);
+            if (outs[chunk] != null) {
+                this.context.copyFromDeviceAsync(this.blockResults,
+                        host.asSlice((long) chunk * count * Double.BYTES, (long) count * Double.BYTES),
+                        this.stream);
+            }
         }
 
         this.waveOuts = outs;
@@ -553,6 +562,10 @@ public final class DensityEvaluatorGpu implements AutoCloseable {
     public void awaitWave() {
         this.context.synchronizeStream(this.stream);
         for (int chunk = 0; chunk < this.waveSize; chunk++) {
+            if (this.waveOuts[chunk] == null) {
+                // A device-resident wave: nothing was queued to read back.
+                continue;
+            }
             // The segment-to-array copy's offset is in bytes, not elements — the wave's slices
             // are count doubles apart, so the byte distance is what lands each chunk in its
             // own array. (Element offsets here were the wave's one real bug: chunk 1 read
@@ -561,6 +574,19 @@ public final class DensityEvaluatorGpu implements AutoCloseable {
                     (long) chunk * this.waveCount * Double.BYTES, this.waveOuts[chunk], 0,
                     this.waveCount);
         }
+    }
+
+    /**
+     * The device address of the block results the last submitted wave ended with — the density
+     * values as they sit on the device, in the same layout a downloaded array would have. Valid
+     * until the next submit on this evaluator, and only then: the device thread is serial, so
+     * the next submit is the next chunk, after whatever was reading this one has finished.
+     *
+     * <p>The decideGpu path reads it instead of downloading, which is what keeps the density
+     * from crossing the host line twice per chunk.
+     */
+    public long blockResultsAddress() {
+        return this.blockResults.address();
     }
 
     /** The image instruction each interpolated marker wraps, in the image's own marker order. */

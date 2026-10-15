@@ -245,19 +245,56 @@ public final class MaterialDeciderGpu implements AutoCloseable {
     }
 
     /**
-     * One chunk's decisions on the device: the grid kernel derives the cells' fluid statuses and
-     * the sampling cutoff, the decide kernel runs the per-block half on them.
-     *
-     * <p>The density must already carry the beard — the same value {@code applyRules} hands the
-     * CPU rules. All three kernels launch on the default stream in order — the column table,
-     * then the grid kernel, then the decide kernel — and the decide kernel reads the grid
-     * kernel's cutoff straight off the device, so nothing crosses back to the host until the
-     * decisions themselves do.
+     * One chunk's decisions from host-resident density: uploads and delegates to
+     * {@link #decideDevice}. The beard path uses this — its density was folded on the host.
      *
      * @return the per-block decision ids and the aquifer's fluid-tick flags
      */
     public Decisions decide(int chunkX, int chunkZ, double[] density, double[] veinToggle,
             double[] veinRidged) {
+        if (this.closed) {
+            throw new IllegalStateException("the decider is closed");
+        }
+        int chunkMinBlockX = chunkX * 16;
+        int chunkMinBlockZ = chunkZ * 16;
+
+        MemorySegment.copy(density, 0, this.hostDensity, ValueLayout.JAVA_DOUBLE, 0,
+                density.length);
+        this.context.copyToDevice(
+                this.hostDensity.asSlice(0L, (long) density.length * Double.BYTES), this.density);
+        if (this.oreVeinsEnabled) {
+            MemorySegment.copy(veinToggle, 0, this.hostVeinToggle, ValueLayout.JAVA_DOUBLE, 0,
+                    veinToggle.length);
+            this.context.copyToDevice(
+                    this.hostVeinToggle.asSlice(0L, (long) veinToggle.length * Double.BYTES),
+                    this.veinToggle);
+            MemorySegment.copy(veinRidged, 0, this.hostVeinRidged, ValueLayout.JAVA_DOUBLE, 0,
+                    veinRidged.length);
+            this.context.copyToDevice(
+                    this.hostVeinRidged.asSlice(0L, (long) veinRidged.length * Double.BYTES),
+                    this.veinRidged);
+        }
+        return decideDevice(chunkX, chunkZ, this.density.address(),
+                this.oreVeinsEnabled ? this.veinToggle.address() : 0L,
+                this.oreVeinsEnabled ? this.veinRidged.address() : 0L);
+    }
+
+    /**
+     * One chunk's decisions from device-resident inputs: the caller passes the addresses of
+     * buffers that already hold the density and the two vein arrays on the device — in practice
+     * the evaluators' block results — and guarantees they stay untouched until this call
+     * returns. The device thread is serial, so the next submit on those evaluators is the next
+     * chunk, after this call is done. Nothing crosses the host line in either direction until
+     * the decisions themselves do.
+     *
+     * <p>All three kernels queue on the default stream; the caller has already synchronised
+     * the producers' streams (the evaluator awaits), so the data is complete before the first
+     * launch.
+     *
+     * @return the per-block decision ids and the aquifer's fluid-tick flags
+     */
+    public Decisions decideDevice(int chunkX, int chunkZ, long densityAddress,
+            long veinToggleAddress, long veinRidgedAddress) {
         if (this.closed) {
             throw new IllegalStateException("the decider is closed");
         }
@@ -277,23 +314,6 @@ public final class MaterialDeciderGpu implements AutoCloseable {
         if (gridTotal > MAX_GRID_TOTAL) {
             throw new IllegalStateException("grid of " + gridTotal
                     + " cells exceeds the decider's " + MAX_GRID_TOTAL);
-        }
-
-        MemorySegment.copy(density, 0, this.hostDensity, ValueLayout.JAVA_DOUBLE, 0,
-                density.length);
-        this.context.copyToDevice(
-                this.hostDensity.asSlice(0L, (long) density.length * Double.BYTES), this.density);
-        if (this.oreVeinsEnabled) {
-            MemorySegment.copy(veinToggle, 0, this.hostVeinToggle, ValueLayout.JAVA_DOUBLE, 0,
-                    veinToggle.length);
-            this.context.copyToDevice(
-                    this.hostVeinToggle.asSlice(0L, (long) veinToggle.length * Double.BYTES),
-                    this.veinToggle);
-            MemorySegment.copy(veinRidged, 0, this.hostVeinRidged, ValueLayout.JAVA_DOUBLE, 0,
-                    veinRidged.length);
-            this.context.copyToDevice(
-                    this.hostVeinRidged.asSlice(0L, (long) veinRidged.length * Double.BYTES),
-                    this.veinRidged);
         }
 
         int firstQuartX = chunkMinBlockX >> 2;
@@ -359,9 +379,9 @@ public final class MaterialDeciderGpu implements AutoCloseable {
         }
 
         try (KernelArguments arguments = new KernelArguments(40)) {
-            arguments.addDevicePointer(this.density.address())
-                    .addDevicePointer(this.oreVeinsEnabled ? this.veinToggle.address() : 0L)
-                    .addDevicePointer(this.oreVeinsEnabled ? this.veinRidged.address() : 0L)
+            arguments.addDevicePointer(densityAddress)
+                    .addDevicePointer(veinToggleAddress)
+                    .addDevicePointer(veinRidgedAddress)
                     .addDevicePointer(this.cellLevels.address())
                     .addDevicePointer(this.cellTypes.address())
                     .addInt(minGridX).addInt(minGridY).addInt(minGridZ)

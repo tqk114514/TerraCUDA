@@ -412,11 +412,32 @@ public final class GpuChunkFiller implements AutoCloseable {
     public EmittedChunk emitAndDecide(int chunkX, int chunkZ, MaterialDeciderGpu decider,
             Beardifier beardifier) {
         long began = TIMING ? System.nanoTime() : 0L;
-        DensityBuffers buffers = emitDensities(chunkX, chunkZ);
+        MaterialDeciderGpu.Decisions decisions;
         try {
-            foldBeardInto(chunkX, chunkZ, buffers.density(), beardifier);
-            MaterialDeciderGpu.Decisions decisions = decider.decide(chunkX, chunkZ,
-                    buffers.density(), buffers.veinToggle(), buffers.veinRidged());
+            if (beardifier == null) {
+                // The device-resident fast path: no structures touch this chunk, so nothing has
+                // to fold the beard on the host and the density never crosses the host line.
+                // The evaluators leave the results on the device (null outs skip the download)
+                // and the decider reads them where they were born. The device thread is serial,
+                // so the buffers stay intact until the decide kernels are done.
+                emitDensitiesResident(chunkX, chunkZ);
+                decisions = decider.decideDevice(chunkX, chunkZ,
+                        this.densityEvaluator.blockResultsAddress(),
+                        this.oreVeinsEnabled ? this.veinToggleEvaluator.blockResultsAddress() : 0L,
+                        this.oreVeinsEnabled ? this.veinRidgedEvaluator.blockResultsAddress() : 0L);
+            } else {
+                // The beard path: the fold is per-block host arithmetic over the chunk's
+                // structure junctions, so the density comes home, is folded, and the decider
+                // uploads it again. Chunks near structures are the few; the fast path is the rest.
+                DensityBuffers buffers = emitDensities(chunkX, chunkZ);
+                try {
+                    foldBeardInto(chunkX, chunkZ, buffers.density(), beardifier);
+                    decisions = decider.decide(chunkX, chunkZ,
+                            buffers.density(), buffers.veinToggle(), buffers.veinRidged());
+                } finally {
+                    releaseBuffers(buffers);
+                }
+            }
 
             int height = this.geometry.height();
             int[] idTable = decisionIdTable();
@@ -438,8 +459,49 @@ public final class GpuChunkFiller implements AutoCloseable {
                 this.rulesNanos.add(System.nanoTime() - began);
                 this.emittedChunks.increment();
             }
-            releaseBuffers(buffers);
         }
+    }
+
+    /**
+     * Emits one chunk's densities without downloading: the three evaluators leave their results
+     * on the device and the caller reads them by address. The device-resident twin of
+     * {@link #emitDensities}, for chunks whose beard is empty.
+     */
+    public void emitDensitiesResident(int chunkX, int chunkZ) {
+        long began = TIMING ? System.nanoTime() : 0L;
+        this.densityEvaluator.submitChunk(this.geometry, chunkX, chunkZ,
+                CornerInterpolation.LERP3, null);
+        if (this.oreVeinsEnabled) {
+            this.veinToggleEvaluator.submitChunk(this.geometry, chunkX, chunkZ,
+                    CornerInterpolation.INCREMENTAL, null);
+            this.veinRidgedEvaluator.submitChunk(this.geometry, chunkX, chunkZ,
+                    CornerInterpolation.INCREMENTAL, null);
+        }
+        long densityAt = TIMING ? System.nanoTime() : 0L;
+        this.densityEvaluator.awaitChunk();
+        if (this.oreVeinsEnabled) {
+            this.veinToggleEvaluator.awaitChunk();
+            this.veinRidgedEvaluator.awaitChunk();
+        }
+        if (TIMING) {
+            this.densityNanos += densityAt - began;
+            this.veinNanos += System.nanoTime() - densityAt;
+        }
+    }
+
+    /** The density the last {@link #emitDensitiesResident} left on the device. */
+    public long densityResultsAddress() {
+        return this.densityEvaluator.blockResultsAddress();
+    }
+
+    /** The vein-toggle array the last {@link #emitDensitiesResident} left on the device. */
+    public long veinToggleResultsAddress() {
+        return this.veinToggleEvaluator.blockResultsAddress();
+    }
+
+    /** The vein-ridged array the last {@link #emitDensitiesResident} left on the device. */
+    public long veinRidgedResultsAddress() {
+        return this.veinRidgedEvaluator.blockResultsAddress();
     }
 
     /** The ten decision ids resolved to registry ids once per filler. */

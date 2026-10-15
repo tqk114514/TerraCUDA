@@ -195,6 +195,81 @@ class MaterialDeciderGpuTest {
     }
 
     /**
+     * The device-resident fast path: the decider reading the evaluators' block results where
+     * they sit must answer identically to the host-upload path over the same data. This is the
+     * wiring emitAndDecide uses for every chunk without structures.
+     */
+    @Test
+    void theDeviceResidentDeciderMatchesTheHostPathBlockForBlock() {
+        CudaEnvironment environment = CudaEnvironment.detect();
+        assumeTrue(environment.available(), "no CUDA device on this machine");
+        Optional<CudaDriver> loaded = CudaDriver.tryLoad();
+        assumeTrue(loaded.isPresent(), "no CUDA driver library on this machine");
+
+        try (CudaDriver driver = loaded.get()) {
+            driver.init();
+            CudaDeviceInfo device = environment.firstDevice().orElseThrow();
+            try (CudaContext context = CudaContext.create(driver, device.index())) {
+                CudaKernels.loadModule(context, device);
+                RandomState randomState = OverworldFixture.randomState();
+                var settings = OverworldFixture.generatorSettings();
+                GpuChunkFiller filler = GpuChunkFiller.create(context, randomState, settings);
+                GpuChunkFiller.RulesContext rulesContext = filler.createRulesContext();
+
+                var oreRandom = VanillaRandomExport.export(randomState.oreRandom());
+                var aquiferRandom = VanillaRandomExport.export(randomState.aquiferRandom());
+                try (MaterialDeciderGpu decider = new MaterialDeciderGpu(context,
+                        OverworldFixture.noiseSettings(), settings.seaLevel(),
+                        oreRandom.seedLo(), oreRandom.seedHi(),
+                        aquiferRandom.seedLo(), aquiferRandom.seedHi(),
+                        settings.isAquifersEnabled(), settings.oreVeinsEnabled(),
+                        rulesContext)) {
+
+                    for (int[] chunk : CHUNKS) {
+                        int chunkX = chunk[0];
+                        int chunkZ = chunk[1];
+
+                        // Reference: the host path -- download, upload back, decide.
+                        GpuChunkFiller.DensityBuffers buffers = filler.emitDensities(chunkX, chunkZ);
+                        MaterialDeciderGpu.Decisions expected = decider.decide(chunkX, chunkZ,
+                                buffers.density(), buffers.veinToggle(), buffers.veinRidged());
+                        filler.releaseBuffers(buffers);
+
+                        // Actual: the same computation, device-resident -- no downloads, the
+                        // decider reads the evaluators' block results where they sit.
+                        filler.emitDensitiesResident(chunkX, chunkZ);
+                        MaterialDeciderGpu.Decisions actual = decider.decideDevice(chunkX, chunkZ,
+                                filler.densityResultsAddress(),
+                                settings.oreVeinsEnabled() ? filler.veinToggleResultsAddress() : 0L,
+                                settings.oreVeinsEnabled() ? filler.veinRidgedResultsAddress() : 0L);
+
+                        int mismatches = 0;
+                        String[] first = new String[1];
+                        for (int blockIndex = 0; blockIndex < actual.states().length; blockIndex++) {
+                            if (expected.states()[blockIndex] != actual.states()[blockIndex]
+                                    || expected.fluidTicks()[blockIndex]
+                                            != actual.fluidTicks()[blockIndex]) {
+                                if (first[0] == null) {
+                                    first[0] = "block " + blockIndex + ": host ("
+                                            + expected.states()[blockIndex] + ", "
+                                            + expected.fluidTicks()[blockIndex] + "), device ("
+                                            + actual.states()[blockIndex] + ", "
+                                            + actual.fluidTicks()[blockIndex] + ")";
+                                }
+                                mismatches++;
+                            }
+                        }
+                        int total = mismatches;
+                        assertEquals(0, total, () -> total + " of "
+                                + actual.states().length + " blocks differ in chunk (" + chunkX
+                                + ", " + chunkZ + "); first: " + first[0]);
+                    }
+                }
+            }
+        }
+    }
+
+    /**
      * G2c's acceptance: the takeover pipeline's device path — emit, fold, decide, map — must
      * produce the same EmittedChunk as the full CPU path, chunk for chunk. This is the
      * production shape the benchmark will run: emitAndDecide through the filler.

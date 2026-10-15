@@ -531,10 +531,29 @@ public final class GpuWorldgenService implements AutoCloseable {
             done.completeExceptionally(new IllegalStateException(unavailableReason));
             return done;
         }
-        if (!this.fillJobs.offer(new FillJob(chunk, beardifier, done))) {
-            // The device is behind. Blocking here would stall the dispatcher, and falling back to
-            // vanilla is both correct and parallel, so the caller gets to choose.
-            done.completeExceptionally(new IllegalStateException("the GPU queue is full"));
+        // Backpressure, not bypass: when the queue is full the device is merely behind, and
+        // falling back to vanilla here would hand the chunk's noise back to the CPU -- the
+        // exact work the device exists to take -- on the caller's thread. Waiting lets the
+        // pipeline self-throttle to the device rate; the caller's thread parks on the bounded
+        // offer and the fork-join pool compensates around it. The escape stays with the
+        // genuinely broken: a closed service, or a device thread that died mid-run (checked by
+        // liveness, because a crashed thread clears neither flag). No cycle exists -- the
+        // device thread only depends on the replay workers, never on this caller's pool.
+        FillJob job = new FillJob(chunk, beardifier, done);
+        while (true) {
+            try {
+                if (this.fillJobs.offer(job, 50, TimeUnit.MILLISECONDS)) {
+                    break;
+                }
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+                done.completeExceptionally(new IllegalStateException("interrupted while queueing"));
+                break;
+            }
+            if (!isReady() || !this.thread.isAlive()) {
+                done.completeExceptionally(new IllegalStateException(unavailableReason()));
+                break;
+            }
         }
         return done;
     }

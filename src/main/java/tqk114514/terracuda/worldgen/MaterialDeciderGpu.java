@@ -295,11 +295,8 @@ public final class MaterialDeciderGpu implements AutoCloseable {
      *
      * @return the per-block decision ids and the aquifer's fluid-tick flags
      */
-    public Decisions decideDevice(int chunkX, int chunkZ, long densityAddress,
-            long veinToggleAddress, long veinRidgedAddress) {
-        if (this.closed) {
-            throw new IllegalStateException("the decider is closed");
-        }
+    /** One chunk's grid geometry and the derived table bounds, for the launch helpers. */
+    private int[] gridBounds(int chunkX, int chunkZ) {
         int chunkMinBlockX = chunkX * 16;
         int chunkMinBlockZ = chunkZ * 16;
         int minGridX = (chunkMinBlockX + SAMPLE_OFFSET_XZ) >> GRID_SPACING_XZ_SHIFT;
@@ -317,14 +314,8 @@ public final class MaterialDeciderGpu implements AutoCloseable {
             throw new IllegalStateException("grid of " + gridTotal
                     + " cells exceeds the decider's " + MAX_GRID_TOTAL);
         }
-
         int firstQuartX = chunkMinBlockX >> 2;
         int firstQuartZ = chunkMinBlockZ >> 2;
-
-        // The K0 column table's bounds: the union of every quart column the grid kernel's
-        // 13-offset loop and cutoff walk can ask for, derived once here so the kernel's lookups
-        // never miss. The kernel evaluates each column exactly once instead of the per-cell
-        // 13-offset re-evaluation the previous shape paid ~5000 times a chunk.
         int tableBaseX = ((minGridX << 4) - 48) >> 2;
         int tableSizeX = ((((maxGridX << 4) + 25) >> 2) - tableBaseX) + 1;
         int tableBaseZ = ((minGridZ << 4) - 16) >> 2;
@@ -334,26 +325,33 @@ public final class MaterialDeciderGpu implements AutoCloseable {
             throw new IllegalStateException("k0 table " + tableSizeX + "x" + tableSizeZ
                     + " exceeds the decider's " + MAX_TABLE_X + "x" + MAX_TABLE_Z);
         }
+        return new int[] {chunkMinBlockX, chunkMinBlockZ, minGridX, minGridY, minGridZ,
+                gridSizeX, gridSizeY, gridSizeZ, gridTotal, firstQuartX, firstQuartZ,
+                tableBaseX, tableSizeX, tableBaseZ, tableSizeZ, tableTotal};
+    }
 
+    private void launchTable(int[] bounds) {
         try (KernelArguments table = new KernelArguments(10)) {
             table.addDevicePointer(this.k0Blob.address())
                     .addDevicePointer(this.k0Offsets.address())
                     .addInt(this.k0Count).addInt(this.k0Root)
-                    .addInt(tableBaseX).addInt(tableBaseZ).addInt(tableSizeX).addInt(tableTotal)
+                    .addInt(bounds[11]).addInt(bounds[13]).addInt(bounds[12]).addInt(bounds[15])
                     .addDevicePointer(this.k0Table.address())
                     .addDevicePointer(this.k0TableScratch.address());
-            int tableBlocks = (tableTotal + BLOCK_SIZE - 1) / BLOCK_SIZE;
+            int tableBlocks = (bounds[15] + BLOCK_SIZE - 1) / BLOCK_SIZE;
             this.context.launch(K0_TABLE_KERNEL_NAME, tableBlocks, 1, 1, BLOCK_SIZE, 1, 1, table);
         }
+    }
 
+    private void launchGrid(int[] bounds) {
         try (KernelArguments grid = new KernelArguments(47)) {
-            grid.addInt(minGridX).addInt(minGridY).addInt(minGridZ)
-                    .addInt(gridSizeX).addInt(gridSizeY).addInt(gridSizeZ)
+            grid.addInt(bounds[2]).addInt(bounds[3]).addInt(bounds[4])
+                    .addInt(bounds[5]).addInt(bounds[6]).addInt(bounds[7])
                     .addInt(this.seaLevel)
                     .addLong(this.aquiferSeedLo).addLong(this.aquiferSeedHi)
-                    .addInt(firstQuartX).addInt(firstQuartZ)
+                    .addInt(bounds[9]).addInt(bounds[10])
                     .addDevicePointer(this.k0Table.address())
-                    .addInt(tableBaseX).addInt(tableBaseZ).addInt(tableSizeX)
+                    .addInt(bounds[11]).addInt(bounds[13]).addInt(bounds[12])
                     .addDevicePointer(this.floodednessBlob.address())
                     .addDevicePointer(this.floodednessOffsets.address())
                     .addInt(this.floodednessCount).addInt(this.floodednessRoot)
@@ -376,11 +374,14 @@ public final class MaterialDeciderGpu implements AutoCloseable {
                     .addDevicePointer(this.cellTypes.address())
                     .addDevicePointer(this.gridSkip.address())
                     .addDevicePointer(this.cellLocations.address())
-                    .addInt(gridTotal);
-            int gridBlocks = (gridTotal + BLOCK_SIZE - 1) / BLOCK_SIZE;
+                    .addInt(bounds[8]);
+            int gridBlocks = (bounds[8] + BLOCK_SIZE - 1) / BLOCK_SIZE;
             this.context.launch(GRID_KERNEL_NAME, gridBlocks, 1, 1, BLOCK_SIZE, 1, 1, grid);
         }
+    }
 
+    private void launchDecide(int[] bounds, long densityAddress, long veinToggleAddress,
+            long veinRidgedAddress) {
         try (KernelArguments arguments = new KernelArguments(39)) {
             arguments.addDevicePointer(densityAddress)
                     .addDevicePointer(veinToggleAddress)
@@ -388,8 +389,8 @@ public final class MaterialDeciderGpu implements AutoCloseable {
                     .addDevicePointer(this.cellLevels.address())
                     .addDevicePointer(this.cellTypes.address())
                     .addDevicePointer(this.cellLocations.address())
-                    .addInt(minGridX).addInt(minGridY).addInt(minGridZ)
-                    .addInt(gridSizeX).addInt(gridSizeY).addInt(gridSizeZ)
+                    .addInt(bounds[2]).addInt(bounds[3]).addInt(bounds[4])
+                    .addInt(bounds[5]).addInt(bounds[6]).addInt(bounds[7])
                     .addDevicePointer(this.gridSkip.address())
                     .addInt(this.seaLevel)
                     .addDevicePointer(this.barrierBlob.address())
@@ -401,12 +402,12 @@ public final class MaterialDeciderGpu implements AutoCloseable {
                     .addInt(this.veinGapCount).addInt(this.veinGapRoot)
                     .addInt(this.veinGapWrapped)
                     .addLong(this.oreSeedLo).addLong(this.oreSeedHi)
-                    .addInt(firstQuartX).addInt(firstQuartZ)
+                    .addInt(bounds[9]).addInt(bounds[10])
                     .addDevicePointer(this.scratch.address())
                     .addInt(this.programScratch)
                     .addDevicePointer(this.decisions.address())
                     .addDevicePointer(this.fluidFlags.address())
-                    .addInt(chunkMinBlockX).addInt(this.geometry.minY()).addInt(chunkMinBlockZ)
+                    .addInt(bounds[0]).addInt(this.geometry.minY()).addInt(bounds[1])
                     .addInt(this.geometry.height())
                     .addInt(this.aquifersEnabled ? 1 : 0)
                     .addInt(this.oreVeinsEnabled ? 1 : 0)
@@ -414,6 +415,44 @@ public final class MaterialDeciderGpu implements AutoCloseable {
             int grid = (this.count + BLOCK_SIZE - 1) / BLOCK_SIZE;
             this.context.launch(KERNEL_NAME, grid, 1, 1, BLOCK_SIZE, 1, 1, arguments);
         }
+    }
+
+    /**
+     * The resident pipeline's per-kernel walls for one chunk, for diagnostics: the table, grid
+     * and decide kernels each launched and synchronised separately, returning their walls in
+     * nanoseconds. The decider's own buffers must already hold the density (a decide call
+     * uploads them); the probe runs with the GPU otherwise idle, so each wall is the kernel's
+     * device time plus its launch overhead.
+     */
+    long[] debugKernelWalls(int chunkX, int chunkZ) {
+        int[] bounds = gridBounds(chunkX, chunkZ);
+        long[] walls = new long[3];
+        long began = System.nanoTime();
+        launchTable(bounds);
+        this.context.synchronize();
+        walls[0] = System.nanoTime() - began;
+        began = System.nanoTime();
+        launchGrid(bounds);
+        this.context.synchronize();
+        walls[1] = System.nanoTime() - began;
+        began = System.nanoTime();
+        launchDecide(bounds, this.density.address(),
+                this.oreVeinsEnabled ? this.veinToggle.address() : 0L,
+                this.oreVeinsEnabled ? this.veinRidged.address() : 0L);
+        this.context.synchronize();
+        walls[2] = System.nanoTime() - began;
+        return walls;
+    }
+
+    public Decisions decideDevice(int chunkX, int chunkZ, long densityAddress,
+            long veinToggleAddress, long veinRidgedAddress) {
+        if (this.closed) {
+            throw new IllegalStateException("the decider is closed");
+        }
+        int[] bounds = gridBounds(chunkX, chunkZ);
+        launchTable(bounds);
+        launchGrid(bounds);
+        launchDecide(bounds, densityAddress, veinToggleAddress, veinRidgedAddress);
         this.context.synchronize();
 
         this.context.copyFromDevice(this.decisions,

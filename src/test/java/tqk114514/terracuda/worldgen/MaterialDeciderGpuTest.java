@@ -270,6 +270,72 @@ class MaterialDeciderGpuTest {
     }
 
     /**
+     * Diagnostic: the resident pipeline's per-kernel walls on a real chunk, printed so the
+     * kernel-side attribution rests on measurement. The decider's buffers are populated by a
+     * reference decide() first; the probe then times table, grid and decide separately, plus
+     * the evaluator group, across several iterations.
+     */
+    @Test
+    void theKernelWallsAreMeasured() {
+        CudaEnvironment environment = CudaEnvironment.detect();
+        assumeTrue(environment.available(), "no CUDA device on this machine");
+        Optional<CudaDriver> loaded = CudaDriver.tryLoad();
+        assumeTrue(loaded.isPresent(), "no CUDA driver library on this machine");
+
+        try (CudaDriver driver = loaded.get()) {
+            driver.init();
+            CudaDeviceInfo device = environment.firstDevice().orElseThrow();
+            try (CudaContext context = CudaContext.create(driver, device.index())) {
+                CudaKernels.loadModule(context, device);
+                RandomState randomState = OverworldFixture.randomState();
+                var settings = OverworldFixture.generatorSettings();
+                GpuChunkFiller filler = GpuChunkFiller.create(context, randomState, settings);
+                GpuChunkFiller.RulesContext rulesContext = filler.createRulesContext();
+                var oreRandom = VanillaRandomExport.export(randomState.oreRandom());
+                var aquiferRandom = VanillaRandomExport.export(randomState.aquiferRandom());
+                try (MaterialDeciderGpu decider = new MaterialDeciderGpu(context,
+                        OverworldFixture.noiseSettings(), settings.seaLevel(),
+                        oreRandom.seedLo(), oreRandom.seedHi(),
+                        aquiferRandom.seedLo(), aquiferRandom.seedHi(),
+                        settings.isAquifersEnabled(), settings.oreVeinsEnabled(),
+                        rulesContext)) {
+
+                    int chunkX = 1;
+                    int chunkZ = -1;
+
+                    // Warmup and buffer population: a reference decide uploads the density.
+                    for (int i = 0; i < 3; i++) {
+                        GpuChunkFiller.DensityBuffers buffers = filler.emitDensities(chunkX, chunkZ);
+                        decider.decide(chunkX, chunkZ, buffers.density(),
+                                buffers.veinToggle(), buffers.veinRidged());
+                        filler.releaseBuffers(buffers);
+                    }
+
+                    long evaluator = 0L;
+                    long table = 0L;
+                    long grid = 0L;
+                    long decide = 0L;
+                    int rounds = 8;
+                    for (int i = 0; i < rounds; i++) {
+                        long began = System.nanoTime();
+                        filler.emitDensitiesResident(chunkX, chunkZ);
+                        evaluator += System.nanoTime() - began;
+
+                        long[] walls = decider.debugKernelWalls(chunkX, chunkZ);
+                        table += walls[0];
+                        grid += walls[1];
+                        decide += walls[2];
+                    }
+                    System.out.printf("WALLS-DBG evaluator=%.3fms k0table=%.3fms grid=%.3fms"
+                                    + " decide=%.3fms (avg of %d, resident form)%n",
+                            evaluator / rounds / 1e6, table / rounds / 1e6,
+                            grid / rounds / 1e6, decide / rounds / 1e6, rounds);
+                }
+            }
+        }
+    }
+
+    /**
      * G2c's acceptance: the takeover pipeline's device path — emit, fold, decide, map — must
      * produce the same EmittedChunk as the full CPU path, chunk for chunk. This is the
      * production shape the benchmark will run: emitAndDecide through the filler.

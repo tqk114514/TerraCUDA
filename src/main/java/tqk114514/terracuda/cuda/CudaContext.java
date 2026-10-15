@@ -112,7 +112,12 @@ public final class CudaContext implements AutoCloseable {
                 "cuMemHostUnregister_v2", "cuMemHostUnregister");
 
         MemorySegment handle = this.arena.allocate(ValueLayout.ADDRESS);
-        int result = invokeInt(this.cuCtxCreate, handle, 0, device);
+        // Blocking sync, not the flags=0 default: with one context on a many-core host CUDA's
+        // AUTO heuristic spins, and the device thread's synchronize calls burned ~2ms of CPU per
+        // chunk waiting for kernels -- visible in the thread profiles as the device thread's own
+        // busy share, and doubled down under CPU starvation. A dedicated waiter loses nothing to
+        // the wake latency and gives the core back to the generation pipeline.
+        int result = invokeInt(this.cuCtxCreate, handle, 0x04 /* CU_CTX_SCHED_BLOCKING_SYNC */, device);
         this.driver.check(result, "cuCtxCreate");
         this.contextHandle = handle.get(ValueLayout.ADDRESS, 0);
     }

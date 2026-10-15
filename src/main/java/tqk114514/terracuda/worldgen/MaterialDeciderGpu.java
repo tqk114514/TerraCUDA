@@ -296,7 +296,7 @@ public final class MaterialDeciderGpu implements AutoCloseable {
      * @return the per-block decision ids and the aquifer's fluid-tick flags
      */
     /** One chunk's grid geometry and the derived table bounds, for the launch helpers. */
-    private int[] gridBounds(int chunkX, int chunkZ) {
+    int[] gridBounds(int chunkX, int chunkZ) {
         int chunkMinBlockX = chunkX * 16;
         int chunkMinBlockZ = chunkZ * 16;
         int minGridX = (chunkMinBlockX + SAMPLE_OFFSET_XZ) >> GRID_SPACING_XZ_SHIFT;
@@ -330,7 +330,7 @@ public final class MaterialDeciderGpu implements AutoCloseable {
                 tableBaseX, tableSizeX, tableBaseZ, tableSizeZ, tableTotal};
     }
 
-    private void launchTable(int[] bounds) {
+    void launchTable(int[] bounds) {
         try (KernelArguments table = new KernelArguments(10)) {
             table.addDevicePointer(this.k0Blob.address())
                     .addDevicePointer(this.k0Offsets.address())

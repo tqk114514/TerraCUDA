@@ -354,6 +354,68 @@ class MaterialDeciderGpuTest {
     }
 
     /**
+     * Diagnostic: the k0 table kernel's wall as the column count sweeps. A flat curve means
+     * the wall is one chain's latency (pathological per-instruction cost); a linear curve
+     * means contention. The real table for the fixture chunk is the last point.
+     */
+    @Test
+    void theK0TableWallSweepsColumnCount() {
+        CudaEnvironment environment = CudaEnvironment.detect();
+        assumeTrue(environment.available(), "no CUDA device on this machine");
+        Optional<CudaDriver> loaded = CudaDriver.tryLoad();
+        assumeTrue(loaded.isPresent(), "no CUDA driver library on this machine");
+
+        try (CudaDriver driver = loaded.get()) {
+            driver.init();
+            CudaDeviceInfo device = environment.firstDevice().orElseThrow();
+            try (CudaContext context = CudaContext.create(driver, device.index())) {
+                CudaKernels.loadModule(context, device);
+                RandomState randomState = OverworldFixture.randomState();
+                var settings = OverworldFixture.generatorSettings();
+                GpuChunkFiller filler = GpuChunkFiller.create(context, randomState, settings);
+                GpuChunkFiller.RulesContext rulesContext = filler.createRulesContext();
+                var oreRandom = VanillaRandomExport.export(randomState.oreRandom());
+                var aquiferRandom = VanillaRandomExport.export(randomState.aquiferRandom());
+                try (MaterialDeciderGpu decider = new MaterialDeciderGpu(context,
+                        OverworldFixture.noiseSettings(), settings.seaLevel(),
+                        oreRandom.seedLo(), oreRandom.seedHi(),
+                        aquiferRandom.seedLo(), aquiferRandom.seedHi(),
+                        settings.isAquifersEnabled(), settings.oreVeinsEnabled(),
+                        rulesContext)) {
+
+                    int chunkX = 1;
+                    int chunkZ = -1;
+                    int[] real = decider.gridBounds(chunkX, chunkZ);
+                    int[] counts = {1, 4, 16, 64, 256, real[15]};
+                    StringBuilder line = new StringBuilder("K0SWEEP-DBG");
+                    for (int wanted : counts) {
+                        int[] bounds = real.clone();
+                        bounds[12] = Math.min(wanted, real[12]);
+                        bounds[14] = Math.min(wanted, real[14]);
+                        bounds[15] = Math.min(wanted, real[15]);
+
+                        // warmup
+                        decider.launchTable(bounds);
+                        context.synchronize();
+
+                        long total = 0L;
+                        int rounds = 12;
+                        for (int i = 0; i < rounds; i++) {
+                            long began = System.nanoTime();
+                            decider.launchTable(bounds);
+                            context.synchronize();
+                            total += System.nanoTime() - began;
+                        }
+                        line.append(String.format(" %dc=%.3fms", bounds[15],
+                                total / (double) rounds / 1e6));
+                    }
+                    System.out.println(line);
+                }
+            }
+        }
+    }
+
+    /**
      * G2c's acceptance: the takeover pipeline's device path — emit, fold, decide, map — must
      * produce the same EmittedChunk as the full CPU path, chunk for chunk. This is the
      * production shape the benchmark will run: emitAndDecide through the filler.

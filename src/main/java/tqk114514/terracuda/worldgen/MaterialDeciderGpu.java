@@ -116,6 +116,7 @@ public final class MaterialDeciderGpu implements AutoCloseable {
     private final CudaContext.DeviceBuffer decisions;
     private final CudaContext.DeviceBuffer fluidFlags;
     private final CudaContext.DeviceBuffer gridSkip;
+    private final CudaContext.DeviceBuffer cellLocations;
     private final CudaContext.DeviceBuffer k0Table;
     private final CudaContext.DeviceBuffer k0TableScratch;
 
@@ -215,6 +216,7 @@ public final class MaterialDeciderGpu implements AutoCloseable {
         this.decisions = context.allocate((long) this.count * 4L);
         this.fluidFlags = context.allocate((long) this.count * 4L);
         this.gridSkip = context.allocate(256L);
+        this.cellLocations = context.allocate((long) MAX_GRID_TOTAL * 3 * 4L);
         this.k0Table = context.allocate((long) MAX_TABLE_X * MAX_TABLE_Z * Double.BYTES);
         this.k0TableScratch = context.allocate(
                 (long) MAX_TABLE_X * MAX_TABLE_Z * this.k0Count * Double.BYTES);
@@ -344,7 +346,7 @@ public final class MaterialDeciderGpu implements AutoCloseable {
             this.context.launch(K0_TABLE_KERNEL_NAME, tableBlocks, 1, 1, BLOCK_SIZE, 1, 1, table);
         }
 
-        try (KernelArguments grid = new KernelArguments(46)) {
+        try (KernelArguments grid = new KernelArguments(47)) {
             grid.addInt(minGridX).addInt(minGridY).addInt(minGridZ)
                     .addInt(gridSizeX).addInt(gridSizeY).addInt(gridSizeZ)
                     .addInt(this.seaLevel)
@@ -373,17 +375,19 @@ public final class MaterialDeciderGpu implements AutoCloseable {
                     .addDevicePointer(this.cellLevels.address())
                     .addDevicePointer(this.cellTypes.address())
                     .addDevicePointer(this.gridSkip.address())
+                    .addDevicePointer(this.cellLocations.address())
                     .addInt(gridTotal);
             int gridBlocks = (gridTotal + BLOCK_SIZE - 1) / BLOCK_SIZE;
             this.context.launch(GRID_KERNEL_NAME, gridBlocks, 1, 1, BLOCK_SIZE, 1, 1, grid);
         }
 
-        try (KernelArguments arguments = new KernelArguments(40)) {
+        try (KernelArguments arguments = new KernelArguments(39)) {
             arguments.addDevicePointer(densityAddress)
                     .addDevicePointer(veinToggleAddress)
                     .addDevicePointer(veinRidgedAddress)
                     .addDevicePointer(this.cellLevels.address())
                     .addDevicePointer(this.cellTypes.address())
+                    .addDevicePointer(this.cellLocations.address())
                     .addInt(minGridX).addInt(minGridY).addInt(minGridZ)
                     .addInt(gridSizeX).addInt(gridSizeY).addInt(gridSizeZ)
                     .addDevicePointer(this.gridSkip.address())
@@ -397,7 +401,6 @@ public final class MaterialDeciderGpu implements AutoCloseable {
                     .addInt(this.veinGapCount).addInt(this.veinGapRoot)
                     .addInt(this.veinGapWrapped)
                     .addLong(this.oreSeedLo).addLong(this.oreSeedHi)
-                    .addLong(this.aquiferSeedLo).addLong(this.aquiferSeedHi)
                     .addInt(firstQuartX).addInt(firstQuartZ)
                     .addDevicePointer(this.scratch.address())
                     .addInt(this.programScratch)
@@ -459,7 +462,7 @@ public final class MaterialDeciderGpu implements AutoCloseable {
             int tableBlocks = (tableTotal + BLOCK_SIZE - 1) / BLOCK_SIZE;
             this.context.launch(K0_TABLE_KERNEL_NAME, tableBlocks, 1, 1, BLOCK_SIZE, 1, 1, table);
         }
-        try (KernelArguments grid = new KernelArguments(46)) {
+        try (KernelArguments grid = new KernelArguments(47)) {
             grid.addInt(minGridX).addInt(minGridY).addInt(minGridZ)
                     .addInt(gridSizeX).addInt(gridSizeY).addInt(gridSizeZ)
                     .addInt(this.seaLevel)
@@ -488,6 +491,7 @@ public final class MaterialDeciderGpu implements AutoCloseable {
                     .addDevicePointer(this.cellLevels.address())
                     .addDevicePointer(this.cellTypes.address())
                     .addDevicePointer(this.gridSkip.address())
+                    .addDevicePointer(this.cellLocations.address())
                     .addInt(gridTotal);
             int gridBlocks = (gridTotal + BLOCK_SIZE - 1) / BLOCK_SIZE;
             this.context.launch(GRID_KERNEL_NAME, gridBlocks, 1, 1, BLOCK_SIZE, 1, 1, grid);
@@ -587,7 +591,8 @@ public final class MaterialDeciderGpu implements AutoCloseable {
         for (CudaContext.DeviceBuffer buffer : new CudaContext.DeviceBuffer[] {
                 this.density, this.veinToggle, this.veinRidged, this.cellLevels, this.cellTypes,
                 this.scratch, this.gridScratchBuffer, this.decisions, this.fluidFlags,
-                this.gridSkip, this.k0Table, this.k0TableScratch, this.barrierBlob, this.barrierOffsets, this.veinGapBlob,
+                this.gridSkip, this.cellLocations, this.k0Table, this.k0TableScratch,
+                this.barrierBlob, this.barrierOffsets, this.veinGapBlob,
                 this.veinGapOffsets, this.k0Blob, this.k0Offsets, this.floodednessBlob,
                 this.floodednessOffsets, this.spreadBlob, this.spreadOffsets, this.lavaBlob,
                 this.lavaOffsets, this.erosionBlob, this.erosionOffsets, this.depthBlob,

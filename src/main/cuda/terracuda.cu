@@ -1024,6 +1024,7 @@ extern "C" __global__ void terracuda_material_decide(
         const double* __restrict__ veinRidged,  // count, or null with veins off
         const int* __restrict__ cellLevels,     // gridTotal
         const int* __restrict__ cellTypes,      // gridTotal, TC_DECIDE_WATER or TC_DECIDE_LAVA
+        const int* __restrict__ cellLocations,  // gridTotal * 3, the grid kernel's anchors
         int minGridX, int minGridY, int minGridZ,
         int gridSizeX, int gridSizeY, int gridSizeZ,
         const int* __restrict__ skipBuffer,     // the grid kernel's cutoff, read where written
@@ -1033,7 +1034,6 @@ extern "C" __global__ void terracuda_material_decide(
         const char* __restrict__ veinGapBlob, const long long* __restrict__ veinGapOffsets,
         int veinGapCount, int veinGapRoot, int veinGapWrapped,
         long long oreSeedLo, long long oreSeedHi,
-        long long aquiferSeedLo, long long aquiferSeedHi,
         int firstQuartX, int firstQuartZ,
         double* __restrict__ scratch,          // count * programScratch doubles
         int programScratch,
@@ -1098,24 +1098,16 @@ extern "C" __global__ void terracuda_material_decide(
                         int cellZ = spacedGridZ - minGridZ;
                         int idx = (cellY * gridSizeZ + cellZ) * gridSizeX + cellX;
 
-                        // The cell's location is a pure function of its grid
-                        // position, so it is recomputed where it is read instead of uploaded:
-                        // the aquifer's positional source, three bounded draws, the pack.
-                        TcXoroshiro cellRandom = tcXoroshiro(
-                                tcGetSeed(spacedGridX, spacedGridY, spacedGridZ) ^ aquiferSeedLo,
-                                aquiferSeedHi);
-                        int cellOffsetX = tcXoroshiroNextInt(&cellRandom, 10);
-                        int cellOffsetY = tcXoroshiroNextInt(&cellRandom, 9);
-                        int cellOffsetZ = tcXoroshiroNextInt(&cellRandom, 10);
-                        int cellBlockX = (spacedGridX << 4) + cellOffsetX;
-                        int cellBlockY = spacedGridY * 12 + cellOffsetY;
-                        int cellBlockZ = (spacedGridZ << 4) + cellOffsetZ;
-                        long long location = (((long long) cellBlockX & 0x3FFFFFFLL) << 38)
-                                | (((long long) cellBlockZ & 0x3FFFFFFLL) << 12)
-                                | ((long long) cellBlockY & 0xFFFLL);
-                        int dx = tcUnpackX(location) - posX;
-                        int dy = tcUnpackY(location) - posY;
-                        int dz = tcUnpackZ(location) - posZ;
+                        // The cell's location, read from the table the grid kernel wrote --
+                        // the same positional chain it ran, hoisted out of the per-block loop.
+                        // Recomputing it here cost a seed derivation and three Xoroshiro draws
+                        // per neighbour per block.
+                        int cellBlockX = cellLocations[idx * 3];
+                        int cellBlockY = cellLocations[idx * 3 + 1];
+                        int cellBlockZ = cellLocations[idx * 3 + 2];
+                        int dx = cellBlockX - posX;
+                        int dy = cellBlockY - posY;
+                        int dz = cellBlockZ - posZ;
                         int newDistance = dx * dx + dy * dy + dz * dz;
                         // The >= chain is verbatim: on a tie the later cell takes the earlier
                         // slot, and that ordering is terrain.
@@ -1378,6 +1370,7 @@ extern "C" __global__ void terracuda_material_grid(
         int* __restrict__ cellLevels,          // gridTotal
         int* __restrict__ cellTypes,           // gridTotal, TC_DECIDE_WATER or TC_DECIDE_LAVA
         int* __restrict__ skipOut,              // one int, written by thread 0
+        int* __restrict__ cellLocations,        // gridTotal * 3, each cell's anchor position
         int gridTotal) {
     int index = blockIdx.x * blockDim.x + threadIdx.x;
     if (index >= gridTotal) {
@@ -1398,6 +1391,12 @@ extern "C" __global__ void terracuda_material_grid(
     int cellBlockX = (gridX << 4) + tcXoroshiroNextInt(&cellRandom, 10);
     int cellBlockY = gridY * 12 + tcXoroshiroNextInt(&cellRandom, 9);
     int cellBlockZ = (gridZ << 4) + tcXoroshiroNextInt(&cellRandom, 10);
+    // Published for the decide kernel's neighbour search: it used to re-run this exact
+    // chain twelve times per block, twelve seeds and thirty-six draws where one table
+    // read now stands.
+    cellLocations[index * 3] = cellBlockX;
+    cellLocations[index * 3 + 1] = cellBlockY;
+    cellLocations[index * 3 + 2] = cellBlockZ;
 
     // The global picker's status at the cell: below both levels it is lava, otherwise the sea.
     bool lavaPick = cellBlockY < min(-54, seaLevel);

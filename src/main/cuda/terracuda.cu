@@ -1531,3 +1531,12 @@ extern "C" __global__ void terracuda_material_grid(
         skipOut[0] = skipGridY * 12 + 11 - 1;
     }
 }
+
+extern "C" __global__ void terracuda_noop(int* __restrict__ sink, int value) {
+    // One store so the launch is not dead code, nothing to compute. This kernel exists
+    // for diagnostics: the launch-plus-synchronise floor on WDDM, which every
+    // launch-and-sync wall measurement has to subtract.
+    if (threadIdx.x == 0 && blockIdx.x == 0) {
+        sink[0] = value;
+    }
+}

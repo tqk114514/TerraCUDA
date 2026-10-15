@@ -326,10 +326,28 @@ class MaterialDeciderGpuTest {
                         grid += walls[1];
                         decide += walls[2];
                     }
+                    // The launch-and-synchronise floor: the same measurement shape around a
+                    // kernel that does nothing, so the walls above can be read net of it.
+                    var sink = context.allocate(4L);
+                    long floor = 0L;
+                    int floorRounds = 60;
+                    try (tqk114514.terracuda.cuda.KernelArguments noop =
+                                 new tqk114514.terracuda.cuda.KernelArguments(2)) {
+                        noop.addDevicePointer(sink.address()).addInt(1);
+                        for (int i = 0; i < floorRounds; i++) {
+                            long began = System.nanoTime();
+                            context.launch("terracuda_noop", 1, 1, 1, 1, 1, 1, noop);
+                            context.synchronize();
+                            floor += System.nanoTime() - began;
+                        }
+                    }
+                    context.free(sink);
+
                     System.out.printf("WALLS-DBG evaluator=%.3fms k0table=%.3fms grid=%.3fms"
-                                    + " decide=%.3fms (avg of %d, resident form)%n",
+                                    + " decide=%.3fms floor=%.3fms (avg of %d, resident form)%n",
                             evaluator / rounds / 1e6, table / rounds / 1e6,
-                            grid / rounds / 1e6, decide / rounds / 1e6, rounds);
+                            grid / rounds / 1e6, decide / rounds / 1e6,
+                            floor / (double) floorRounds / 1e6, rounds);
                 }
             }
         }
